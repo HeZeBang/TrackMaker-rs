@@ -4,8 +4,9 @@ layout: home
 
 hero:
   name: "TrackMaker-rs"
-  text: "A high-performance audio-based information transmission tool, written in Rust"
-  tagline: My great project tagline
+  text: "Audio-based, \nInformation transmission"
+  tagline: ♪ 納期は明日だ 絶対徹夜 ♪
+  image: /logo.png
   actions:
     - theme: brand
       text: Markdown Examples

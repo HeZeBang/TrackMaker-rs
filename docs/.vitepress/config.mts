@@ -11,6 +11,8 @@ export default defineConfig({
       { text: 'Examples', link: '/markdown-examples' }
     ],
 
+    logo: '/logo.png',
+
     sidebar: [
       {
         text: 'Examples',
@@ -22,7 +24,17 @@ export default defineConfig({
     ],
 
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/vuejs/vitepress' }
-    ]
+      { icon: 'github', link: 'https://github.com/HeZeBang/TrackMaker-rs' }
+    ],
+
+    editLink: {
+      pattern: 'https://github.com/HeZeBang/TrackMaker-rs/edit/main/docs/:path',
+      text: 'Edit this page on GitHub'
+    },
+
+    footer: {
+      message: 'Released under the MIT License.',
+      copyright: 'Made with ❤️ by HeZeBang & WilliamZhang'
+    }
   }
 })
