@@ -5,4 +5,7 @@ edition = "2024"
 
 [dependencies]
 jack = "0.13.3"
+indicatif = "0.17"
 symphonia = "0.5.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
