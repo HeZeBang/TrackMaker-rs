@@ -1,0 +1,16 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "cargo",
+			"command": "run",
+			"problemMatcher": [
+				"$rustc"
+			],
+			"env": {
+				"DYLD_LIBRARY_PATH": "/Users/zbhe/homebrew/lib:${env:DYLD_LIBRARY_PATH}"
+			},
+			"label": "rust: cargo run"
+		}
+	]
+}
