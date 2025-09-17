@@ -4,6 +4,7 @@ import { defineConfig } from 'vitepress'
 export default defineConfig({
   title: "TrackMaker-rs",
   description: "A high-performance audio-based information transmission tool, written in Rust",
+  base: "/TrackMaker-rs/",
   themeConfig: {
     // https://vitepress.dev/reference/default-theme-config
     nav: [
