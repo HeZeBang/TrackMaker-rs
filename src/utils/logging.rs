@@ -1,4 +1,4 @@
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 pub fn init_logging() {
     let env_filter = EnvFilter::try_from_default_env()
@@ -13,5 +13,3 @@ pub fn init_logging() {
         .with_writer(std::io::stdout)
         .init();
 }
-
-

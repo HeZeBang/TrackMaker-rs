@@ -27,13 +27,18 @@ impl ProgressManager {
         template: &str,
         message: &str,
     ) -> Result<(), String> {
-        let mut bars = self.bars.lock().map_err(|e| format!("Lock error: {}", e))?;
-        
+        let mut bars = self
+            .bars
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+
         if bars.contains_key(id) {
             return Err(format!("Progress bar '{}' already exists", id));
         }
 
-        let pb = self.mp.add(ProgressBar::new(total));
+        let pb = self
+            .mp
+            .add(ProgressBar::new(total));
         pb.set_style(
             ProgressStyle::default_bar()
                 .template(template)
@@ -48,7 +53,10 @@ impl ProgressManager {
 
     /// 更新进度条位置
     pub fn set_position(&self, id: &str, pos: u64) -> Result<(), String> {
-        let bars = self.bars.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let bars = self
+            .bars
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
         if let Some(pb) = bars.get(id) {
             pb.set_position(pos);
             Ok(())
@@ -59,7 +67,10 @@ impl ProgressManager {
 
     /// 更新进度条消息
     pub fn set_message(&self, id: &str, message: &str) -> Result<(), String> {
-        let bars = self.bars.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let bars = self
+            .bars
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
         if let Some(pb) = bars.get(id) {
             pb.set_message(message.to_string());
             Ok(())
@@ -70,7 +81,10 @@ impl ProgressManager {
 
     /// 完成并清理进度条
     pub fn finish_and_clear(&self, id: &str) -> Result<(), String> {
-        let mut bars = self.bars.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let mut bars = self
+            .bars
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
         if let Some(pb) = bars.remove(id) {
             pb.finish_and_clear();
             Ok(())
@@ -81,7 +95,10 @@ impl ProgressManager {
 
     /// 完成进度条（保留显示）
     pub fn finish(&self, id: &str, message: &str) -> Result<(), String> {
-        let bars = self.bars.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let bars = self
+            .bars
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
         if let Some(pb) = bars.get(id) {
             pb.finish_with_message(message.to_string());
             Ok(())
@@ -101,7 +118,10 @@ impl ProgressManager {
 
     /// 检查进度条是否已完成
     pub fn is_finished(&self, id: &str) -> Result<bool, String> {
-        let bars = self.bars.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let bars = self
+            .bars
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
         if let Some(pb) = bars.get(id) {
             Ok(pb.is_finished())
         } else {
@@ -126,10 +146,14 @@ impl Default for ProgressManager {
 }
 
 pub mod templates {
-    pub const RECORDING: &str = "RECORDING: [{bar:30.red}] {percent}% ({pos}/{len} samples) {msg}";
-    pub const PLAYBACK: &str = "PLAYBACK: [{bar:30.green}] {percent}% ({pos}/{len} samples) {msg}";
-    pub const PROCESSING: &str = "PROCESSING: [{bar:30.blue}] {percent}% ({pos}/{len}) {msg}";
-    pub const DOWNLOAD: &str = "DOWNLOAD: [{bar:30.yellow}] {percent}% ({pos}/{len} bytes) {msg}";
+    pub const RECORDING: &str =
+        "RECORDING: [{bar:30.red}] {percent}% ({pos}/{len} samples) {msg}";
+    pub const PLAYBACK: &str =
+        "PLAYBACK: [{bar:30.green}] {percent}% ({pos}/{len} samples) {msg}";
+    pub const PROCESSING: &str =
+        "PROCESSING: [{bar:30.blue}] {percent}% ({pos}/{len}) {msg}";
+    pub const DOWNLOAD: &str =
+        "DOWNLOAD: [{bar:30.yellow}] {percent}% ({pos}/{len} bytes) {msg}";
 }
 
 pub mod colors {
