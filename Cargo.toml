@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 jack = "0.13.3"
+symphonia = "0.5.4"
