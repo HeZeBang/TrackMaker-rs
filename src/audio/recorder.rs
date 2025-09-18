@@ -12,7 +12,7 @@ pub enum AppState {
 /// Thread-safe shared state
 #[derive(Clone)]
 pub struct AppShared {
-    pub recorded_audio: Arc<Mutex<Vec<f32>>>,
+    pub record_buffer: Arc<Mutex<Vec<f32>>>,
     pub playback_buffer: Arc<Mutex<VecDeque<f32>>>,
     pub app_state: Arc<Mutex<AppState>>,
     pub sample_counter: Arc<Mutex<usize>>,
@@ -21,7 +21,7 @@ pub struct AppShared {
 impl AppShared {
     pub fn new(capacity_samples: usize) -> Self {
         Self {
-            recorded_audio: Arc::new(Mutex::new(Vec::with_capacity(
+            record_buffer: Arc::new(Mutex::new(Vec::with_capacity(
                 capacity_samples,
             ))),
             playback_buffer: Arc::new(Mutex::new(VecDeque::new())),
@@ -60,7 +60,7 @@ pub fn build_process_closure(
             match current_state {
                 AppState::Recording => {
                     let mut recorded = shared_cb
-                        .recorded_audio
+                        .record_buffer
                         .lock()
                         .unwrap();
                     let mut counter = shared_cb
@@ -73,6 +73,7 @@ pub fn build_process_closure(
                             recorded.push(sample);
                             *counter += 1;
                         } else {
+                            // TODO: Use external callback to process the recorded audio
                             let mut playback = shared_cb
                                 .playback_buffer
                                 .lock()
