@@ -71,30 +71,24 @@ fn main() {
             "recording",
             recording_duration_samples as u64,
             templates::RECORDING,
-            format!("Record for {} secs", DEFAULT_RECORD_SECONDS).as_str(),
+            in_port_name.as_str(),
         )
         .unwrap();
 
-    // UI 线程负责基于状态更新进度
-    std::thread::spawn({
-        let shared = shared.clone();
-        let pm = progress_manager;
-        move || {
-            ui::run_progress_loop(&shared, recording_duration_samples, &pm);
-        }
-    });
-
-    // 监听状态变化：录制 -> 播放
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
+        
+        ui::update_progress(&shared, recording_duration_samples, &progress_manager);
+        
         let state = {
             shared
-                .app_state
-                .lock()
-                .unwrap()
-                .clone()
+            .app_state
+            .lock()
+            .unwrap()
+            .clone()
         };
-        if let recorder::AppState::Playing = state {
+        if let recorder::AppState::Idle = state {
+            progress_manager.finish_all();
             break;
         }
     }
@@ -106,8 +100,20 @@ fn main() {
         &out_port_name,
     );
 
+    progress_manager.create_bar(
+        "playback",
+        recording_duration_samples as u64,
+        templates::PLAYBACK,
+        out_port_name.as_str(),
+    ).unwrap();
+
+    *shared.app_state.lock().unwrap() = recorder::AppState::Playing;
+
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
+        
+        ui::update_progress(&shared, recording_duration_samples, &progress_manager);
+        
         let state = {
             shared
                 .app_state
@@ -116,6 +122,7 @@ fn main() {
                 .clone()
         };
         if let recorder::AppState::Idle = state {
+            progress_manager.finish_all();
             break;
         }
     }

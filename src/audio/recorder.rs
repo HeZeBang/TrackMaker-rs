@@ -83,7 +83,7 @@ pub fn build_process_closure(
                                 .app_state
                                 .lock()
                                 .unwrap();
-                            *state = AppState::Playing;
+                            *state = AppState::Idle;
                             break;
                         }
                     }

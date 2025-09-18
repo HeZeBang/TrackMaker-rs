@@ -129,6 +129,15 @@ impl ProgressManager {
         }
     }
 
+    /// 完成所有进度条
+    pub fn finish_all(&self) {
+        if let Ok(mut bars) = self.bars.lock() {
+            for (_, pb) in bars.drain() {
+                pb.finish();
+            }
+        }
+    }
+
     /// 清理所有进度条
     pub fn clear_all(&self) {
         if let Ok(mut bars) = self.bars.lock() {
@@ -147,13 +156,13 @@ impl Default for ProgressManager {
 
 pub mod templates {
     pub const RECORDING: &str =
-        "RECORDING: [{bar:30.red}] {percent}% ({pos}/{len} samples) {msg}";
+        "RECORDING:   [{bar:30.red}] {percent}% ({pos}/{len} samples) {msg}";
     pub const PLAYBACK: &str =
-        "PLAYBACK: [{bar:30.green}] {percent}% ({pos}/{len} samples) {msg}";
+        "PLAYBACK:    [{bar:30.green}] {percent}% ({pos}/{len} samples) {msg}";
     pub const PROCESSING: &str =
-        "PROCESSING: [{bar:30.blue}] {percent}% ({pos}/{len}) {msg}";
+        "PROCESSING:  [{bar:30.blue}] {percent}% ({pos}/{len}) {msg}";
     pub const DOWNLOAD: &str =
-        "DOWNLOAD: [{bar:30.yellow}] {percent}% ({pos}/{len} bytes) {msg}";
+        "DOWNLOADING: [{bar:30.yellow}] {percent}% ({pos}/{len} bytes) {msg}";
 }
 
 pub mod colors {
