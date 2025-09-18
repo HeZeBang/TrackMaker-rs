@@ -12,7 +12,7 @@ use device::jack::{
 use ui::print_banner;
 use utils::consts::*;
 use utils::logging::init_logging;
-use utils::progress::{ProgressManager, templates};
+use ui::progress::{ProgressManager, templates};
 
 fn main() {
     init_logging();

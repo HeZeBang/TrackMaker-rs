@@ -7,6 +7,7 @@ pub enum AppState {
     Recording,
     Playing,
     Idle,
+    RecordingAndPlaying,
 }
 
 /// Thread-safe shared state
@@ -104,6 +105,46 @@ pub fn build_process_closure(
                 }
                 AppState::Idle => {
                     // 保持静音
+                }
+                AppState::RecordingAndPlaying => {
+                    // Record: in_buffer -> record_buffer
+                    let mut recorded = shared_cb
+                        .record_buffer
+                        .lock()
+                        .unwrap();
+
+                    let mut counter = shared_cb
+                        .sample_counter
+                        .lock()
+                        .unwrap();
+
+                    for &sample in in_buffer {
+                        if recorded.len() < recording_duration_samples {
+                            recorded.push(sample);
+                            *counter += 1;
+                        } else {
+                            let mut state = shared_cb
+                                .app_state
+                                .lock()
+                                .unwrap();
+                            *state = AppState::Idle;
+                            break;
+                        }
+                    }
+
+                    // Play: playback_buffer -> out_buffer
+                    let mut playback = shared_cb
+                        .playback_buffer
+                        .lock()
+                        .unwrap();
+
+                    for out_sample in out_buffer.iter_mut() {
+                        if let Some(sample) = playback.pop_front() {
+                            *out_sample = sample;
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
 

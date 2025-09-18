@@ -1,5 +1,6 @@
 use crate::audio::recorder::{AppShared, AppState};
-use crate::utils::progress::{ProgressManager, templates};
+pub mod progress;
+use crate::ui::progress::{ProgressManager, templates};
 
 pub fn print_banner() {
     println!("TrackMaker-rs");
@@ -19,7 +20,7 @@ pub fn update_progress(
     };
 
     match current_state {
-        AppState::Recording => {
+        AppState::Recording | AppState::RecordingAndPlaying => {
             let recorded_samples = {
                 let recorded = shared
                     .record_buffer
