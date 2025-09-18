@@ -11,6 +11,18 @@
 				"DYLD_LIBRARY_PATH": "/Users/zbhe/homebrew/lib:${env:DYLD_LIBRARY_PATH}"
 			},
 			"label": "rust: cargo run"
+		},
+		{
+			"type": "cargo",
+			"command": "build",
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"label": "rust: cargo build"
 		}
 	]
 }

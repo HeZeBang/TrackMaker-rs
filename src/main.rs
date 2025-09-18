@@ -9,6 +9,7 @@ use device::jack::{
     connect_output_to_first_system_input, disconnect_input_sources,
     disconnect_output_sinks, print_jack_info,
 };
+use tracing::info;
 use ui::print_banner;
 use ui::progress::{ProgressManager, templates};
 use utils::consts::*;
@@ -106,8 +107,6 @@ fn main() {
         &out_port_name,
     );
 
-    let mut music = Vec::new();
-
     // Copy to playback buffer
     {
         let mut recorded = shared
@@ -119,8 +118,7 @@ fn main() {
             .lock()
             .unwrap();
 
-        playback.extend(recorded.iter().copied());
-        music.extend(recorded.drain(..));
+        playback.extend(recorded.drain(..));
     }
 
     progress_manager
@@ -174,7 +172,21 @@ fn main() {
             .lock()
             .unwrap();
 
-        playback.extend(music.iter().copied()); // TODO: fix with real music
+        info!("Filling playback buffer with music from sample.flac");
+
+        let mut music = Vec::new();
+        audio::decoder::decode_flac_to_f32("./assets/sample.flac")
+            .unwrap_or_else(|_| {
+                tracing::warn!("Failed to decode sample.flac, using silence");
+                vec![0.0; recording_duration_samples as usize]
+            })
+            .into_iter()
+            .take(recording_duration_samples as usize)
+            .for_each(|s| music.push(s));
+
+        info!("Music length: {} samples", music.len());
+
+        playback.extend(music.drain(..));
     }
 
     progress_manager
@@ -216,7 +228,7 @@ fn main() {
     // Playback
     disconnect_input_sources(active_client.as_client(), &in_port_name);
 
-    // Copy&Mix to playback buffer
+    // Copy to playback buffer
     {
         let mut recorded = shared
             .record_buffer
@@ -227,14 +239,7 @@ fn main() {
             .lock()
             .unwrap();
 
-        // playback.extend(recorded.drain(..));
-        // playback = music[i] + recorded[i]
-        playback.extend(
-            music
-                .iter()
-                .zip(recorded.drain(..))
-                .map(|(a, b)| a + b),
-        );
+        playback.extend(recorded.drain(..));
     }
 
     progress_manager

@@ -1,6 +1,6 @@
 use crate::audio::recorder::{AppShared, AppState};
 pub mod progress;
-use crate::ui::progress::{ProgressManager, templates};
+use crate::ui::progress::{ProgressManager};
 
 pub fn print_banner() {
     println!("TrackMaker-rs");
@@ -39,7 +39,12 @@ pub fn update_progress(
                     .unwrap();
                 playback.len()
             };
-            let played_samples = recording_duration_samples - remaining_samples;
+            // 防止下溢：确保 remaining_samples 不会超过 recording_duration_samples
+            let played_samples = if remaining_samples > recording_duration_samples {
+                0 // 如果剩余样本超过总时长，说明刚开始播放，设为0
+            } else {
+                recording_duration_samples - remaining_samples
+            };
             let _ =
                 progress_manager.set_position("playback", played_samples as u64);
         }

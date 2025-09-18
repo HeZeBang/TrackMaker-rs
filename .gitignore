@@ -170,3 +170,6 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Distinghuished Apple User
+.DS_Store
