@@ -161,6 +161,6 @@ pub mod templates {
         "PLAYBACK:    [{bar:30.green}] {percent}% ({pos}/{len} samples) {msg}";
     pub const PROCESSING: &str =
         "PROCESSING:  [{bar:30.blue}] {percent}% ({pos}/{len}) {msg}";
-    pub const DOWNLOAD: &str =
-        "DOWNLOADING: [{bar:30.yellow}] {percent}% ({pos}/{len} bytes) {msg}";
+    pub const PLAYREC: &str =
+        "PLAYREC:     [{bar:30.yellow}] {percent}% ({pos}/{len} samples) {msg}";
 }

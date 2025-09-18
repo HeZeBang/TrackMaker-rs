@@ -20,7 +20,7 @@ pub fn update_progress(
     };
 
     match current_state {
-        AppState::Recording | AppState::RecordingAndPlaying => {
+        AppState::Recording => {
             let recorded_samples = {
                 let recorded = shared
                     .record_buffer
@@ -39,12 +39,21 @@ pub fn update_progress(
                     .unwrap();
                 playback.len()
             };
-            let played_samples =
-                recording_duration_samples - remaining_samples;
+            let played_samples = recording_duration_samples - remaining_samples;
+            let _ =
+                progress_manager.set_position("playback", played_samples as u64);
+        }
+        AppState::RecordingAndPlaying => {
+            let recorded_samples = {
+                let recorded = shared
+                    .record_buffer
+                    .lock()
+                    .unwrap();
+                recorded.len()
+            };
             let _ = progress_manager
-                .set_position("playback", played_samples as u64);
+                .set_position("playrec", recorded_samples as u64);
         }
-        AppState::Idle => {
-        }
+        AppState::Idle => {}
     }
 }

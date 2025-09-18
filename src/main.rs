@@ -7,12 +7,14 @@ use audio::recorder;
 use device::jack::{
     connect_input_from_first_system_output,
     connect_output_to_first_system_input, disconnect_input_sources,
-    print_jack_info,
+    disconnect_output_sinks, print_jack_info,
 };
 use ui::print_banner;
+use ui::progress::{ProgressManager, templates};
 use utils::consts::*;
 use utils::logging::init_logging;
-use ui::progress::{ProgressManager, templates};
+
+use crate::device::jack::connect_system_ports;
 
 fn main() {
     init_logging();
@@ -32,7 +34,7 @@ fn main() {
         DEFAULT_RECORD_SECONDS
     );
 
-    // 共享状态
+    // Shared State
     let shared = recorder::AppShared::new(recording_duration_samples);
     let shared_cb = shared.clone();
 
@@ -46,7 +48,7 @@ fn main() {
     let in_port_name = in_port.name().unwrap();
     let out_port_name = out_port.name().unwrap();
 
-    // 音频处理回调
+    // Process Callback
     let process_cb = recorder::build_process_closure(
         in_port,
         out_port,
@@ -77,15 +79,19 @@ fn main() {
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
-        
-        ui::update_progress(&shared, recording_duration_samples, &progress_manager);
-        
+
+        ui::update_progress(
+            &shared,
+            recording_duration_samples,
+            &progress_manager,
+        );
+
         let state = {
             shared
-            .app_state
-            .lock()
-            .unwrap()
-            .clone()
+                .app_state
+                .lock()
+                .unwrap()
+                .clone()
         };
         if let recorder::AppState::Idle = state {
             progress_manager.finish_all();
@@ -93,12 +99,14 @@ fn main() {
         }
     }
 
-    // 切换到播放阶段：断开输入，连接输出
+    // Playback
     disconnect_input_sources(active_client.as_client(), &in_port_name);
     connect_output_to_first_system_input(
         active_client.as_client(),
         &out_port_name,
     );
+
+    let mut music = Vec::new();
 
     // Copy to playback buffer
     {
@@ -110,23 +118,148 @@ fn main() {
             .playback_buffer
             .lock()
             .unwrap();
-        playback.extend(recorded.drain(..));
+
+        playback.extend(recorded.iter().copied());
+        music.extend(recorded.drain(..));
     }
 
-    progress_manager.create_bar(
-        "playback",
-        recording_duration_samples as u64,
-        templates::PLAYBACK,
-        out_port_name.as_str(),
-    ).unwrap();
+    progress_manager
+        .create_bar(
+            "playback",
+            recording_duration_samples as u64,
+            templates::PLAYBACK,
+            out_port_name.as_str(),
+        )
+        .unwrap();
 
-    *shared.app_state.lock().unwrap() = recorder::AppState::Playing;
+    *shared
+        .app_state
+        .lock()
+        .unwrap() = recorder::AppState::Playing;
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
-        
-        ui::update_progress(&shared, recording_duration_samples, &progress_manager);
-        
+
+        ui::update_progress(
+            &shared,
+            recording_duration_samples,
+            &progress_manager,
+        );
+
+        let state = {
+            shared
+                .app_state
+                .lock()
+                .unwrap()
+                .clone()
+        };
+        if let recorder::AppState::Idle = state {
+            progress_manager.finish_all();
+            break;
+        }
+    }
+
+    // Play music and record in the same time
+    disconnect_output_sinks(active_client.as_client(), &out_port_name);
+    connect_system_ports(
+        active_client.as_client(),
+        &in_port_name,
+        &out_port_name,
+    );
+
+    // Copy to playback buffer
+    {
+        let mut playback = shared
+            .playback_buffer
+            .lock()
+            .unwrap();
+
+        playback.extend(music.iter().copied()); // TODO: fix with real music
+    }
+
+    progress_manager
+        .create_bar(
+            "playrec",
+            recording_duration_samples as u64,
+            templates::PLAYREC,
+            out_port_name.as_str(),
+        )
+        .unwrap();
+
+    *shared
+        .app_state
+        .lock()
+        .unwrap() = recorder::AppState::RecordingAndPlaying;
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        ui::update_progress(
+            &shared,
+            recording_duration_samples,
+            &progress_manager,
+        );
+
+        let state = {
+            shared
+                .app_state
+                .lock()
+                .unwrap()
+                .clone()
+        };
+        if let recorder::AppState::Idle = state {
+            progress_manager.finish_all();
+            break;
+        }
+    }
+
+    // Playback
+    disconnect_input_sources(active_client.as_client(), &in_port_name);
+
+    // Copy&Mix to playback buffer
+    {
+        let mut recorded = shared
+            .record_buffer
+            .lock()
+            .unwrap();
+        let mut playback = shared
+            .playback_buffer
+            .lock()
+            .unwrap();
+
+        // playback.extend(recorded.drain(..));
+        // playback = music[i] + recorded[i]
+        playback.extend(
+            music
+                .iter()
+                .zip(recorded.drain(..))
+                .map(|(a, b)| a + b),
+        );
+    }
+
+    progress_manager
+        .create_bar(
+            "playback",
+            recording_duration_samples as u64,
+            templates::PLAYBACK,
+            out_port_name.as_str(),
+        )
+        .unwrap();
+
+    *shared
+        .app_state
+        .lock()
+        .unwrap() = recorder::AppState::Playing;
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        ui::update_progress(
+            &shared,
+            recording_duration_samples,
+            &progress_manager,
+        );
+
         let state = {
             shared
                 .app_state

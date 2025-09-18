@@ -103,9 +103,7 @@ pub fn build_process_closure(
                         }
                     }
                 }
-                AppState::Idle => {
-                    // 保持静音
-                }
+                AppState::Idle => {}
                 AppState::RecordingAndPlaying => {
                     // Record: in_buffer -> record_buffer
                     let mut recorded = shared_cb
