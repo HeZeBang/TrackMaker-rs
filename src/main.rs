@@ -100,6 +100,19 @@ fn main() {
         &out_port_name,
     );
 
+    // Copy to playback buffer
+    {
+        let mut recorded = shared
+            .record_buffer
+            .lock()
+            .unwrap();
+        let mut playback = shared
+            .playback_buffer
+            .lock()
+            .unwrap();
+        playback.extend(recorded.drain(..));
+    }
+
     progress_manager.create_bar(
         "playback",
         recording_duration_samples as u64,

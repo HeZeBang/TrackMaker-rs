@@ -22,7 +22,7 @@ pub fn update_progress(
         AppState::Recording => {
             let recorded_samples = {
                 let recorded = shared
-                    .recorded_audio
+                    .record_buffer
                     .lock()
                     .unwrap();
                 recorded.len()

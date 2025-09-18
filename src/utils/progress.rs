@@ -164,12 +164,3 @@ pub mod templates {
     pub const DOWNLOAD: &str =
         "DOWNLOADING: [{bar:30.yellow}] {percent}% ({pos}/{len} bytes) {msg}";
 }
-
-pub mod colors {
-    pub const RED: &str = "red";
-    pub const GREEN: &str = "green";
-    pub const BLUE: &str = "blue";
-    pub const YELLOW: &str = "yellow";
-    pub const CYAN: &str = "cyan";
-    pub const MAGENTA: &str = "magenta";
-}

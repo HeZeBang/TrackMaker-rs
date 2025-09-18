@@ -73,13 +73,6 @@ pub fn build_process_closure(
                             recorded.push(sample);
                             *counter += 1;
                         } else {
-                            // TODO: Use external callback to process the recorded audio
-                            let mut playback = shared_cb
-                                .playback_buffer
-                                .lock()
-                                .unwrap();
-                            playback.extend(recorded.iter().cloned());
-
                             let mut state = shared_cb
                                 .app_state
                                 .lock()
