@@ -1,4 +1,4 @@
-extern crate jack;
+use jack;
 
 fn main() {
     println!("Hello, world!");
