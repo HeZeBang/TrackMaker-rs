@@ -75,14 +75,16 @@ fn main() -> anyhow::Result<()> {
     let config = device
         .default_output_config()
         .unwrap();
+    println!("Default output config: {:?}", config);
+    // Customize sample rate
     let cc = cpal::StreamConfig{
         channels: config.channels(),
         sample_rate: cpal::SampleRate(48000),
         buffer_size: cpal::BufferSize::Default,
     };
-    println!("Default output config: {:?}", cc);
+    println!("Custom output config: {:?}", cc);
 
-    match config.sample_format() {
+    let _ = match config.sample_format() {
         cpal::SampleFormat::I8 => run::<i8>(&device, &config.into()),
         cpal::SampleFormat::I16 => run::<i16>(&device, &config.into()),
         cpal::SampleFormat::I24 => run::<I24>(&device, &config.into()),
@@ -98,13 +100,16 @@ fn main() -> anyhow::Result<()> {
         cpal::SampleFormat::F32 => run::<f32>(&device, &config.into()),
         cpal::SampleFormat::F64 => run::<f64>(&device, &config.into()),
         sample_format => panic!("Unsupported sample format '{sample_format}'"),
-    }
+    };
+
+    run::<f64>(&device, &cc.into())
 }
 
 pub fn run<T>(device: &cpal::Device, config: &cpal::StreamConfig) -> Result<(), anyhow::Error>
 where
     T: SizedSample + FromSample<f32>,
 {
+    println!("Running with config: {:?}\n", config);
     let sample_rate = config.sample_rate.0 as f32;
     let channels = config.channels as usize;
 
