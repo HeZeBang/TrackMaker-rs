@@ -9,7 +9,8 @@ export default defineConfig({
     // https://vitepress.dev/reference/default-theme-config
     nav: [
       { text: 'Home', link: '/' },
-      { text: 'Examples', link: '/markdown-examples' }
+      { text: 'Examples', link: '/markdown-examples' },
+      { text: "Projects", link: "/proj/proj1" },
     ],
 
     logo: '/logo.png',
@@ -20,6 +21,12 @@ export default defineConfig({
         items: [
           { text: 'Markdown Examples', link: '/markdown-examples' },
           { text: 'Runtime API Examples', link: '/api-examples' }
+        ]
+      },
+      {
+        text: 'Projects',
+        items: [
+          { text: 'Project 1', link: '/proj/proj1' }
         ]
       }
     ],
@@ -37,5 +44,8 @@ export default defineConfig({
       message: 'Released under the MIT License.',
       copyright: 'Made with ❤️ by HeZeBang & WilliamZhang'
     }
+  },
+  markdown: {
+    math: true,
   }
 })
