@@ -9,6 +9,7 @@ use device::jack::{
     connect_output_to_first_system_input, disconnect_input_sources,
     disconnect_output_sinks, print_jack_info,
 };
+use serde::{Deserialize, Serialize};
 use tracing::info;
 use ui::print_banner;
 use ui::progress::{ProgressManager, templates};
@@ -62,107 +63,12 @@ fn main() {
         .activate_async((), process)
         .unwrap();
 
-    // Recording
-    connect_input_from_first_system_output(
-        active_client.as_client(),
-        &in_port_name,
-    );
-
     let progress_manager = ProgressManager::new();
-    progress_manager
-        .create_bar(
-            "recording",
-            recording_duration_samples as u64,
-            templates::RECORDING,
-            in_port_name.as_str(),
-        )
-        .unwrap();
 
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        ui::update_progress(
-            &shared,
-            recording_duration_samples,
-            &progress_manager,
-        );
-
-        let state = {
-            shared
-                .app_state
-                .lock()
-                .unwrap()
-                .clone()
-        };
-        if let recorder::AppState::Idle = state {
-            progress_manager.finish_all();
-            break;
-        }
-    }
-
-    // Playback
-    disconnect_input_sources(active_client.as_client(), &in_port_name);
-    connect_output_to_first_system_input(
-        active_client.as_client(),
-        &out_port_name,
-    );
-
-    // Copy to playback buffer
-    {
-        let mut recorded = shared
-            .record_buffer
-            .lock()
-            .unwrap();
-        let mut playback = shared
-            .playback_buffer
-            .lock()
-            .unwrap();
-
-        playback.extend(recorded.drain(..));
-    }
-
-    progress_manager
-        .create_bar(
-            "playback",
-            recording_duration_samples as u64,
-            templates::PLAYBACK,
-            out_port_name.as_str(),
-        )
-        .unwrap();
-
-    *shared
-        .app_state
-        .lock()
-        .unwrap() = recorder::AppState::Playing;
-
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        ui::update_progress(
-            &shared,
-            recording_duration_samples,
-            &progress_manager,
-        );
-
-        let state = {
-            shared
-                .app_state
-                .lock()
-                .unwrap()
-                .clone()
-        };
-        if let recorder::AppState::Idle = state {
-            progress_manager.finish_all();
-            break;
-        }
-    }
-
-    // Play music and record in the same time
-    disconnect_output_sinks(active_client.as_client(), &out_port_name);
     connect_system_ports(
         active_client.as_client(),
-        &in_port_name,
-        &out_port_name,
+        in_port_name.as_str(),
+        out_port_name.as_str(),
     );
 
     // Copy to playback buffer
@@ -183,6 +89,23 @@ fn main() {
             .into_iter()
             .take(recording_duration_samples as usize)
             .for_each(|s| music.push(s));
+
+        let audio_data: utils::dump::AudioData = utils::dump::AudioData {
+            sample_rate: 48000,
+            audio_data: music.clone(),
+            duration: recording_duration_samples as f32 / sample_rate as f32,
+            channels: 1,
+        };
+        match serde_json::to_string(&audio_data) {
+            Ok(json_string) => {
+                std::fs::write("./tmp/output.json", json_string)
+                    .expect("Unable to write file");
+                println!("Serialized music data written to ./tmp/output.json");
+            }
+            Err(e) => {
+                eprintln!("Error serializing to JSON: {}", e);
+            }
+        }
 
         info!("Music length: {} samples", music.len());
 
