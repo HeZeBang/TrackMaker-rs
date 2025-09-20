@@ -37,7 +37,7 @@ fn main() {
     tracing::info!("JACK client status: {:?}", status);
     let (sample_rate, _buffer_size) = print_jack_info(&client);
 
-    let max_duration_samples = 529300;
+    let max_duration_samples = sample_rate * 15;
 
     // Shared State
     let shared = recorder::AppShared::new(max_duration_samples);
@@ -79,7 +79,7 @@ fn main() {
         run_sender(shared, progress_manager, sample_rate as u32);
     } else {
         // Receiver (Simulation)
-        run_receiver(shared, progress_manager, sample_rate as u32);
+        run_receiver(shared, progress_manager, sample_rate as u32, max_duration_samples as u32);
     }
 
     tracing::info!("Exiting gracefully...");
@@ -228,6 +228,7 @@ fn run_receiver(
     shared: recorder::AppShared,
     progress_manager: ProgressManager,
     sample_rate: u32,
+    max_recording_duration_samples: u32,
 ) {
     // Generate preamble for receiver (same as in sender)
     let sample_rate_f32 = sample_rate as f32;
@@ -260,7 +261,7 @@ fn run_receiver(
     progress_manager
         .create_bar(
             "recording",
-            529300 as u64,
+            max_recording_duration_samples as u64,
             templates::RECORDING,
             "receiver",
         )
@@ -273,7 +274,7 @@ fn run_receiver(
 
         ui::update_progress(
             &shared,
-            529300,
+            max_recording_duration_samples as usize,
             &progress_manager,
         );
 
