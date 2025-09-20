@@ -5,12 +5,9 @@ mod ui;
 mod utils;
 use audio::recorder;
 use device::jack::{
-    connect_input_from_first_system_output,
-    connect_output_to_first_system_input, disconnect_input_sources,
-    disconnect_output_sinks, print_jack_info,
+    print_jack_info,
 };
 use rand::{self, Rng, SeedableRng};
-use serde::{Deserialize, Serialize};
 use tracing::info;
 use ui::print_banner;
 use ui::progress::{ProgressManager, templates};
@@ -106,7 +103,7 @@ fn main() {
         .collect();
 
     // CRC8 polynomial: x^8+x^7+x^5+x^2+x+1 (0x1D7)
-    let crc8_poly = 0x1D7u16;
+    let _crc8_poly = 0x1D7u16;
 
     // Preamble generation (440 samples)
     let mut f_p = Vec::with_capacity(440);
@@ -155,8 +152,8 @@ fn main() {
         frame_wave_pre.extend(frame_wave);
 
         // Add random inter-frame spacing
-        let inter_frame_space1: usize = rng.gen_range(0..100);
-        let inter_frame_space2: usize = rng.gen_range(0..100);
+        let inter_frame_space1: usize = rng.random_range(0..100);
+        let inter_frame_space2: usize = rng.random_range(0..100);
 
         output_track.extend(vec![0.0; inter_frame_space1]);
         output_track.extend(frame_wave_pre);
@@ -174,6 +171,11 @@ fn main() {
         playback.extend(output_track);
         info!("Output track length: {} samples", playback.len());
     }
+
+    let rx_fifo = {
+        let playback = shared.playback_buffer.lock().unwrap();
+        playback.clone()
+    };
 
 
     progress_manager
@@ -207,6 +209,103 @@ fn main() {
             break;
         }
     }
+
+    let mut power = 0.0f32;
+    let mut power_debug = vec![0.0f32; rx_fifo.len()];
+    let mut start_index = 0usize;
+    let mut start_index_debug = vec![0.0f32; rx_fifo.len()];
+    let mut sync_fifo = vec![0.0f32; 440];
+    let mut sync_power_debug = vec![0.0f32; rx_fifo.len()];
+    let mut sync_power_local_max = 0.0f32;
+
+    let mut decode_fifo = Vec::new();
+    let mut correct_frame_num = 0;
+
+    let mut state = 0; // 0: sync, 1: decode
+
+    for i in 0..rx_fifo.len() {
+        let current_sample = rx_fifo[i];
+        
+        power = power * (1.0 - 1.0/64.0) + current_sample * current_sample / 64.0;
+        power_debug[i] = power;
+        
+        if state == 0 {
+            // Packet sync
+            sync_fifo.rotate_left(1);
+            sync_fifo[439] = current_sample;
+            
+            let sync_power = sync_fifo.iter()
+                .zip(preamble.iter())
+                .map(|(a, b)| a * b)
+                .sum::<f32>() / 200.0;
+            sync_power_debug[i] = sync_power;
+
+            if (sync_power > power * 2.0) 
+                && (sync_power > sync_power_local_max) 
+                && (sync_power > 0.05) {
+                sync_power_local_max = sync_power;
+                start_index = i;
+            } else if (i > start_index + 200) && (start_index != 0) {
+                start_index_debug[start_index] = 1.5;
+                sync_power_local_max = 0.0;
+                sync_fifo.fill(0.0);
+                state = 1;
+
+                // Convert VecDeque slice to Vec
+                decode_fifo = rx_fifo.range(start_index + 1..i).copied().collect();
+            }
+        } else if state == 1 {
+            decode_fifo.push(current_sample);
+            
+            if decode_fifo.len() == 44 * 108 {
+                // Decode
+                let decode_len = decode_fifo.len();
+                let carrier_slice = &carrier[..decode_len.min(carrier.len())];
+                
+                // Remove carrier (simplified smoothing)
+                let mut decode_remove_carrier = Vec::with_capacity(decode_len);
+                for j in 0..decode_len {
+                    let start = j.saturating_sub(5);
+                    let end = (j + 6).min(decode_len);
+                    let sum: f32 = (start..end)
+                        .map(|k| decode_fifo[k] * carrier_slice.get(k).unwrap_or(&0.0))
+                        .sum();
+                    decode_remove_carrier.push(sum / (end - start) as f32);
+                }
+                
+                let mut decode_power_bit = vec![false; 108];
+                for j in 0..108 {
+                    let start_idx = 10 + j * 44;
+                    let end_idx = (30 + j * 44).min(decode_remove_carrier.len());
+                    if start_idx < decode_remove_carrier.len() && start_idx < end_idx {
+                        let sum: f32 = decode_remove_carrier[start_idx..end_idx].iter().sum();
+                        decode_power_bit[j] = sum > 0.0;
+                    }
+                }
+                
+                // CRC check (simplified - just compare first 8 bits with expected ID)
+                let mut temp_index = 0u8;
+                for k in 0..8 {
+                    if decode_power_bit[k] {
+                        temp_index += 1 << (7 - k);
+                    }
+                }
+                
+                if temp_index > 0 && temp_index <= 100 {
+                    info!("Correct, ID: {}", temp_index);
+                    correct_frame_num += 1;
+                } else {
+                    info!("Error in frame");
+                }
+                
+                start_index = 0;
+                decode_fifo.clear();
+                state = 0;
+            }
+        }
+    }
+
+    info!("Total Correct: {}", correct_frame_num);
 
     tracing::info!("Exiting gracefully...");
     if let Err(err) = active_client.deactivate() {
