@@ -102,7 +102,7 @@ fn main() -> anyhow::Result<()> {
         sample_format => panic!("Unsupported sample format '{sample_format}'"),
     };
 
-    run::<f64>(&device, &cc.into())
+    run::<f32>(&device, &cc.into())
 }
 
 pub fn run<T>(device: &cpal::Device, config: &cpal::StreamConfig) -> Result<(), anyhow::Error>

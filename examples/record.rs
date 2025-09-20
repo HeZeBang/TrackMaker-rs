@@ -1,282 +1,204 @@
-use jack;
-use trackmaker_rs::*;
-use audio::recorder;
-use device::jack::{
-    connect_input_from_first_system_output,
-    connect_output_to_first_system_input, disconnect_input_sources,
-    disconnect_output_sinks, print_jack_info,
-};
-use tracing::info;
-use ui::print_banner;
-use ui::progress::{ProgressManager, templates};
-use utils::consts::*;
-use utils::logging::init_logging;
+//! Records audio to a buffer and then plays it back using the default input/output devices.
+//!
+//! The input data is recorded to a buffer array and then played back through the output device.
 
-use crate::device::jack::connect_system_ports;
+use clap::Parser;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
-fn main() {
-    init_logging();
-    print_banner();
-    let (client, status) = jack::Client::new(
-        JACK_CLIENT_NAME,
-        jack::ClientOptions::NO_START_SERVER,
-    )
-    .unwrap();
-    tracing::info!("JACK client status: {:?}", status);
-    let (sample_rate, _buffer_size) = print_jack_info(&client);
+#[derive(Parser, Debug)]
+#[command(version, about = "CPAL record_wav example", long_about = None)]
+struct Opt {
+    /// The audio device to use
+    #[arg(short, long, default_value_t = String::from("default"))]
+    device: String,
 
-    let recording_duration_samples = sample_rate * DEFAULT_RECORD_SECONDS;
-    tracing::info!(
-        "Recording duration: {} samples ({} seconds)",
-        recording_duration_samples,
-        DEFAULT_RECORD_SECONDS
-    );
+    /// Use the JACK host
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd"
+        ),
+        feature = "jack"
+    ))]
+    #[arg(short, long)]
+    #[allow(dead_code)]
+    jack: bool,
+}
 
-    // Shared State
-    let shared = recorder::AppShared::new(recording_duration_samples);
-    let shared_cb = shared.clone();
+fn main() -> Result<(), anyhow::Error> {
+    let opt = Opt::parse();
 
-    let in_port = client
-        .register_port(INPUT_PORT_NAME, jack::AudioIn::default())
-        .unwrap();
-    let out_port = client
-        .register_port(OUTPUT_PORT_NAME, jack::AudioOut::default())
-        .unwrap();
-
-    let in_port_name = in_port.name().unwrap();
-    let out_port_name = out_port.name().unwrap();
-
-    // Process Callback
-    let process_cb = recorder::build_process_closure(
-        in_port,
-        out_port,
-        shared_cb,
-        recording_duration_samples,
-    );
-    let process = jack::contrib::ClosureProcessHandler::new(process_cb);
-
-    let active_client = client
-        .activate_async((), process)
-        .unwrap();
-
-    // Recording
-    connect_input_from_first_system_output(
-        active_client.as_client(),
-        &in_port_name,
-    );
-
-    let progress_manager = ProgressManager::new();
-    progress_manager
-        .create_bar(
-            "recording",
-            recording_duration_samples as u64,
-            templates::RECORDING,
-            in_port_name.as_str(),
-        )
-        .unwrap();
-
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        ui::update_progress(
-            &shared,
-            recording_duration_samples,
-            &progress_manager,
-        );
-
-        let state = {
-            shared
-                .app_state
-                .lock()
-                .unwrap()
-                .clone()
-        };
-        if let recorder::AppState::Idle = state {
-            progress_manager.finish_all();
-            break;
-        }
-    }
-
-    // Playback
-    disconnect_input_sources(active_client.as_client(), &in_port_name);
-    connect_output_to_first_system_input(
-        active_client.as_client(),
-        &out_port_name,
-    );
-
-    // Copy to playback buffer
-    {
-        let mut recorded = shared
-            .record_buffer
-            .lock()
-            .unwrap();
-        let mut playback = shared
-            .playback_buffer
-            .lock()
-            .unwrap();
-
-        playback.extend(recorded.drain(..));
-    }
-
-    progress_manager
-        .create_bar(
-            "playback",
-            recording_duration_samples as u64,
-            templates::PLAYBACK,
-            out_port_name.as_str(),
-        )
-        .unwrap();
-
-    *shared
-        .app_state
-        .lock()
-        .unwrap() = recorder::AppState::Playing;
-
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        ui::update_progress(
-            &shared,
-            recording_duration_samples,
-            &progress_manager,
-        );
-
-        let state = {
-            shared
-                .app_state
-                .lock()
-                .unwrap()
-                .clone()
-        };
-        if let recorder::AppState::Idle = state {
-            progress_manager.finish_all();
-            break;
-        }
-    }
-
-    // Play music and record in the same time
-    disconnect_output_sinks(active_client.as_client(), &out_port_name);
-    connect_system_ports(
-        active_client.as_client(),
-        &in_port_name,
-        &out_port_name,
-    );
-
-    // Copy to playback buffer
-    {
-        let mut playback = shared
-            .playback_buffer
-            .lock()
-            .unwrap();
-
-        info!("Filling playback buffer with music from sample.flac");
-
-        let mut music = Vec::new();
-        audio::decoder::decode_flac_to_f32("./assets/sample.flac")
-            .unwrap_or_else(|_| {
-                tracing::warn!("Failed to decode sample.flac, using silence");
-                vec![0.0; recording_duration_samples as usize]
-            })
+    // Conditionally compile with jack if the feature is specified.
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd"
+        ),
+        feature = "jack"
+    ))]
+    // Manually check for flags. Can be passed through cargo with -- e.g.
+    // cargo run --release --example beep --features jack -- --jack
+    let host = if opt.jack {
+        cpal::host_from_id(cpal::available_hosts()
             .into_iter()
-            .take(recording_duration_samples as usize)
-            .for_each(|s| music.push(s));
+            .find(|id| *id == cpal::HostId::Jack)
+            .expect(
+                "make sure --features jack is specified. only works on OSes where jack is available",
+            )).expect("jack host unavailable")
+    } else {
+        cpal::default_host()
+    };
 
-        info!("Music length: {} samples", music.len());
+    #[cfg(any(
+        not(any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd"
+        )),
+        not(feature = "jack")
+    ))]
+    let host = cpal::default_host();
 
-        playback.extend(music.drain(..));
+    // Set up the input device and stream with the default input config.
+    let input_device = if opt.device == "default" {
+        host.default_input_device()
+    } else {
+        host.input_devices()?
+            .find(|x| {
+                x.name()
+                    .map(|y| y == opt.device)
+                    .unwrap_or(false)
+            })
     }
+    .expect("failed to find input device");
 
-    progress_manager
-        .create_bar(
-            "playrec",
-            recording_duration_samples as u64,
-            templates::PLAYREC,
-            out_port_name.as_str(),
-        )
-        .unwrap();
+    println!("Input device: {}", input_device.name()?);
 
-    *shared
-        .app_state
+    let input_config = input_device
+        .default_input_config()
+        .expect("Failed to get default input config");
+    println!("Default input config: {input_config:?}");
+
+    // Set up the output device for playback
+    let output_device = host
+        .default_output_device()
+        .expect("failed to find output device");
+
+    println!("Output device: {}", output_device.name()?);
+
+    let default_output_config = output_device
+        .default_output_config()
+        .expect("Failed to get default output config");
+    println!("Default output config: {default_output_config:?}");
+
+    let output_config = cpal::StreamConfig {
+        channels: default_output_config.channels(),
+        sample_rate: cpal::SampleRate(48000),
+        buffer_size: cpal::BufferSize::Default,
+    };
+    println!("Output config: {output_config:?}");
+
+    // Create a buffer to store recorded audio data
+    let audio_buffer: Arc<Mutex<VecDeque<f32>>> =
+        Arc::new(Mutex::new(VecDeque::new()));
+
+    // Recording phase
+    println!("Begin recording...");
+
+    let buffer_clone = audio_buffer.clone();
+    let err_fn = move |err| {
+        eprintln!("an error occurred on stream: {err}");
+    };
+
+    let input_stream = input_device.build_input_stream(
+        &input_config.into(),
+        move |data, _: &_| record_to_buffer_f32(data, &buffer_clone),
+        err_fn,
+        None,
+    )?;
+
+    input_stream.play()?;
+
+    // Let recording go for roughly three seconds.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    drop(input_stream);
+
+    let buffer_size = audio_buffer
         .lock()
-        .unwrap() = recorder::AppState::RecordingAndPlaying;
+        .unwrap()
+        .len();
+    println!("Recording complete! Captured {} samples.", buffer_size);
 
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    // Playback phase
+    println!("Begin playback...");
 
-        ui::update_progress(
-            &shared,
-            recording_duration_samples,
-            &progress_manager,
-        );
+    let buffer_clone = audio_buffer.clone();
+    let playback_pos_mutex = Arc::new(Mutex::new(0));
+    let playback_pos_clone = playback_pos_mutex.clone();
 
-        let state = {
-            shared
-                .app_state
-                .lock()
-                .unwrap()
-                .clone()
-        };
-        if let recorder::AppState::Idle = state {
-            progress_manager.finish_all();
-            break;
+    let err_fn = move |err| {
+        eprintln!("an error occurred on playback stream: {err}");
+    };
+
+    let output_stream = output_device.build_output_stream(
+        &output_config.into(),
+        move |data, _: &_| {
+            play_from_buffer_f32(data, &buffer_clone, &playback_pos_clone)
+        },
+        err_fn,
+        None,
+    )?;
+
+    output_stream.play()?;
+
+    // Wait for playback to complete (roughly the same duration as recording)
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    drop(output_stream);
+
+    println!("Playback complete!");
+    Ok(())
+}
+
+type AudioBuffer = Arc<Mutex<VecDeque<f32>>>;
+
+fn record_to_buffer_f32(input: &[f32], buffer: &AudioBuffer) {
+    if let Ok(mut guard) = buffer.try_lock() {
+        for &sample in input.iter() {
+            guard.push_back(sample);
         }
     }
+}
 
-    // Playback
-    disconnect_input_sources(active_client.as_client(), &in_port_name);
-
-    // Copy to playback buffer
+fn play_from_buffer_f32(
+    output: &mut [f32],
+    buffer: &AudioBuffer,
+    playback_pos: &Arc<Mutex<usize>>,
+) {
+    if let (Ok(buffer_guard), Ok(mut pos_guard)) =
+        (buffer.try_lock(), playback_pos.try_lock())
     {
-        let mut recorded = shared
-            .record_buffer
-            .lock()
-            .unwrap();
-        let mut playback = shared
-            .playback_buffer
-            .lock()
-            .unwrap();
+        let mut pos = *pos_guard;
+        let buffer_vec: Vec<f32> = buffer_guard
+            .iter()
+            .cloned()
+            .collect();
 
-        playback.extend(recorded.drain(..));
-    }
-
-    progress_manager
-        .create_bar(
-            "playback",
-            recording_duration_samples as u64,
-            templates::PLAYBACK,
-            out_port_name.as_str(),
-        )
-        .unwrap();
-
-    *shared
-        .app_state
-        .lock()
-        .unwrap() = recorder::AppState::Playing;
-
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        ui::update_progress(
-            &shared,
-            recording_duration_samples,
-            &progress_manager,
-        );
-
-        let state = {
-            shared
-                .app_state
-                .lock()
-                .unwrap()
-                .clone()
-        };
-        if let recorder::AppState::Idle = state {
-            progress_manager.finish_all();
-            break;
+        for sample in output.iter_mut() {
+            if pos < buffer_vec.len() {
+                *sample = buffer_vec[pos];
+                pos += 1;
+            } else {
+                *sample = 0.0;
+            }
         }
-    }
 
-    tracing::info!("Exiting gracefully...");
-    if let Err(err) = active_client.deactivate() {
-        tracing::error!("Error deactivating client: {}", err);
+        *pos_guard = pos;
     }
 }
