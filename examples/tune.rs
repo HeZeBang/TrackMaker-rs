@@ -1,99 +1,146 @@
-//! Sine wave generator with frequency configuration exposed through standard
-//! input.
+use clap::Parser;
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    FromSample, Sample, SizedSample, I24, StreamConfig,
+};
 
-use crossbeam_channel::bounded;
-use std::io;
-use std::str::FromStr;
+#[derive(Parser, Debug)]
+#[command(version, about = "CPAL beep example", long_about = None)]
+struct Opt {
+    /// The audio device to use
+    #[arg(short, long, default_value_t = String::from("default"))]
+    device: String,
 
-fn main() {
-    // 1. open a client
-    let (client, _status) =
-        jack::Client::new("rust_jack_sine", jack::ClientOptions::default()).unwrap();
-
-    // 2. register port
-    let out_port = client
-        .register_port("sine_out", jack::AudioOut::default())
-        .unwrap();
-
-    // 3. define process callback handler
-    let (tx, rx) = bounded(1_000_000);
-    struct State {
-        out_port: jack::Port<jack::AudioOut>,
-        rx: crossbeam_channel::Receiver<f64>,
-        frame_t: f64,
-        time: f64,
-    }
-    let process = jack::contrib::ClosureProcessHandler::with_state(
-        State {
-            out_port,
-            rx,
-            frame_t: 1.0 / client.sample_rate() as f64,
-            time: 0.0,
-        },
-        |state, _, ps| -> jack::Control {
-            // Get output buffer
-            let out = state.out_port.as_mut_slice(ps);
-
-            // Check frequency requests
-            while let Ok(f) = state.rx.try_recv() {
-                state.time = 0.0;
-                // You can modify this logic to update specific frequencies
-                // state.frequency1 = f;
-            }
-
-            // Write output
-            for v in out.iter_mut() {
-                // Generate mixed sine wave with two frequencies
-                let x1 = 1000.0 * state.time * 2.0 * std::f64::consts::PI;
-                let x2 = 10000.0 * state.time * 2.0 * std::f64::consts::PI;
-                let y1 = x1.sin();
-                let y2 = x2.sin();
-                // Mix the two frequencies with equal amplitude
-                let mixed = (y1 + y2) * 0.5;
-                *v = mixed as f32;
-                state.time += state.frame_t;
-            }
-
-            // Continue as normal
-            jack::Control::Continue
-        },
-        move |_, _, _| jack::Control::Continue,
-    );
-
-    // 4. Activate the client. Also connect the ports to the system audio.
-    let active_client = client.activate_async((), process).unwrap();
-    active_client
-        .as_client()
-        .connect_ports_by_name("rust_jack_sine:sine_out", "system:playback_1")
-        .unwrap();
-    active_client
-        .as_client()
-        .connect_ports_by_name("rust_jack_sine:sine_out", "system:playback_2")
-        .unwrap();
-    // processing starts here
-
-    // 5. wait or do some processing while your handler is running in real time.
-    println!("Enter an integer value to change the first frequency (second frequency is fixed at 10000Hz).");
-    println!("Current frequencies: 1000Hz + 10000Hz");
-    while let Some(f) = read_freq() {
-        tx.send(f).unwrap();
-    }
-
-    // 6. Optional deactivate. Not required since active_client will deactivate on
-    // drop, though explicit deactivate may help you identify errors in
-    // deactivate.
-    if let Err(err) = active_client.deactivate() {
-        eprintln!("JACK exited with error: {err}");
-    };
+    /// Use the JACK host
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd"
+        ),
+        feature = "jack"
+    ))]
+    #[arg(short, long)]
+    #[allow(dead_code)]
+    jack: bool,
 }
 
-/// Attempt to read a frequency from standard in. Will block until there is
-/// user input. `None` is returned if there was an error reading from standard
-/// in, or the retrieved string wasn't a compatible u16 integer.
-fn read_freq() -> Option<f64> {
-    let mut user_input = String::new();
-    match io::stdin().read_line(&mut user_input) {
-        Ok(_) => u16::from_str(user_input.trim()).ok().map(|n| n as f64),
-        Err(_) => None,
+fn main() -> anyhow::Result<()> {
+    let opt = Opt::parse();
+
+    // Conditionally compile with jack if the feature is specified.
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd"
+        ),
+        feature = "jack"
+    ))]
+    // Manually check for flags. Can be passed through cargo with -- e.g.
+    // cargo run --release --example beep --features jack -- --jack
+    let host = if opt.jack {
+        cpal::host_from_id(cpal::available_hosts()
+            .into_iter()
+            .find(|id| *id == cpal::HostId::Jack)
+            .expect(
+                "make sure --features jack is specified. only works on OSes where jack is available",
+            )).expect("jack host unavailable")
+    } else {
+        cpal::default_host()
+    };
+
+    #[cfg(any(
+        not(any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd"
+        )),
+        not(feature = "jack")
+    ))]
+    let host = cpal::default_host();
+
+    let device = if opt.device == "default" {
+        host.default_output_device()
+    } else {
+        host.output_devices()?
+            .find(|x| x.name().map(|y| y == opt.device).unwrap_or(false))
+    }
+    .expect("failed to find output device");
+    println!("Output device: {}", device.name()?);
+
+    let config = device
+        .default_output_config()
+        .unwrap();
+    let cc = cpal::StreamConfig{
+        channels: config.channels(),
+        sample_rate: cpal::SampleRate(48000),
+        buffer_size: cpal::BufferSize::Default,
+    };
+    println!("Default output config: {:?}", cc);
+
+    match config.sample_format() {
+        cpal::SampleFormat::I8 => run::<i8>(&device, &config.into()),
+        cpal::SampleFormat::I16 => run::<i16>(&device, &config.into()),
+        cpal::SampleFormat::I24 => run::<I24>(&device, &config.into()),
+        cpal::SampleFormat::I32 => run::<i32>(&device, &config.into()),
+        // cpal::SampleFormat::I48 => run::<I48>(&device, &config.into()),
+        cpal::SampleFormat::I64 => run::<i64>(&device, &config.into()),
+        cpal::SampleFormat::U8 => run::<u8>(&device, &config.into()),
+        cpal::SampleFormat::U16 => run::<u16>(&device, &config.into()),
+        // cpal::SampleFormat::U24 => run::<U24>(&device, &config.into()),
+        cpal::SampleFormat::U32 => run::<u32>(&device, &config.into()),
+        // cpal::SampleFormat::U48 => run::<U48>(&device, &config.into()),
+        cpal::SampleFormat::U64 => run::<u64>(&device, &config.into()),
+        cpal::SampleFormat::F32 => run::<f32>(&device, &config.into()),
+        cpal::SampleFormat::F64 => run::<f64>(&device, &config.into()),
+        sample_format => panic!("Unsupported sample format '{sample_format}'"),
+    }
+}
+
+pub fn run<T>(device: &cpal::Device, config: &cpal::StreamConfig) -> Result<(), anyhow::Error>
+where
+    T: SizedSample + FromSample<f32>,
+{
+    let sample_rate = config.sample_rate.0 as f32;
+    let channels = config.channels as usize;
+
+    // Produce a sinusoid of maximum amplitude.
+    let mut sample_clock = 0f32;
+    let mut next_value = move || {
+        sample_clock = (sample_clock + 1.0) % sample_rate;
+        (sample_clock * 1000.0 * 2.0 * std::f32::consts::PI / sample_rate).sin() + 
+        (sample_clock * 10000.0 * 2.0 * std::f32::consts::PI / sample_rate).sin()
+    };
+
+    let err_fn = |err| eprintln!("an error occurred on stream: {err}");
+
+    let stream = device.build_output_stream(
+        config,
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            write_data(data, channels, &mut next_value)
+        },
+        err_fn,
+        None,
+    )?;
+    stream.play()?;
+
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+
+    Ok(())
+}
+
+fn write_data<T>(output: &mut [T], channels: usize, next_sample: &mut dyn FnMut() -> f32)
+where
+    T: Sample + FromSample<f32>,
+{
+    for frame in output.chunks_mut(channels) {
+        let value: T = T::from_sample(next_sample());
+        for sample in frame.iter_mut() {
+            *sample = value;
+        }
     }
 }

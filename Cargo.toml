@@ -3,6 +3,8 @@ name = "trackmaker-rs"
 version = "0.0.1"
 edition = "2024"
 
+[features]
+
 [dependencies]
 jack = "0.13.3"
 indicatif = "0.17"
@@ -10,3 +12,7 @@ symphonia = "0.5.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 crossbeam-channel = "0.5.15"
+cpal = { version = "0.16.0", features = ["jack"] }
+anyhow = "1.0.100"
+clap = { version = "4.0", features = ["derive"] }
+ringbuf = "0.3"

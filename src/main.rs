@@ -1,285 +1,138 @@
-use jack;
-mod audio;
-mod device;
-mod ui;
-mod utils;
-use audio::recorder;
-use device::jack::{
-    connect_input_from_first_system_output,
-    connect_output_to_first_system_input, disconnect_input_sources,
-    disconnect_output_sinks, print_jack_info,
+use clap::Parser;
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    FromSample, Sample, SizedSample, I24,
 };
-use tracing::info;
-use ui::print_banner;
-use ui::progress::{ProgressManager, templates};
-use utils::consts::*;
-use utils::logging::init_logging;
 
-use crate::device::jack::connect_system_ports;
+#[derive(Parser, Debug)]
+#[command(version, about = "CPAL beep example", long_about = None)]
+struct Opt {
+    /// The audio device to use
+    #[arg(short, long, default_value_t = String::from("default"))]
+    device: String,
 
-fn main() {
-    init_logging();
-    print_banner();
-    let (client, status) = jack::Client::new(
-        JACK_CLIENT_NAME,
-        jack::ClientOptions::NO_START_SERVER,
-    )
-    .unwrap();
-    tracing::info!("JACK client status: {:?}", status);
-    let (sample_rate, _buffer_size) = print_jack_info(&client);
+    /// Use the JACK host
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd"
+        ),
+        feature = "jack"
+    ))]
+    #[arg(short, long)]
+    #[allow(dead_code)]
+    jack: bool,
+}
 
-    let recording_duration_samples = sample_rate * DEFAULT_RECORD_SECONDS;
-    tracing::info!(
-        "Recording duration: {} samples ({} seconds)",
-        recording_duration_samples,
-        DEFAULT_RECORD_SECONDS
-    );
+fn main() -> anyhow::Result<()> {
+    let opt = Opt::parse();
 
-    // Shared State
-    let shared = recorder::AppShared::new(recording_duration_samples);
-    let shared_cb = shared.clone();
-
-    let in_port = client
-        .register_port(INPUT_PORT_NAME, jack::AudioIn::default())
-        .unwrap();
-    let out_port = client
-        .register_port(OUTPUT_PORT_NAME, jack::AudioOut::default())
-        .unwrap();
-
-    let in_port_name = in_port.name().unwrap();
-    let out_port_name = out_port.name().unwrap();
-
-    // Process Callback
-    let process_cb = recorder::build_process_closure(
-        in_port,
-        out_port,
-        shared_cb,
-        recording_duration_samples,
-    );
-    let process = jack::contrib::ClosureProcessHandler::new(process_cb);
-
-    let active_client = client
-        .activate_async((), process)
-        .unwrap();
-
-    // Recording
-    connect_input_from_first_system_output(
-        active_client.as_client(),
-        &in_port_name,
-    );
-
-    let progress_manager = ProgressManager::new();
-    progress_manager
-        .create_bar(
-            "recording",
-            recording_duration_samples as u64,
-            templates::RECORDING,
-            in_port_name.as_str(),
-        )
-        .unwrap();
-
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        ui::update_progress(
-            &shared,
-            recording_duration_samples,
-            &progress_manager,
-        );
-
-        let state = {
-            shared
-                .app_state
-                .lock()
-                .unwrap()
-                .clone()
-        };
-        if let recorder::AppState::Idle = state {
-            progress_manager.finish_all();
-            break;
-        }
-    }
-
-    // Playback
-    disconnect_input_sources(active_client.as_client(), &in_port_name);
-    connect_output_to_first_system_input(
-        active_client.as_client(),
-        &out_port_name,
-    );
-
-    // Copy to playback buffer
-    {
-        let mut recorded = shared
-            .record_buffer
-            .lock()
-            .unwrap();
-        let mut playback = shared
-            .playback_buffer
-            .lock()
-            .unwrap();
-
-        playback.extend(recorded.drain(..));
-    }
-
-    progress_manager
-        .create_bar(
-            "playback",
-            recording_duration_samples as u64,
-            templates::PLAYBACK,
-            out_port_name.as_str(),
-        )
-        .unwrap();
-
-    *shared
-        .app_state
-        .lock()
-        .unwrap() = recorder::AppState::Playing;
-
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        ui::update_progress(
-            &shared,
-            recording_duration_samples,
-            &progress_manager,
-        );
-
-        let state = {
-            shared
-                .app_state
-                .lock()
-                .unwrap()
-                .clone()
-        };
-        if let recorder::AppState::Idle = state {
-            progress_manager.finish_all();
-            break;
-        }
-    }
-
-    // Play music and record in the same time
-    disconnect_output_sinks(active_client.as_client(), &out_port_name);
-    connect_system_ports(
-        active_client.as_client(),
-        &in_port_name,
-        &out_port_name,
-    );
-
-    // Copy to playback buffer
-    {
-        let mut playback = shared
-            .playback_buffer
-            .lock()
-            .unwrap();
-
-        info!("Filling playback buffer with music from sample.flac");
-
-        let mut music = Vec::new();
-        audio::decoder::decode_flac_to_f32("./assets/sample.flac")
-            .unwrap_or_else(|_| {
-                tracing::warn!("Failed to decode sample.flac, using silence");
-                vec![0.0; recording_duration_samples as usize]
-            })
+    // Conditionally compile with jack if the feature is specified.
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd"
+        ),
+        feature = "jack"
+    ))]
+    // Manually check for flags. Can be passed through cargo with -- e.g.
+    // cargo run --release --example beep --features jack -- --jack
+    let host = if opt.jack {
+        cpal::host_from_id(cpal::available_hosts()
             .into_iter()
-            .take(recording_duration_samples as usize)
-            .for_each(|s| music.push(s));
+            .find(|id| *id == cpal::HostId::Jack)
+            .expect(
+                "make sure --features jack is specified. only works on OSes where jack is available",
+            )).expect("jack host unavailable")
+    } else {
+        cpal::default_host()
+    };
 
-        info!("Music length: {} samples", music.len());
+    #[cfg(any(
+        not(any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd"
+        )),
+        not(feature = "jack")
+    ))]
+    let host = cpal::default_host();
 
-        playback.extend(music.drain(..));
+    let device = if opt.device == "default" {
+        host.default_output_device()
+    } else {
+        host.output_devices()?
+            .find(|x| x.name().map(|y| y == opt.device).unwrap_or(false))
     }
+    .expect("failed to find output device");
+    println!("Output device: {}", device.name()?);
 
-    progress_manager
-        .create_bar(
-            "playrec",
-            recording_duration_samples as u64,
-            templates::PLAYREC,
-            out_port_name.as_str(),
-        )
-        .unwrap();
+    let config = device.default_output_config().unwrap();
+    println!("Default output config: {config:?}");
 
-    *shared
-        .app_state
-        .lock()
-        .unwrap() = recorder::AppState::RecordingAndPlaying;
+    match config.sample_format() {
+        cpal::SampleFormat::I8 => run::<i8>(&device, &config.into()),
+        cpal::SampleFormat::I16 => run::<i16>(&device, &config.into()),
+        cpal::SampleFormat::I24 => run::<I24>(&device, &config.into()),
+        cpal::SampleFormat::I32 => run::<i32>(&device, &config.into()),
+        // cpal::SampleFormat::I48 => run::<I48>(&device, &config.into()),
+        cpal::SampleFormat::I64 => run::<i64>(&device, &config.into()),
+        cpal::SampleFormat::U8 => run::<u8>(&device, &config.into()),
+        cpal::SampleFormat::U16 => run::<u16>(&device, &config.into()),
+        // cpal::SampleFormat::U24 => run::<U24>(&device, &config.into()),
+        cpal::SampleFormat::U32 => run::<u32>(&device, &config.into()),
+        // cpal::SampleFormat::U48 => run::<U48>(&device, &config.into()),
+        cpal::SampleFormat::U64 => run::<u64>(&device, &config.into()),
+        cpal::SampleFormat::F32 => run::<f32>(&device, &config.into()),
+        cpal::SampleFormat::F64 => run::<f64>(&device, &config.into()),
+        sample_format => panic!("Unsupported sample format '{sample_format}'"),
+    }
+}
 
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+pub fn run<T>(device: &cpal::Device, config: &cpal::StreamConfig) -> Result<(), anyhow::Error>
+where
+    T: SizedSample + FromSample<f32>,
+{
+    let sample_rate = config.sample_rate.0 as f32;
+    let channels = config.channels as usize;
 
-        ui::update_progress(
-            &shared,
-            recording_duration_samples,
-            &progress_manager,
-        );
+    // Produce a sinusoid of maximum amplitude.
+    let mut sample_clock = 0f32;
+    let mut next_value = move || {
+        sample_clock = (sample_clock + 1.0) % sample_rate;
+        (sample_clock * 440.0 * 2.0 * std::f32::consts::PI / sample_rate).sin()
+    };
 
-        let state = {
-            shared
-                .app_state
-                .lock()
-                .unwrap()
-                .clone()
-        };
-        if let recorder::AppState::Idle = state {
-            progress_manager.finish_all();
-            break;
+    let err_fn = |err| eprintln!("an error occurred on stream: {err}");
+
+    let stream = device.build_output_stream(
+        config,
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            write_data(data, channels, &mut next_value)
+        },
+        err_fn,
+        None,
+    )?;
+    stream.play()?;
+
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+
+    Ok(())
+}
+
+fn write_data<T>(output: &mut [T], channels: usize, next_sample: &mut dyn FnMut() -> f32)
+where
+    T: Sample + FromSample<f32>,
+{
+    for frame in output.chunks_mut(channels) {
+        let value: T = T::from_sample(next_sample());
+        for sample in frame.iter_mut() {
+            *sample = value;
         }
-    }
-
-    // Playback
-    disconnect_input_sources(active_client.as_client(), &in_port_name);
-
-    // Copy to playback buffer
-    {
-        let mut recorded = shared
-            .record_buffer
-            .lock()
-            .unwrap();
-        let mut playback = shared
-            .playback_buffer
-            .lock()
-            .unwrap();
-
-        playback.extend(recorded.drain(..));
-    }
-
-    progress_manager
-        .create_bar(
-            "playback",
-            recording_duration_samples as u64,
-            templates::PLAYBACK,
-            out_port_name.as_str(),
-        )
-        .unwrap();
-
-    *shared
-        .app_state
-        .lock()
-        .unwrap() = recorder::AppState::Playing;
-
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        ui::update_progress(
-            &shared,
-            recording_duration_samples,
-            &progress_manager,
-        );
-
-        let state = {
-            shared
-                .app_state
-                .lock()
-                .unwrap()
-                .clone()
-        };
-        if let recorder::AppState::Idle = state {
-            progress_manager.finish_all();
-            break;
-        }
-    }
-
-    tracing::info!("Exiting gracefully...");
-    if let Err(err) = active_client.deactivate() {
-        tracing::error!("Error deactivating client: {}", err);
     }
 }
