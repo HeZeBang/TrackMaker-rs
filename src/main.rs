@@ -1,3 +1,4 @@
+use dialoguer::{theme::ColorfulTheme, Select};
 use jack;
 mod audio;
 mod device;
@@ -19,6 +20,15 @@ use crate::device::jack::connect_system_ports;
 fn main() {
     init_logging();
     print_banner();
+
+    let selections = &["Sender", "Receiver (Simulation)"];
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select mode")
+        .default(0)
+        .items(&selections[..])
+        .interact()
+        .unwrap();
+
     let (client, status) = jack::Client::new(
         JACK_CLIENT_NAME,
         jack::ClientOptions::NO_START_SERVER,
@@ -27,7 +37,7 @@ fn main() {
     tracing::info!("JACK client status: {:?}", status);
     let (sample_rate, _buffer_size) = print_jack_info(&client);
 
-    let max_duration_samples = sample_rate * DEFAULT_RECORD_SECONDS * 3;
+    let max_duration_samples = 529300;
 
     // Shared State
     let shared = recorder::AppShared::new(max_duration_samples);
@@ -64,6 +74,25 @@ fn main() {
         out_port_name.as_str(),
     );
 
+    if selection == 0 {
+        // Sender
+        run_sender(shared, progress_manager, sample_rate as u32);
+    } else {
+        // Receiver (Simulation)
+        run_receiver(shared, progress_manager, sample_rate as u32);
+    }
+
+    tracing::info!("Exiting gracefully...");
+    if let Err(err) = active_client.deactivate() {
+        tracing::error!("Error deactivating client: {}", err);
+    }
+}
+
+fn run_sender(
+    shared: recorder::AppShared,
+    progress_manager: ProgressManager,
+    sample_rate: u32,
+) {
     // random data for 100 frame with 100 bit/frame
     let seed = 1u64; // seed 1 is a magic number
     let mut rng = rand::rngs::StdRng::from_seed([seed as u8; 32]);
@@ -163,39 +192,90 @@ fn main() {
     let output_track_len = output_track.len();
 
     {
-        let mut playback = shared
-            .playback_buffer
-            .lock()
-            .unwrap();
-
+        let mut playback = shared.playback_buffer.lock().unwrap();
         playback.extend(output_track);
-        info!("Output track length: {} samples", playback.len());
+        info!(
+            "Output track length: {} samples",
+            playback.len()
+        );
     }
-
-    let rx_fifo = {
-        let playback = shared.playback_buffer.lock().unwrap();
-        playback.clone()
-    };
-
 
     progress_manager
         .create_bar(
             "playback",
             output_track_len as u64,
             templates::PLAYBACK,
-            out_port_name.as_str(),
+            "sender",
         )
         .unwrap();
 
-    *shared
-        .app_state
-        .lock()
-        .unwrap() = recorder::AppState::Playing;
+    *shared.app_state.lock().unwrap() = recorder::AppState::Playing;
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         ui::update_progress(&shared, output_track_len, &progress_manager);
+
+        let state = { shared.app_state.lock().unwrap().clone() };
+        if let recorder::AppState::Idle = state {
+            progress_manager.finish_all();
+            break;
+        }
+    }
+}
+
+fn run_receiver(
+    shared: recorder::AppShared,
+    progress_manager: ProgressManager,
+    sample_rate: u32,
+) {
+    // Generate preamble for receiver (same as in sender)
+    let sample_rate_f32 = sample_rate as f32;
+    let t: Vec<f32> = (0..48000)
+        .map(|i| i as f32 / sample_rate_f32)
+        .collect();
+
+    // Preamble generation (440 samples)
+    let mut f_p = Vec::with_capacity(440);
+    // First 220: linear from 2kHz to 10kHz
+    for i in 0..220 {
+        f_p.push(2000.0 + (8000.0 * i as f32 / 219.0));
+    }
+    // Next 220: linear from 10kHz to 2kHz
+    for i in 0..220 {
+        f_p.push(10000.0 - (8000.0 * i as f32 / 219.0));
+    }
+
+    // Generate preamble using cumulative trapezoidal integration
+    let mut omega = 0.0;
+    let mut preamble = Vec::with_capacity(440);
+    preamble.push((2.0 * std::f32::consts::PI * f_p[0] * t[0]).sin());
+
+    for i in 1..440 {
+        let dt = t[i] - t[i - 1];
+        omega += std::f32::consts::PI * (f_p[i] + f_p[i - 1]) * dt;
+        preamble.push(omega.sin());
+    }
+
+    progress_manager
+        .create_bar(
+            "recording",
+            529300 as u64,
+            templates::RECORDING,
+            "receiver",
+        )
+        .unwrap();
+
+    // *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        ui::update_progress(
+            &shared,
+            529300,
+            &progress_manager,
+        );
 
         let state = {
             shared
@@ -210,6 +290,11 @@ fn main() {
         }
     }
 
+    let rx_fifo: std::collections::VecDeque<f32> = {
+        let record = shared.record_buffer.lock().unwrap();
+        record.iter().copied().collect()
+    };
+
     let mut power = 0.0f32;
     let mut power_debug = vec![0.0f32; rx_fifo.len()];
     let mut start_index = 0usize;
@@ -223,26 +308,41 @@ fn main() {
 
     let mut state = 0; // 0: sync, 1: decode
 
+    // This part is a bit of a hack for the simulation
+    // We need a carrier wave for decoding. In a real receiver, this would be handled differently.
+    let sample_rate_f32_decode = 48000.0;
+    let t_decode: Vec<f32> = (0..rx_fifo.len())
+        .map(|i| i as f32 / sample_rate_f32_decode)
+        .collect();
+    let fc_decode = 10000.0;
+    let carrier_decode: Vec<f32> = t_decode
+        .iter()
+        .map(|&time| (2.0 * std::f32::consts::PI * fc_decode * time).sin())
+        .collect();
+
     for i in 0..rx_fifo.len() {
         let current_sample = rx_fifo[i];
-        
-        power = power * (1.0 - 1.0/64.0) + current_sample * current_sample / 64.0;
+
+        power = power * (1.0 - 1.0 / 64.0) + current_sample * current_sample / 64.0;
         power_debug[i] = power;
-        
+
         if state == 0 {
             // Packet sync
             sync_fifo.rotate_left(1);
             sync_fifo[439] = current_sample;
-            
-            let sync_power = sync_fifo.iter()
+
+            let sync_power = sync_fifo
+                .iter()
                 .zip(preamble.iter())
                 .map(|(a, b)| a * b)
-                .sum::<f32>() / 200.0;
+                .sum::<f32>()
+                / 200.0;
             sync_power_debug[i] = sync_power;
 
-            if (sync_power > power * 2.0) 
-                && (sync_power > sync_power_local_max) 
-                && (sync_power > 0.05) {
+            if (sync_power > power * 2.0)
+                && (sync_power > sync_power_local_max)
+                && (sync_power > 0.05)
+            {
                 sync_power_local_max = sync_power;
                 start_index = i;
             } else if (i > start_index + 200) && (start_index != 0) {
@@ -256,12 +356,12 @@ fn main() {
             }
         } else if state == 1 {
             decode_fifo.push(current_sample);
-            
+
             if decode_fifo.len() == 44 * 108 {
                 // Decode
                 let decode_len = decode_fifo.len();
-                let carrier_slice = &carrier[..decode_len.min(carrier.len())];
-                
+                let carrier_slice = &carrier_decode[..decode_len.min(carrier_decode.len())];
+
                 // Remove carrier (simplified smoothing)
                 let mut decode_remove_carrier = Vec::with_capacity(decode_len);
                 for j in 0..decode_len {
@@ -272,7 +372,7 @@ fn main() {
                         .sum();
                     decode_remove_carrier.push(sum / (end - start) as f32);
                 }
-                
+
                 let mut decode_power_bit = vec![false; 108];
                 for j in 0..108 {
                     let start_idx = 10 + j * 44;
@@ -282,7 +382,7 @@ fn main() {
                         decode_power_bit[j] = sum > 0.0;
                     }
                 }
-                
+
                 // CRC check (simplified - just compare first 8 bits with expected ID)
                 let mut temp_index = 0u8;
                 for k in 0..8 {
@@ -290,14 +390,14 @@ fn main() {
                         temp_index += 1 << (7 - k);
                     }
                 }
-                
+
                 if temp_index > 0 && temp_index <= 100 {
                     info!("Correct, ID: {}", temp_index);
                     correct_frame_num += 1;
                 } else {
                     info!("Error in frame");
                 }
-                
+
                 start_index = 0;
                 decode_fifo.clear();
                 state = 0;
@@ -306,9 +406,4 @@ fn main() {
     }
 
     info!("Total Correct: {}", correct_frame_num);
-
-    tracing::info!("Exiting gracefully...");
-    if let Err(err) = active_client.deactivate() {
-        tracing::error!("Error deactivating client: {}", err);
-    }
 }
