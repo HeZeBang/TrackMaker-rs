@@ -49,7 +49,7 @@ $$
 
 # 参考的实现
 
-参考 [SamplePHY.m](/SamplePHY.m)，我们分为两个模块：Sender，Receiver
+参考 `SamplePHY.m`，我们分为两个模块：Sender，Receiver
 
 ## Sender
 
