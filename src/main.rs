@@ -21,7 +21,7 @@ fn main() {
     init_logging();
     print_banner();
 
-    let selections = &["Sender", "Receiver (Simulation)"];
+    let selections = &["Sender", "Receiver"];
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Select mode")
         .default(0)
@@ -78,7 +78,7 @@ fn main() {
         // Sender
         run_sender(shared, progress_manager, sample_rate as u32);
     } else {
-        // Receiver (Simulation)
+        // Receiver
         run_receiver(shared, progress_manager, sample_rate as u32, max_duration_samples as u32);
     }
 
