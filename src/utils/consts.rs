@@ -1,6 +1,9 @@
 /// 默认录音时长（秒）- 增加到30秒以应对FSK较低的传输效率
 pub const DEFAULT_RECORD_SECONDS: usize = 30;
 
+/// 接收端最大等待时间（秒）- FSK解调需要更长的处理时间
+pub const RECEIVER_MAX_WAIT_SECONDS: usize = 18;
+
 /// 日志级别（可被 RUST_LOG 覆盖）
 pub const LOG_LEVEL: &str = "info";
 

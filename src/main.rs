@@ -38,8 +38,8 @@ fn main() {
     tracing::info!("JACK client status: {:?}", status);
     let (sample_rate, _buffer_size) = print_jack_info(&client);
 
-    // 增加最大录音时长以适应FSK较低的传输效率 (30秒)
-    let max_duration_samples = sample_rate * 30;
+    // 使用常量设置最大录音时长以适应FSK较低的传输效率
+    let max_duration_samples = sample_rate * RECEIVER_MAX_WAIT_SECONDS;
 
     // Shared State
     let shared = recorder::AppShared::new(max_duration_samples);
