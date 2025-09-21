@@ -5,6 +5,7 @@ mod device;
 mod ui;
 mod utils;
 use audio::recorder;
+use audio::fsk::{FSKModulator, FSKDemodulator};
 use device::jack::{
     print_jack_info,
 };
@@ -37,7 +38,8 @@ fn main() {
     tracing::info!("JACK client status: {:?}", status);
     let (sample_rate, _buffer_size) = print_jack_info(&client);
 
-    let max_duration_samples = sample_rate * 15;
+    // 增加最大录音时长以适应FSK较低的传输效率 (30秒)
+    let max_duration_samples = sample_rate * 30;
 
     // Shared State
     let shared = recorder::AppShared::new(max_duration_samples);
@@ -118,31 +120,23 @@ fn run_sender(
     }
 
     // PHY Frame generation
-    // Generate time vector for 1 second at 48kHz
+    // 创建FSK调制器
+    let mut fsk_modulator = FSKModulator::new(sample_rate as f32);
+
+    // Preamble generation (440 samples) - 保持与原来相同的线性扫频前导码
     let sample_rate_f32 = sample_rate as f32;
     let t: Vec<f32> = (0..48000)
         .map(|i| i as f32 / sample_rate_f32)
         .collect();
 
-    // Carrier frequency 10kHz
-    let fc = 10000.0;
-    let carrier: Vec<f32> = t
-        .iter()
-        .map(|&time| (2.0 * std::f32::consts::PI * fc * time).sin())
-        .collect();
-
-    // CRC8 polynomial: x^8+x^7+x^5+x^2+x+1 (0x1D7)
-    let _crc8_poly = 0x1D7u16;
-
-    // Preamble generation (440 samples)
     let mut f_p = Vec::with_capacity(440);
-    // First 220: linear from 2kHz to 10kHz
+    // First 220: linear from 2kHz to 12kHz (扩展到FSK的最高频率)
     for i in 0..220 {
-        f_p.push(2000.0 + (8000.0 * i as f32 / 219.0));
+        f_p.push(2000.0 + (10000.0 * i as f32 / 219.0));
     }
-    // Next 220: linear from 10kHz to 2kHz
+    // Next 220: linear from 12kHz to 2kHz
     for i in 0..220 {
-        f_p.push(10000.0 - (8000.0 * i as f32 / 219.0));
+        f_p.push(12000.0 - (10000.0 * i as f32 / 219.0));
     }
 
     // Generate preamble using cumulative trapezoidal integration
@@ -164,17 +158,8 @@ fn run_sender(
         let mut frame_crc = frame.clone();
         frame_crc.extend_from_slice(&[0u8; 8]); // Add 8 CRC bits (placeholder)
 
-        // Modulation: 44 samples per bit, baudrate ~1000bps
-        let mut frame_wave = Vec::with_capacity(frame_crc.len() * 44);
-        for (j, &bit) in frame_crc.iter().enumerate() {
-            let start_idx = j * 44;
-            let end_idx = (j + 1) * 44;
-            let amplitude = if bit == 1 { 1.0 } else { -1.0 };
-
-            for k in start_idx..end_idx.min(carrier.len()) {
-                frame_wave.push(carrier[k] * amplitude);
-            }
-        }
+        // FSK调制: 使用新的码率 (800bps, 60 samples per bit)
+        let frame_wave = fsk_modulator.modulate_bits(&frame_crc);
 
         // Add preamble
         let mut frame_wave_pre = preamble.clone();
@@ -236,15 +221,15 @@ fn run_receiver(
         .map(|i| i as f32 / sample_rate_f32)
         .collect();
 
-    // Preamble generation (440 samples)
+    // Preamble generation (440 samples) - 匹配发送端的频率范围
     let mut f_p = Vec::with_capacity(440);
-    // First 220: linear from 2kHz to 10kHz
+    // First 220: linear from 2kHz to 12kHz
     for i in 0..220 {
-        f_p.push(2000.0 + (8000.0 * i as f32 / 219.0));
+        f_p.push(2000.0 + (10000.0 * i as f32 / 219.0));
     }
-    // Next 220: linear from 10kHz to 2kHz
+    // Next 220: linear from 12kHz to 2kHz
     for i in 0..220 {
-        f_p.push(10000.0 - (8000.0 * i as f32 / 219.0));
+        f_p.push(12000.0 - (10000.0 * i as f32 / 219.0));
     }
 
     // Generate preamble using cumulative trapezoidal integration
@@ -296,6 +281,9 @@ fn run_receiver(
         record.iter().copied().collect()
     };
 
+    // 创建FSK解调器
+    let mut fsk_demodulator = FSKDemodulator::new(sample_rate as f32);
+
     let mut power = 0.0f32;
     let mut power_debug = vec![0.0f32; rx_fifo.len()];
     let mut start_index = 0usize;
@@ -308,18 +296,6 @@ fn run_receiver(
     let mut correct_frame_num = 0;
 
     let mut state = 0; // 0: sync, 1: decode
-
-    // This part is a bit of a hack for the simulation
-    // We need a carrier wave for decoding. In a real receiver, this would be handled differently.
-    let sample_rate_f32_decode = 48000.0;
-    let t_decode: Vec<f32> = (0..rx_fifo.len())
-        .map(|i| i as f32 / sample_rate_f32_decode)
-        .collect();
-    let fc_decode = 10000.0;
-    let carrier_decode: Vec<f32> = t_decode
-        .iter()
-        .map(|&time| (2.0 * std::f32::consts::PI * fc_decode * time).sin())
-        .collect();
 
     for i in 0..rx_fifo.len() {
         let current_sample = rx_fifo[i];
@@ -358,45 +334,28 @@ fn run_receiver(
         } else if state == 1 {
             decode_fifo.push(current_sample);
 
-            if decode_fifo.len() == 44 * 108 {
-                // Decode
-                let decode_len = decode_fifo.len();
-                let carrier_slice = &carrier_decode[..decode_len.min(carrier_decode.len())];
+            // FSK解调: 调整为新的比特长度 (60 samples/bit * 108 bits = 6480 samples)
+            if decode_fifo.len() == SAMPLES_PER_BIT * 108 {
+                // 使用FSK解调器解码
+                let decoded_bits = fsk_demodulator.demodulate_samples(&decode_fifo);
 
-                // Remove carrier (simplified smoothing)
-                let mut decode_remove_carrier = Vec::with_capacity(decode_len);
-                for j in 0..decode_len {
-                    let start = j.saturating_sub(5);
-                    let end = (j + 6).min(decode_len);
-                    let sum: f32 = (start..end)
-                        .map(|k| decode_fifo[k] * carrier_slice.get(k).unwrap_or(&0.0))
-                        .sum();
-                    decode_remove_carrier.push(sum / (end - start) as f32);
-                }
-
-                let mut decode_power_bit = vec![false; 108];
-                for j in 0..108 {
-                    let start_idx = 10 + j * 44;
-                    let end_idx = (30 + j * 44).min(decode_remove_carrier.len());
-                    if start_idx < decode_remove_carrier.len() && start_idx < end_idx {
-                        let sum: f32 = decode_remove_carrier[start_idx..end_idx].iter().sum();
-                        decode_power_bit[j] = sum > 0.0;
+                if decoded_bits.len() >= 8 {
+                    // CRC check (simplified - just compare first 8 bits with expected ID)
+                    let mut temp_index = 0u8;
+                    for k in 0..8 {
+                        if decoded_bits[k] == 1 {
+                            temp_index += 1 << (7 - k);
+                        }
                     }
-                }
 
-                // CRC check (simplified - just compare first 8 bits with expected ID)
-                let mut temp_index = 0u8;
-                for k in 0..8 {
-                    if decode_power_bit[k] {
-                        temp_index += 1 << (7 - k);
+                    if temp_index > 0 && temp_index <= 100 {
+                        info!("Correct, ID: {}", temp_index);
+                        correct_frame_num += 1;
+                    } else {
+                        info!("Error in frame, decoded ID: {}", temp_index);
                     }
-                }
-
-                if temp_index > 0 && temp_index <= 100 {
-                    info!("Correct, ID: {}", temp_index);
-                    correct_frame_num += 1;
                 } else {
-                    info!("Error in frame");
+                    info!("Error: insufficient decoded bits");
                 }
 
                 start_index = 0;
