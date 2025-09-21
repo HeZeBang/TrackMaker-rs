@@ -75,6 +75,10 @@ fn main() {
         .interact()
         .unwrap();
 
+    {
+        shared.record_buffer.lock().unwrap().clear();
+    }
+
     if selection == 0 {
         // Sender
         run_sender(shared, progress_manager, sample_rate as u32);
