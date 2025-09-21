@@ -5,6 +5,7 @@ mod device;
 mod ui;
 mod utils;
 use audio::recorder;
+use audio::psk::{PskModulator, PskDemodulator, utils as psk_utils};
 use device::jack::{
     print_jack_info,
 };
@@ -93,6 +94,13 @@ fn run_sender(
     progress_manager: ProgressManager,
     sample_rate: u32,
 ) {
+    // PSK Configuration
+    let sample_rate_f32 = sample_rate as f32;
+    let carrier_freq = 10000.0; // 10kHz carrier
+    let symbol_rate = 1000.0;   // 1000 symbols/second
+    
+    let modulator = PskModulator::new(sample_rate_f32, carrier_freq, symbol_rate);
+    
     // random data for 100 frame with 100 bit/frame
     let seed = 1u64; // seed 1 is a magic number
     let mut rng = rand::rngs::StdRng::from_seed([seed as u8; 32]);
@@ -117,46 +125,15 @@ fn run_sender(
         }
     }
 
-    // PHY Frame generation
-    // Generate time vector for 1 second at 48kHz
-    let sample_rate_f32 = sample_rate as f32;
-    let t: Vec<f32> = (0..48000)
-        .map(|i| i as f32 / sample_rate_f32)
-        .collect();
+    // Generate chirp preamble for synchronization (440 samples)
+    let preamble = psk_utils::generate_chirp_preamble(
+        sample_rate_f32,
+        2000.0,  // Start at 2kHz
+        10000.0, // End at 10kHz
+        440      // 440 samples duration
+    );
 
-    // Carrier frequency 10kHz
-    let fc = 10000.0;
-    let carrier: Vec<f32> = t
-        .iter()
-        .map(|&time| (2.0 * std::f32::consts::PI * fc * time).sin())
-        .collect();
-
-    // CRC8 polynomial: x^8+x^7+x^5+x^2+x+1 (0x1D7)
-    let _crc8_poly = 0x1D7u16;
-
-    // Preamble generation (440 samples)
-    let mut f_p = Vec::with_capacity(440);
-    // First 220: linear from 2kHz to 10kHz
-    for i in 0..220 {
-        f_p.push(2000.0 + (8000.0 * i as f32 / 219.0));
-    }
-    // Next 220: linear from 10kHz to 2kHz
-    for i in 0..220 {
-        f_p.push(10000.0 - (8000.0 * i as f32 / 219.0));
-    }
-
-    // Generate preamble using cumulative trapezoidal integration
-    let mut omega = 0.0;
-    let mut preamble = Vec::with_capacity(440);
-    preamble.push((2.0 * std::f32::consts::PI * f_p[0] * t[0]).sin());
-
-    for i in 1..440 {
-        let dt = t[i] - t[i - 1];
-        omega += std::f32::consts::PI * (f_p[i] + f_p[i - 1]) * dt;
-        preamble.push(omega.sin());
-    }
-
-    // Process each frame
+    // Process each frame using PSK
     for i in 0..100 {
         let frame = &frames[i];
 
@@ -164,17 +141,8 @@ fn run_sender(
         let mut frame_crc = frame.clone();
         frame_crc.extend_from_slice(&[0u8; 8]); // Add 8 CRC bits (placeholder)
 
-        // Modulation: 44 samples per bit, baudrate ~1000bps
-        let mut frame_wave = Vec::with_capacity(frame_crc.len() * 44);
-        for (j, &bit) in frame_crc.iter().enumerate() {
-            let start_idx = j * 44;
-            let end_idx = (j + 1) * 44;
-            let amplitude = if bit == 1 { 1.0 } else { -1.0 };
-
-            for k in start_idx..end_idx.min(carrier.len()) {
-                frame_wave.push(carrier[k] * amplitude);
-            }
-        }
+        // PSK Modulation
+        let frame_wave = modulator.modulate_bpsk(&frame_crc);
 
         // Add preamble
         let mut frame_wave_pre = preamble.clone();
@@ -195,7 +163,7 @@ fn run_sender(
         let mut playback = shared.playback_buffer.lock().unwrap();
         playback.extend(output_track);
         info!(
-            "Output track length: {} samples",
+            "Output track length: {} samples (PSK modulated)",
             playback.len()
         );
     }
@@ -230,33 +198,20 @@ fn run_receiver(
     sample_rate: u32,
     max_recording_duration_samples: u32,
 ) {
-    // Generate preamble for receiver (same as in sender)
+    // PSK Configuration
     let sample_rate_f32 = sample_rate as f32;
-    let t: Vec<f32> = (0..48000)
-        .map(|i| i as f32 / sample_rate_f32)
-        .collect();
+    let carrier_freq = 10000.0; // 10kHz carrier
+    let symbol_rate = 1000.0;   // 1000 symbols/second
+    
+    let demodulator = PskDemodulator::new(sample_rate_f32, carrier_freq, symbol_rate);
 
-    // Preamble generation (440 samples)
-    let mut f_p = Vec::with_capacity(440);
-    // First 220: linear from 2kHz to 10kHz
-    for i in 0..220 {
-        f_p.push(2000.0 + (8000.0 * i as f32 / 219.0));
-    }
-    // Next 220: linear from 10kHz to 2kHz
-    for i in 0..220 {
-        f_p.push(10000.0 - (8000.0 * i as f32 / 219.0));
-    }
-
-    // Generate preamble using cumulative trapezoidal integration
-    let mut omega = 0.0;
-    let mut preamble = Vec::with_capacity(440);
-    preamble.push((2.0 * std::f32::consts::PI * f_p[0] * t[0]).sin());
-
-    for i in 1..440 {
-        let dt = t[i] - t[i - 1];
-        omega += std::f32::consts::PI * (f_p[i] + f_p[i - 1]) * dt;
-        preamble.push(omega.sin());
-    }
+    // Generate chirp preamble for synchronization (same as sender)
+    let preamble = psk_utils::generate_chirp_preamble(
+        sample_rate_f32,
+        2000.0,  // Start at 2kHz
+        10000.0, // End at 10kHz
+        440      // 440 samples duration
+    );
 
     progress_manager
         .create_bar(
@@ -266,8 +221,6 @@ fn run_receiver(
             "receiver",
         )
         .unwrap();
-
-    // *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -291,120 +244,83 @@ fn run_receiver(
         }
     }
 
-    let rx_fifo: std::collections::VecDeque<f32> = {
+    let rx_signal: Vec<f32> = {
         let record = shared.record_buffer.lock().unwrap();
         record.iter().copied().collect()
     };
 
-    let mut power = 0.0f32;
-    let mut power_debug = vec![0.0f32; rx_fifo.len()];
-    let mut start_index = 0usize;
-    let mut start_index_debug = vec![0.0f32; rx_fifo.len()];
-    let mut sync_fifo = vec![0.0f32; 440];
-    let mut sync_power_debug = vec![0.0f32; rx_fifo.len()];
-    let mut sync_power_local_max = 0.0f32;
+    if rx_signal.is_empty() {
+        info!("No signal received");
+        return;
+    }
 
-    let mut decode_fifo = Vec::new();
+    info!("Processing received signal with PSK demodulation...");
+
     let mut correct_frame_num = 0;
+    let samples_per_symbol = (sample_rate_f32 / symbol_rate) as usize;
+    let frame_length_samples = 108 * samples_per_symbol; // 108 bits per frame (100 + 8 CRC)
+    let preamble_length = preamble.len();
 
-    let mut state = 0; // 0: sync, 1: decode
-
-    // This part is a bit of a hack for the simulation
-    // We need a carrier wave for decoding. In a real receiver, this would be handled differently.
-    let sample_rate_f32_decode = 48000.0;
-    let t_decode: Vec<f32> = (0..rx_fifo.len())
-        .map(|i| i as f32 / sample_rate_f32_decode)
-        .collect();
-    let fc_decode = 10000.0;
-    let carrier_decode: Vec<f32> = t_decode
-        .iter()
-        .map(|&time| (2.0 * std::f32::consts::PI * fc_decode * time).sin())
-        .collect();
-
-    for i in 0..rx_fifo.len() {
-        let current_sample = rx_fifo[i];
-
-        power = power * (1.0 - 1.0 / 64.0) + current_sample * current_sample / 64.0;
-        power_debug[i] = power;
-
-        if state == 0 {
-            // Packet sync
-            sync_fifo.rotate_left(1);
-            sync_fifo[439] = current_sample;
-
-            let sync_power = sync_fifo
-                .iter()
-                .zip(preamble.iter())
-                .map(|(a, b)| a * b)
-                .sum::<f32>()
-                / 200.0;
-            sync_power_debug[i] = sync_power;
-
-            if (sync_power > power * 2.0)
-                && (sync_power > sync_power_local_max)
-                && (sync_power > 0.05)
-            {
-                sync_power_local_max = sync_power;
-                start_index = i;
-            } else if (i > start_index + 200) && (start_index != 0) {
-                start_index_debug[start_index] = 1.5;
-                sync_power_local_max = 0.0;
-                sync_fifo.fill(0.0);
-                state = 1;
-
-                // Convert VecDeque slice to Vec
-                decode_fifo = rx_fifo.range(start_index + 1..i).copied().collect();
-            }
-        } else if state == 1 {
-            decode_fifo.push(current_sample);
-
-            if decode_fifo.len() == 44 * 108 {
-                // Decode
-                let decode_len = decode_fifo.len();
-                let carrier_slice = &carrier_decode[..decode_len.min(carrier_decode.len())];
-
-                // Remove carrier (simplified smoothing)
-                let mut decode_remove_carrier = Vec::with_capacity(decode_len);
-                for j in 0..decode_len {
-                    let start = j.saturating_sub(5);
-                    let end = (j + 6).min(decode_len);
-                    let sum: f32 = (start..end)
-                        .map(|k| decode_fifo[k] * carrier_slice.get(k).unwrap_or(&0.0))
-                        .sum();
-                    decode_remove_carrier.push(sum / (end - start) as f32);
-                }
-
-                let mut decode_power_bit = vec![false; 108];
-                for j in 0..108 {
-                    let start_idx = 10 + j * 44;
-                    let end_idx = (30 + j * 44).min(decode_remove_carrier.len());
-                    if start_idx < decode_remove_carrier.len() && start_idx < end_idx {
-                        let sum: f32 = decode_remove_carrier[start_idx..end_idx].iter().sum();
-                        decode_power_bit[j] = sum > 0.0;
-                    }
-                }
-
-                // CRC check (simplified - just compare first 8 bits with expected ID)
-                let mut temp_index = 0u8;
-                for k in 0..8 {
-                    if decode_power_bit[k] {
-                        temp_index += 1 << (7 - k);
-                    }
-                }
-
-                if temp_index > 0 && temp_index <= 100 {
-                    info!("Correct, ID: {}", temp_index);
-                    correct_frame_num += 1;
-                } else {
-                    info!("Error in frame");
-                }
-
-                start_index = 0;
-                decode_fifo.clear();
-                state = 0;
-            }
+    // Cross-correlate with preamble to find frame starts
+    let correlation = psk_utils::cross_correlate(&rx_signal, &preamble);
+    
+    // Find correlation peaks above threshold
+    let correlation_threshold = correlation.iter().fold(0.0f32, |acc, &x| acc.max(x)) * 0.3;
+    
+    let mut frame_starts = Vec::new();
+    let mut i = 0;
+    while i < correlation.len() {
+        if correlation[i] > correlation_threshold {
+            // Found a potential frame start
+            frame_starts.push(i + preamble_length); // Frame starts after preamble
+            
+            // Skip ahead to avoid detecting the same frame multiple times
+            i += frame_length_samples;
+        } else {
+            i += 1;
         }
     }
 
-    info!("Total Correct: {}", correct_frame_num);
+    info!("Found {} potential frames", frame_starts.len());
+
+    // Demodulate each detected frame
+    for (frame_idx, &frame_start) in frame_starts.iter().enumerate() {
+        let frame_end = frame_start + frame_length_samples;
+        
+        if frame_end <= rx_signal.len() {
+            let frame_signal = &rx_signal[frame_start..frame_end];
+            
+            // Demodulate using PSK
+            let demodulated_bits = demodulator.demodulate_bpsk(frame_signal);
+            
+            if demodulated_bits.len() >= 8 {
+                // Extract frame ID from first 8 bits
+                let mut frame_id = 0u8;
+                for k in 0..8 {
+                    if demodulated_bits[k] == 1 {
+                        frame_id += 1 << (7 - k);
+                    }
+                }
+
+                if frame_id > 0 && frame_id <= 100 {
+                    info!("Frame {}: Correct, ID: {}", frame_idx + 1, frame_id);
+                    correct_frame_num += 1;
+                } else {
+                    info!("Frame {}: Error in frame, decoded ID: {}", frame_idx + 1, frame_id);
+                }
+            } else {
+                info!("Frame {}: Insufficient bits demodulated", frame_idx + 1);
+            }
+        } else {
+            info!("Frame {}: Signal too short for complete frame", frame_idx + 1);
+        }
+    }
+
+    info!("Total Correct Frames: {} / {}", correct_frame_num, frame_starts.len());
+    
+    // Calculate success rate
+    if !frame_starts.is_empty() {
+        let success_rate = (correct_frame_num as f32 / frame_starts.len() as f32) * 100.0;
+        info!("Success Rate: {:.1}%", success_rate);
+    }
 }
