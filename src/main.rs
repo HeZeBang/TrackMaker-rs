@@ -1,5 +1,6 @@
 use dialoguer::{theme::ColorfulTheme, Select};
 use jack;
+use std::io::Write;
 mod audio;
 mod device;
 mod ui;
@@ -20,14 +21,6 @@ use crate::device::jack::connect_system_ports;
 fn main() {
     init_logging();
     print_banner();
-
-    let selections = &["Sender", "Receiver"];
-    let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select mode")
-        .default(0)
-        .items(&selections[..])
-        .interact()
-        .unwrap();
 
     let (client, status) = jack::Client::new(
         JACK_CLIENT_NAME,
@@ -74,6 +67,14 @@ fn main() {
         out_port_name.as_str(),
     );
 
+    let selections = &["Sender", "Receiver"];
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select mode")
+        .default(0)
+        .items(&selections[..])
+        .interact()
+        .unwrap();
+
     if selection == 0 {
         // Sender
         run_sender(shared, progress_manager, sample_rate as u32);
@@ -93,27 +94,44 @@ fn run_sender(
     progress_manager: ProgressManager,
     sample_rate: u32,
 ) {
-    // random data for 100 frame with 100 bit/frame
-    let seed = 1u64; // seed 1 is a magic number
-    let mut rng = rand::rngs::StdRng::from_seed([seed as u8; 32]);
-
+    // Read content from think-different.txt file
+    let file_content = std::fs::read_to_string("assets/think-different.txt")
+        .expect("Failed to read think-different.txt");
+    
+    // Convert text content to bits (ASCII encoding)
+    let text_bits: Vec<u8> = file_content
+        .bytes()
+        .flat_map(|byte| {
+            (0..8).map(move |i| ((byte >> (7 - i)) & 1) as u8)
+        })
+        .collect();
+    
+    let mut rng = rand::rngs::StdRng::from_seed([1u8; 32]);
     let mut output_track = Vec::new();
 
     // 100 frames, each 100 bits
     let mut frames = vec![vec![0u8; 100]; 100];
 
-    // Fill with random 0s and 1s
+    // Fill frames with content from think-different.txt
+    let mut bit_index = 0;
     for i in 0..100 {
-        for j in 0..100 {
-            frames[i][j] = rng.random_range(0..=1);
-        }
-    }
-
-    // Set first 8 bits to id
-    for i in 0..100 {
+        // Set first 8 bits to frame ID
         let id = i + 1; // 1-indexed like MATLAB
         for j in 0..8 {
             frames[i][j] = ((id >> (7 - j)) & 1) as u8;
+        }
+        
+        // Fill remaining 92 bits with content from file
+        for j in 8..100 {
+            if bit_index < text_bits.len() {
+                frames[i][j] = text_bits[bit_index];
+                bit_index += 1;
+            } else {
+                // If we run out of file content, wrap around
+                bit_index = 0;
+                frames[i][j] = text_bits[bit_index];
+                bit_index += 1;
+            }
         }
     }
 
@@ -306,6 +324,7 @@ fn run_receiver(
 
     let mut decode_fifo = Vec::new();
     let mut correct_frame_num = 0;
+    let mut decoded_content = Vec::new(); // Store decoded content for streaming output
 
     let mut state = 0; // 0: sync, 1: decode
 
@@ -393,10 +412,38 @@ fn run_receiver(
                 }
 
                 if temp_index > 0 && temp_index <= 100 {
-                    info!("Correct, ID: {}", temp_index);
+                    info!("正确接收，帧ID: {}", temp_index);
                     correct_frame_num += 1;
+                    
+                    // Extract data bits (skip first 8 bits which are ID)
+                    let data_bits = &decode_power_bit[8..100];
+                    decoded_content.extend_from_slice(data_bits);
+                    
+                    // Convert accumulated bits to text and output
+                    if decoded_content.len() >= 8 {
+                        let mut output_text = String::new();
+                        let mut i = 0;
+                        while i + 8 <= decoded_content.len() {
+                            let mut byte = 0u8;
+                            for j in 0..8 {
+                                if decoded_content[i + j] {
+                                    byte |= 1 << (7 - j);
+                                }
+                            }
+                            output_text.push(byte as char);
+                            i += 8;
+                        }
+                        
+                        if !output_text.is_empty() {
+                            print!("{}", output_text);
+                            std::io::stdout().flush().unwrap();
+                        }
+                        
+                        // Remove processed bits
+                        decoded_content.drain(0..i);
+                    }
                 } else {
-                    info!("Error in frame");
+                    info!("帧错误");
                 }
 
                 start_index = 0;
@@ -406,5 +453,26 @@ fn run_receiver(
         }
     }
 
-    info!("Total Correct: {}", correct_frame_num);
+    // Output any remaining decoded content
+    if !decoded_content.is_empty() {
+        let mut output_text = String::new();
+        let mut i = 0;
+        while i + 8 <= decoded_content.len() {
+            let mut byte = 0u8;
+            for j in 0..8 {
+                if decoded_content[i + j] {
+                    byte |= 1 << (7 - j);
+                }
+            }
+            output_text.push(byte as char);
+            i += 8;
+        }
+        
+        if !output_text.is_empty() {
+            print!("{}", output_text);
+            std::io::stdout().flush().unwrap();
+        }
+    }
+    
+    println!("\n接收完成！总共正确接收帧数: {}", correct_frame_num);
 }
