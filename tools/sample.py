@@ -135,19 +135,38 @@ def create_audio_dashboard(audio_data, sample_rate):
     # 创建子图
     fig = make_subplots(
         rows=2, cols=2,
-        subplot_titles=('波形图', '频谱图', '频谱图', '统计信息'),
+        subplot_titles=('波形图', '频谱图', '时频谱图', '统计信息'),
         specs=[[{"secondary_y": False}, {"secondary_y": False}],
-               [{"type": "heatmap"}, {"type": "table"}]]
+               [{"type": "heatmap"}, {"type": "table"}]],
+        vertical_spacing=0.08  # 调整垂直间距
     )
     
-    # 波形图
+def create_audio_dashboard(audio_data, sample_rate):
+    """创建音频分析仪表板"""
+    # 使用更简单的方法：分别创建时间轴相关的图表，然后组合
+    from plotly.subplots import make_subplots
+    
+    # 创建具有共享x轴的子图
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=('波形图', '频谱图', '时频谱图', '统计信息'),
+        specs=[[{"secondary_y": False}, {"secondary_y": False}],
+               [{"type": "heatmap"}, {"type": "table"}]],
+        shared_xaxes="columns",  # 按列共享x轴
+        vertical_spacing=0.08
+    )
+    
+    # 计算时间轴
     time = np.linspace(0, len(audio_data) / sample_rate, len(audio_data))
+    
+    # 波形图 (row=1, col=1)
     fig.add_trace(
-        go.Scatter(x=time, y=audio_data, mode='lines', name='波形'),
+        go.Scatter(x=time, y=audio_data, mode='lines', name='波形', 
+                  line=dict(color='blue', width=1)),
         row=1, col=1
     )
     
-    # 频谱图
+    # 频谱图 (row=1, col=2)
     fft = np.fft.fft(audio_data)
     freqs = np.fft.fftfreq(len(audio_data), 1/sample_rate)
     positive_freqs = freqs[:len(freqs)//2]
@@ -155,11 +174,11 @@ def create_audio_dashboard(audio_data, sample_rate):
     
     fig.add_trace(
         go.Scatter(x=positive_freqs, y=20 * np.log10(magnitude + 1e-10), 
-                  mode='lines', name='频谱'),
+                  mode='lines', name='频谱', line=dict(color='red', width=1)),
         row=1, col=2
     )
     
-    # 频谱图
+    # 时频谱图 (row=2, col=1) - 与波形图共享x轴
     frequencies, times, Sxx = signal.spectrogram(
         audio_data, sample_rate, nperseg=1024, noverlap=512
     )
@@ -197,6 +216,15 @@ def create_audio_dashboard(audio_data, sample_rate):
         title_text="音频分析仪表板",
         showlegend=False
     )
+    
+    # 配置轴标签
+    fig.update_xaxes(title_text="时间 (秒)", row=1, col=1)
+    fig.update_xaxes(title_text="频率 (Hz)", row=1, col=2) 
+    fig.update_xaxes(title_text="时间 (秒)", row=2, col=1)
+    
+    fig.update_yaxes(title_text="振幅", row=1, col=1)
+    fig.update_yaxes(title_text="幅度 (dB)", row=1, col=2)
+    fig.update_yaxes(title_text="频率 (Hz)", row=2, col=1)
     
     return fig
 
@@ -240,8 +268,7 @@ def main():
     data = load_audio_data(json_file)
     
     if data is None:
-        print("使用示例数据进行演示...")
-        data = create_sample_data()
+        return -1
     
     # 提取音频数据
     try:
@@ -257,10 +284,7 @@ def main():
         
     except (KeyError, ValueError) as e:
         print(f"数据格式错误: {e}")
-        print("使用示例数据...")
-        data = create_sample_data()
-        audio_data = np.array(data['audio_data'])
-        sample_rate = data['sample_rate']
+        return -2
     
     # 生成各种可视化图表
     print("\n正在生成可视化图表...")
