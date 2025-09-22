@@ -74,6 +74,8 @@ fn main() {
             in_port_name.as_str(),
         )
         .unwrap();
+    
+    *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));

@@ -1,4 +1,5 @@
 use jack;
+use trackmaker_rs::audio::recorder;
 
 fn main() {
     println!("Hello, world!");
@@ -72,6 +73,8 @@ fn main() {
         }
     }
 
+    let shared = recorder::AppShared::new(10 * sample_rate as usize);
+    *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
     println!("Audio processing started. Running for 10 seconds...");
 
     // Wait for 10 seconds
