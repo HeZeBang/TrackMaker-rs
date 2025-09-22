@@ -1,0 +1,11 @@
+[package]
+name = "psk800rc2-test"
+version = "0.0.1"
+edition = "2021"
+
+[[bin]]
+name = "simple_test"
+path = "src/simple_test.rs"
+
+[dependencies]
+num-complex = "0.4"
