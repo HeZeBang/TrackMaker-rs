@@ -10,7 +10,7 @@ use device::jack::{
     print_jack_info,
 };
 use rand::{self, Rng, SeedableRng};
-use tracing::info;
+use tracing::{debug, info};
 use ui::print_banner;
 use ui::progress::{ProgressManager, templates};
 use utils::consts::*;
@@ -416,7 +416,7 @@ fn run_receiver(
                 }
 
                 if temp_index > 0 && temp_index <= 100 {
-                    info!("正确接收，帧ID: {}", temp_index);
+                    debug!("Frame ID: {}", temp_index);
                     correct_frame_num += 1;
                     
                     // Extract data bits (skip first 8 bits which are ID)
@@ -447,7 +447,7 @@ fn run_receiver(
                         decoded_content.drain(0..i);
                     }
                 } else {
-                    info!("帧错误");
+                    debug!("Wrong Frame ID: {}", temp_index);
                 }
 
                 start_index = 0;
