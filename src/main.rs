@@ -293,7 +293,7 @@ fn run_receiver(
         )
         .unwrap();
 
-    // *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
+    *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
