@@ -1,3 +1,4 @@
+use clap::Parser;
 use dialoguer::{theme::ColorfulTheme, Select};
 use jack;
 use std::io::Write;
@@ -9,7 +10,6 @@ use audio::recorder;
 use device::jack::{
     print_jack_info,
 };
-use rand::{self, Rng, SeedableRng};
 use tracing::{debug, info};
 use ui::print_banner;
 use ui::progress::{ProgressManager, templates};
@@ -18,8 +18,364 @@ use utils::logging::init_logging;
 
 use crate::device::jack::connect_system_ports;
 
+/// PSK800RC2 数字调制解调器
+#[derive(Parser)]
+#[command(name = "trackmaker")]
+#[command(about = "基于 fldigi PSK800RC2 模式的数字调制解调器")]
+struct Args {
+    /// 运行测试模式（不使用 JACK 音频设备）
+    #[arg(long)]
+    test: bool,
+}
+
+// PSK800RC2 参数
+const SYMBOL_RATE: f32 = 800.0; // 符号速率 800 Hz
+const CARRIER_FREQ: f32 = 1500.0; // 载波频率 1500 Hz
+const SAMPLE_RATE: u32 = 48000; // 采样率 48 kHz
+const SAMPLES_PER_SYMBOL: usize = (SAMPLE_RATE as f32 / SYMBOL_RATE) as usize; // 60 samples per symbol
+const RC_ALPHA: f32 = 0.35; // 根余弦滤波器滚降因子
+const PREAMBLE_BITS: usize = 32; // 前导码长度
+const SYNC_WORD: u32 = 0x1ACFFC1D; // 同步字
+
+// PSK800RC2 调制器结构
+struct PSK800RC2Modulator {
+    sample_rate: f32,
+    carrier_freq: f32,
+    symbol_rate: f32,
+    samples_per_symbol: usize,
+    phase: f32,
+    rc_filter: Vec<f32>,
+}
+
+impl PSK800RC2Modulator {
+    fn new() -> Self {
+        let samples_per_symbol = SAMPLES_PER_SYMBOL;
+        let rc_filter = Self::generate_rc_filter(samples_per_symbol, RC_ALPHA);
+        
+        Self {
+            sample_rate: SAMPLE_RATE as f32,
+            carrier_freq: CARRIER_FREQ,
+            symbol_rate: SYMBOL_RATE,
+            samples_per_symbol,
+            phase: 0.0,
+            rc_filter,
+        }
+    }
+    
+    /// 生成根余弦滤波器
+    fn generate_rc_filter(samples_per_symbol: usize, alpha: f32) -> Vec<f32> {
+        let filter_length = samples_per_symbol * 8; // 8 个符号长度
+        let mut filter = Vec::with_capacity(filter_length);
+        let t_symbol = samples_per_symbol as f32;
+        
+        for i in 0..filter_length {
+            let t = (i as f32 - filter_length as f32 / 2.0) / t_symbol;
+            
+            if t == 0.0 {
+                filter.push(1.0);
+            } else if (4.0 * alpha * t).abs() == 1.0 {
+                let val = (std::f32::consts::PI / 4.0) * 
+                    ((1.0 + alpha) * (std::f32::consts::PI * (1.0 + alpha) / (4.0 * alpha)).sin() + 
+                     (1.0 - alpha) * (std::f32::consts::PI * (1.0 - alpha) / (4.0 * alpha)).cos());
+                filter.push(val / (std::f32::consts::PI * alpha));
+            } else {
+                let numerator = (std::f32::consts::PI * t).sin() * 
+                    (std::f32::consts::PI * alpha * t).cos();
+                let denominator = std::f32::consts::PI * t * 
+                    (1.0 - (4.0 * alpha * t).powi(2));
+                filter.push(numerator / denominator);
+            }
+        }
+        
+        // 归一化滤波器
+        let sum: f32 = filter.iter().sum();
+        if sum > 0.0 {
+            for coeff in &mut filter {
+                *coeff /= sum;
+            }
+        }
+        
+        filter
+    }
+    
+    /// 调制比特数据
+    fn modulate(&mut self, bits: &[u8]) -> Vec<f32> {
+        let mut output = Vec::new();
+        let mut symbol_buffer = vec![0.0f32; self.rc_filter.len()];
+        
+        for &bit in bits {
+            // BPSK: 0 -> -1, 1 -> +1
+            let symbol = if bit == 0 { -1.0 } else { 1.0 };
+            
+            // 脉冲成形
+            symbol_buffer.rotate_left(self.samples_per_symbol);
+            for i in 0..self.samples_per_symbol {
+                symbol_buffer[symbol_buffer.len() - self.samples_per_symbol + i] = 0.0;
+            }
+            symbol_buffer[symbol_buffer.len() - self.samples_per_symbol] = symbol;
+            
+            // 应用根余弦滤波器
+            let mut filtered_samples = vec![0.0f32; self.samples_per_symbol];
+            for i in 0..self.samples_per_symbol {
+                let mut sum = 0.0;
+                for (j, &coeff) in self.rc_filter.iter().enumerate() {
+                    let buffer_idx = (symbol_buffer.len() - self.rc_filter.len() + j + i) % symbol_buffer.len();
+                    sum += coeff * symbol_buffer[buffer_idx];
+                }
+                filtered_samples[i] = sum;
+            }
+            
+            // 载波调制
+            for sample in filtered_samples {
+                let carrier = (2.0 * std::f32::consts::PI * self.carrier_freq * self.phase / self.sample_rate).cos();
+                output.push(sample * carrier);
+                self.phase += 1.0;
+                if self.phase >= self.sample_rate {
+                    self.phase = 0.0;
+                }
+            }
+        }
+        
+        output
+    }
+}
+
+// PSK800RC2 解调器结构
+struct PSK800RC2Demodulator {
+    sample_rate: f32,
+    carrier_freq: f32,
+    symbol_rate: f32,
+    samples_per_symbol: usize,
+    phase: f32,
+    i_buffer: Vec<f32>,
+    q_buffer: Vec<f32>,
+    symbol_buffer: Vec<f32>,
+    bit_sync_phase: f32,
+    last_symbol: f32,
+    sync_state: SyncState,
+    sync_word_buffer: u32,
+    bits_since_sync: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SyncState {
+    Searching,
+    Synchronized,
+}
+
+impl PSK800RC2Demodulator {
+    fn new() -> Self {
+        Self {
+            sample_rate: SAMPLE_RATE as f32,
+            carrier_freq: CARRIER_FREQ,
+            symbol_rate: SYMBOL_RATE,
+            samples_per_symbol: SAMPLES_PER_SYMBOL,
+            phase: 0.0,
+            i_buffer: Vec::new(),
+            q_buffer: Vec::new(),
+            symbol_buffer: Vec::new(),
+            bit_sync_phase: 0.0,
+            last_symbol: 0.0,
+            sync_state: SyncState::Searching,
+            sync_word_buffer: 0,
+            bits_since_sync: 0,
+        }
+    }
+    
+    /// 解调音频信号
+    fn demodulate(&mut self, samples: &[f32]) -> Vec<u8> {
+        let mut bits = Vec::new();
+        
+        for &sample in samples {
+            // 正交解调
+            let i_sample = sample * (2.0 * std::f32::consts::PI * self.carrier_freq * self.phase / self.sample_rate).cos();
+            let q_sample = sample * -(2.0 * std::f32::consts::PI * self.carrier_freq * self.phase / self.sample_rate).sin();
+            
+            self.i_buffer.push(i_sample);
+            self.q_buffer.push(q_sample);
+            
+            // 低通滤波（简单的移动平均）
+            let window_size = self.samples_per_symbol / 4;
+            if self.i_buffer.len() > window_size {
+                self.i_buffer.remove(0);
+                self.q_buffer.remove(0);
+            }
+            
+            let i_filtered: f32 = self.i_buffer.iter().sum::<f32>() / self.i_buffer.len() as f32;
+            let q_filtered: f32 = self.q_buffer.iter().sum::<f32>() / self.q_buffer.len() as f32;
+            
+            // 计算符号
+            let symbol = (i_filtered.atan2(q_filtered) - self.last_symbol).cos();
+            self.symbol_buffer.push(symbol);
+            
+            // 符号采样
+            self.bit_sync_phase += self.symbol_rate / self.sample_rate;
+            if self.bit_sync_phase >= 1.0 {
+                self.bit_sync_phase -= 1.0;
+                
+                if let Some(&sampled_symbol) = self.symbol_buffer.last() {
+                    let bit = if sampled_symbol > 0.0 { 1 } else { 0 };
+                    
+                    // 同步检测
+                    self.sync_word_buffer = (self.sync_word_buffer << 1) | bit as u32;
+                    
+                    match self.sync_state {
+                        SyncState::Searching => {
+                            if self.sync_word_buffer == SYNC_WORD {
+                                self.sync_state = SyncState::Synchronized;
+                                self.bits_since_sync = 0;
+                                debug!("找到同步字，开始接收数据");
+                            }
+                        }
+                        SyncState::Synchronized => {
+                            if self.bits_since_sync >= PREAMBLE_BITS {
+                                bits.push(bit);
+                            }
+                            self.bits_since_sync += 1;
+                            
+                            // 检查是否丢失同步
+                            if self.bits_since_sync > 10000 { // 10000 比特后重新搜索同步
+                                self.sync_state = SyncState::Searching;
+                                debug!("同步丢失，重新搜索同步字");
+                            }
+                        }
+                    }
+                }
+                
+                self.symbol_buffer.clear();
+            }
+            
+            self.phase += 1.0;
+            if self.phase >= self.sample_rate {
+                self.phase = 0.0;
+            }
+        }
+        
+        bits
+    }
+}
+
+/// 将比特转换为字节
+fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for chunk in bits.chunks(8) {
+        if chunk.len() == 8 {
+            let mut byte = 0u8;
+            for (i, &bit) in chunk.iter().enumerate() {
+                byte |= (bit & 1) << (7 - i);
+            }
+            bytes.push(byte);
+        }
+    }
+    bytes
+}
+
+/// 将字节转换为比特
+fn bytes_to_bits(bytes: &[u8]) -> Vec<u8> {
+    let mut bits = Vec::new();
+    for &byte in bytes {
+        for i in 0..8 {
+            bits.push((byte >> (7 - i)) & 1);
+        }
+    }
+    bits
+}
+
+/// 生成同步序列
+fn generate_sync_sequence() -> Vec<u8> {
+    let mut sync_bits = Vec::new();
+    
+    // 前导码：交替的 0101... 模式，用于时钟恢复
+    for i in 0..PREAMBLE_BITS {
+        sync_bits.push((i % 2) as u8);
+    }
+    
+    // 同步字
+    let sync_word_bits = bytes_to_bits(&SYNC_WORD.to_be_bytes());
+    sync_bits.extend(sync_word_bits);
+    
+    sync_bits
+}
+
+/// 测试模式 - 不使用 JACK 音频设备
+fn test_psk800rc2() {
+    println!("开始 PSK800RC2 测试模式...");
+    
+    // 读取测试数据
+    let test_data = std::fs::read_to_string("assets/think-different.txt")
+        .expect("无法读取 think-different.txt 文件");
+    println!("原始数据长度: {} 字节", test_data.len());
+    println!("原始数据内容: {}", test_data.trim());
+    
+    // 准备发送数据
+    let data_bytes = test_data.as_bytes();
+    let data_bits = bytes_to_bits(data_bytes);
+    
+    // 生成完整的发送比特序列
+    let mut tx_bits = generate_sync_sequence();
+    tx_bits.extend(data_bits);
+    println!("总发送比特数: {}", tx_bits.len());
+    
+    // 调制
+    let mut modulator = PSK800RC2Modulator::new();
+    let modulated_signal = modulator.modulate(&tx_bits);
+    println!("调制信号长度: {} 样本", modulated_signal.len());
+    
+    // 保存调制信号到文件
+    utils::dump::dump_to_wav("./tmp/psk800rc2_test.wav", &utils::dump::AudioData {
+        sample_rate: SAMPLE_RATE,
+        audio_data: modulated_signal.clone(),
+        duration: modulated_signal.len() as f32 / SAMPLE_RATE as f32,
+        channels: 1,
+    }).expect("无法保存 WAV 文件");
+    info!("已保存调制信号到 ./tmp/psk800rc2_test.wav");
+    
+    // 解调
+    let mut demodulator = PSK800RC2Demodulator::new();
+    let rx_bits = demodulator.demodulate(&modulated_signal);
+    println!("接收到的比特数: {}", rx_bits.len());
+    
+    // 转换为字节并解码
+    let rx_bytes = bits_to_bytes(&rx_bits);
+    if let Ok(decoded_text) = String::from_utf8(rx_bytes) {
+        println!("解码数据长度: {} 字节", decoded_text.len());
+        println!("解码数据内容: {}", decoded_text.trim());
+        
+        // 比较结果
+        let original = test_data.trim();
+        let decoded = decoded_text.trim();
+        
+        if original == decoded {
+            println!("✅ 测试通过！编码解码完全匹配");
+        } else {
+            println!("⚠️  部分匹配，比较前 {} 个字符:", original.len().min(decoded.len()));
+            let match_len = original.chars().zip(decoded.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+            println!("匹配长度: {} 字符", match_len);
+            
+            if match_len > 0 {
+                println!("✅ 部分测试通过！前 {} 个字符匹配", match_len);
+            } else {
+                println!("❌ 测试失败！没有匹配的字符");
+            }
+        }
+    } else {
+        println!("❌ 解码失败！接收到的数据不是有效的 UTF-8");
+    }
+}
+
 fn main() {
+    let args = Args::parse();
+    
     init_logging();
+    
+    if args.test {
+        // 测试模式 - 不使用 JACK
+        test_psk800rc2();
+        return;
+    }
+    
     print_banner();
 
     let (client, status) = jack::Client::new(
@@ -67,9 +423,9 @@ fn main() {
         out_port_name.as_str(),
     );
 
-    let selections = &["Sender", "Receiver", "Test (no JACK)"];
+    let selections = &["PSK800RC2 发送模式", "PSK800RC2 接收模式"];
     let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select mode")
+        .with_prompt("选择模式")
         .default(0)
         .items(&selections[..])
         .interact()
@@ -80,150 +436,49 @@ fn main() {
     }
 
     if selection == 0 {
-        // Sender
-        run_sender(shared, progress_manager, sample_rate as u32);
-    } else if selection == 1 {
-        // Receiver
-        run_receiver(shared, progress_manager, sample_rate as u32, max_duration_samples as u32);
+        // PSK800RC2 Sender
+        run_psk800rc2_sender(shared, progress_manager, sample_rate as u32);
     } else {
-        // Test mode (no JACK)
-        test_sender_receiver();
-        return;
+        // PSK800RC2 Receiver
+        run_psk800rc2_receiver(shared, progress_manager, sample_rate as u32, max_duration_samples as u32);
     }
 
-    tracing::info!("Exiting gracefully...");
+    tracing::info!("正在优雅退出...");
     if let Err(err) = active_client.deactivate() {
-        tracing::error!("Error deactivating client: {}", err);
+        tracing::error!("关闭客户端时出错: {}", err);
     }
 }
 
-fn run_sender(
+/// PSK800RC2 发送模式
+fn run_psk800rc2_sender(
     shared: recorder::AppShared,
     progress_manager: ProgressManager,
     sample_rate: u32,
 ) {
-    // Read content from think-different.txt file
+    // 读取测试数据
     let file_content = std::fs::read_to_string("assets/think-different.txt")
-        .expect("Failed to read think-different.txt");
+        .expect("无法读取 think-different.txt");
     
-    // Convert text content to bits (ASCII encoding)
-    let text_bits: Vec<u8> = file_content
-        .bytes()
-        .flat_map(|byte| {
-            (0..8).map(move |i| ((byte >> (7 - i)) & 1) as u8)
-        })
-        .collect();
+    println!("发送数据: {}", file_content.trim());
     
-    let mut rng = rand::rngs::StdRng::from_seed([1u8; 32]);
-    let mut output_track = Vec::new();
-
-    // 100 frames, each 100 bits
-    let mut frames = vec![vec![0u8; 100]; 100];
-
-    // Fill frames with content from think-different.txt
-    let mut bit_index = 0;
-    for i in 0..100 {
-        // Set first 8 bits to frame ID
-        let id = i + 1; // 1-indexed like MATLAB
-        for j in 0..8 {
-            frames[i][j] = ((id >> (7 - j)) & 1) as u8;
-        }
-        
-        // Fill remaining 92 bits with content from file
-        for j in 8..100 {
-            if bit_index < text_bits.len() {
-                frames[i][j] = text_bits[bit_index];
-                bit_index += 1;
-            } else {
-                // If we run out of file content, wrap around
-                bit_index = 0;
-                frames[i][j] = text_bits[bit_index];
-                bit_index += 1;
-            }
-        }
-    }
-
-    // PHY Frame generation
-    // Generate time vector for 1 second at 48kHz
-    let sample_rate_f32 = sample_rate as f32;
-    let t: Vec<f32> = (0..48000)
-        .map(|i| i as f32 / sample_rate_f32)
-        .collect();
-
-    // Carrier frequency 10kHz
-    let fc = 10000.0;
-    let carrier: Vec<f32> = t
-        .iter()
-        .map(|&time| (2.0 * std::f32::consts::PI * fc * time).sin())
-        .collect();
-
-    // CRC8 polynomial: x^8+x^7+x^5+x^2+x+1 (0x1D7)
-    let _crc8_poly = 0x1D7u16;
-
-    // Preamble generation (440 samples)
-    let mut f_p = Vec::with_capacity(440);
-    // First 220: linear from 2kHz to 10kHz
-    for i in 0..220 {
-        f_p.push(2000.0 + (8000.0 * i as f32 / 219.0));
-    }
-    // Next 220: linear from 10kHz to 2kHz
-    for i in 0..220 {
-        f_p.push(10000.0 - (8000.0 * i as f32 / 219.0));
-    }
-
-    // Generate preamble using cumulative trapezoidal integration
-    let mut omega = 0.0;
-    let mut preamble = Vec::with_capacity(440);
-    preamble.push((2.0 * std::f32::consts::PI * f_p[0] * t[0]).sin());
-
-    for i in 1..440 {
-        let dt = t[i] - t[i - 1];
-        omega += std::f32::consts::PI * (f_p[i] + f_p[i - 1]) * dt;
-        preamble.push(omega.sin());
-    }
-
-    // Process each frame
-    for i in 0..100 {
-        let frame = &frames[i];
-
-        // Add CRC8 (simplified implementation)
-        let mut frame_crc = frame.clone();
-        frame_crc.extend_from_slice(&[0u8; 8]); // Add 8 CRC bits (placeholder)
-
-        // Modulation: 44 samples per bit, baudrate ~1000bps
-        let mut frame_wave = Vec::with_capacity(frame_crc.len() * 44);
-        for (j, &bit) in frame_crc.iter().enumerate() {
-            let start_idx = j * 44;
-            let end_idx = (j + 1) * 44;
-            let amplitude = if bit == 1 { 1.0 } else { -1.0 };
-
-            for k in start_idx..end_idx.min(carrier.len()) {
-                frame_wave.push(carrier[k] * amplitude);
-            }
-        }
-
-        // Add preamble
-        let mut frame_wave_pre = preamble.clone();
-        frame_wave_pre.extend(frame_wave);
-
-        // Add random inter-frame spacing
-        let inter_frame_space1: usize = rng.random_range(0..100);
-        let inter_frame_space2: usize = rng.random_range(0..100);
-
-        output_track.extend(vec![0.0; inter_frame_space1]);
-        output_track.extend(frame_wave_pre);
-        output_track.extend(vec![0.0; inter_frame_space2]);
-    }
-
-    let output_track_len = output_track.len();
-
+    // 准备发送数据
+    let data_bytes = file_content.as_bytes();
+    let data_bits = bytes_to_bits(data_bytes);
+    
+    // 生成完整的发送比特序列
+    let mut tx_bits = generate_sync_sequence();
+    tx_bits.extend(data_bits);
+    
+    // PSK800RC2 调制
+    let mut modulator = PSK800RC2Modulator::new();
+    let modulated_signal = modulator.modulate(&tx_bits);
+    
+    let output_track_len = modulated_signal.len();
+    
     {
         let mut playback = shared.playback_buffer.lock().unwrap();
-        playback.extend(output_track);
-        info!(
-            "Output track length: {} samples",
-            playback.len()
-        );
+        playback.extend(modulated_signal);
+        info!("PSK800RC2 输出信号长度: {} 样本", playback.len());
     }
 
     progress_manager
@@ -231,7 +486,7 @@ fn run_sender(
             "playback",
             output_track_len as u64,
             templates::PLAYBACK,
-            "sender",
+            "PSK800RC2 发送",
         )
         .unwrap();
 
@@ -250,46 +505,19 @@ fn run_sender(
     }
 }
 
-fn run_receiver(
+/// PSK800RC2 接收模式
+fn run_psk800rc2_receiver(
     shared: recorder::AppShared,
     progress_manager: ProgressManager,
     sample_rate: u32,
     max_recording_duration_samples: u32,
 ) {
-    // Generate preamble for receiver (same as in sender)
-    let sample_rate_f32 = sample_rate as f32;
-    let t: Vec<f32> = (0..48000)
-        .map(|i| i as f32 / sample_rate_f32)
-        .collect();
-
-    // Preamble generation (440 samples)
-    let mut f_p = Vec::with_capacity(440);
-    // First 220: linear from 2kHz to 10kHz
-    for i in 0..220 {
-        f_p.push(2000.0 + (8000.0 * i as f32 / 219.0));
-    }
-    // Next 220: linear from 10kHz to 2kHz
-    for i in 0..220 {
-        f_p.push(10000.0 - (8000.0 * i as f32 / 219.0));
-    }
-
-    // Generate preamble using cumulative trapezoidal integration
-    let mut omega = 0.0;
-    let mut preamble = Vec::with_capacity(440);
-    preamble.push((2.0 * std::f32::consts::PI * f_p[0] * t[0]).sin());
-
-    for i in 1..440 {
-        let dt = t[i] - t[i - 1];
-        omega += std::f32::consts::PI * (f_p[i] + f_p[i - 1]) * dt;
-        preamble.push(omega.sin());
-    }
-
     progress_manager
         .create_bar(
             "recording",
             max_recording_duration_samples as u64,
             templates::RECORDING,
-            "receiver",
+            "PSK800RC2 接收",
         )
         .unwrap();
 
@@ -317,478 +545,23 @@ fn run_receiver(
         }
     }
 
-    let rx_fifo: std::collections::VecDeque<f32> = {
+    let rx_samples: Vec<f32> = {
         let record = shared.record_buffer.lock().unwrap();
         record.iter().copied().collect()
     };
 
-    let mut power = 0.0f32;
-    let mut power_debug = vec![0.0f32; rx_fifo.len()];
-    let mut start_index = 0usize;
-    let mut start_index_debug = vec![0.0f32; rx_fifo.len()];
-    let mut sync_fifo = vec![0.0f32; 440];
-    let mut sync_power_debug = vec![0.0f32; rx_fifo.len()];
-    let mut sync_power_local_max = 0.0f32;
-
-    let mut decode_fifo = Vec::new();
-    let mut correct_frame_num = 0;
-    let mut decoded_content = Vec::new(); // Store decoded content for streaming output
-
-    let mut state = 0; // 0: sync, 1: decode
-
-    // This part is a bit of a hack for the simulation
-    // We need a carrier wave for decoding. In a real receiver, this would be handled differently.
-    let sample_rate_f32_decode = 48000.0;
-    let t_decode: Vec<f32> = (0..rx_fifo.len())
-        .map(|i| i as f32 / sample_rate_f32_decode)
-        .collect();
-    let fc_decode = 10000.0;
-    let carrier_decode: Vec<f32> = t_decode
-        .iter()
-        .map(|&time| (2.0 * std::f32::consts::PI * fc_decode * time).sin())
-        .collect();
-
-    for i in 0..rx_fifo.len() {
-        let current_sample = rx_fifo[i];
-
-        power = power * (1.0 - 1.0 / 64.0) + current_sample * current_sample / 64.0;
-        power_debug[i] = power;
-
-        if state == 0 {
-            // Packet sync
-            sync_fifo.rotate_left(1);
-            sync_fifo[439] = current_sample;
-
-            let sync_power = sync_fifo
-                .iter()
-                .zip(preamble.iter())
-                .map(|(a, b)| a * b)
-                .sum::<f32>()
-                / 200.0;
-            sync_power_debug[i] = sync_power;
-
-            if (sync_power > power * 2.0)
-                && (sync_power > sync_power_local_max)
-                && (sync_power > 0.05)
-            {
-                sync_power_local_max = sync_power;
-                start_index = i;
-            } else if (i > start_index + 200) && (start_index != 0) {
-                start_index_debug[start_index] = 1.5;
-                sync_power_local_max = 0.0;
-                sync_fifo.fill(0.0);
-                state = 1;
-
-                // Convert VecDeque slice to Vec
-                decode_fifo = rx_fifo.range(start_index + 1..i).copied().collect();
-            }
-        } else if state == 1 {
-            decode_fifo.push(current_sample);
-
-            if decode_fifo.len() == 44 * 108 {
-                // Decode
-                let decode_len = decode_fifo.len();
-                let carrier_slice = &carrier_decode[..decode_len.min(carrier_decode.len())];
-
-                // Remove carrier (simplified smoothing)
-                let mut decode_remove_carrier = Vec::with_capacity(decode_len);
-                for j in 0..decode_len {
-                    let start = j.saturating_sub(5);
-                    let end = (j + 6).min(decode_len);
-                    let sum: f32 = (start..end)
-                        .map(|k| decode_fifo[k] * carrier_slice.get(k).unwrap_or(&0.0))
-                        .sum();
-                    decode_remove_carrier.push(sum / (end - start) as f32);
-                }
-
-                let mut decode_power_bit = vec![false; 108];
-                for j in 0..108 {
-                    let start_idx = 10 + j * 44;
-                    let end_idx = (30 + j * 44).min(decode_remove_carrier.len());
-                    if start_idx < decode_remove_carrier.len() && start_idx < end_idx {
-                        let sum: f32 = decode_remove_carrier[start_idx..end_idx].iter().sum();
-                        decode_power_bit[j] = sum > 0.0;
-                    }
-                }
-
-                // CRC check (simplified - just compare first 8 bits with expected ID)
-                let mut temp_index = 0u8;
-                for k in 0..8 {
-                    if decode_power_bit[k] {
-                        temp_index += 1 << (7 - k);
-                    }
-                }
-
-                if temp_index > 0 && temp_index <= 100 {
-                    debug!("Frame ID: {}", temp_index);
-                    correct_frame_num += 1;
-                    
-                    // Extract data bits (skip first 8 bits which are ID)
-                    let data_bits = &decode_power_bit[8..100];
-                    decoded_content.extend_from_slice(data_bits);
-                    
-                    // Convert accumulated bits to text and output
-                    if decoded_content.len() >= 8 {
-                        let mut output_text = String::new();
-                        let mut i = 0;
-                        while i + 8 <= decoded_content.len() {
-                            let mut byte = 0u8;
-                            for j in 0..8 {
-                                if decoded_content[i + j] {
-                                    byte |= 1 << (7 - j);
-                                }
-                            }
-                            output_text.push(byte as char);
-                            i += 8;
-                        }
-                        
-                        if !output_text.is_empty() {
-                            print!("{}", output_text);
-                            std::io::stdout().flush().unwrap();
-                        }
-                        
-                        // Remove processed bits
-                        decoded_content.drain(0..i);
-                    }
-                } else {
-                    debug!("Wrong Frame ID: {}", temp_index);
-                }
-
-                start_index = 0;
-                decode_fifo.clear();
-                state = 0;
-            }
-        }
-    }
-
-    // Output any remaining decoded content
-    if !decoded_content.is_empty() {
-        let mut output_text = String::new();
-        let mut i = 0;
-        while i + 8 <= decoded_content.len() {
-            let mut byte = 0u8;
-            for j in 0..8 {
-                if decoded_content[i + j] {
-                    byte |= 1 << (7 - j);
-                }
-            }
-            output_text.push(byte as char);
-            i += 8;
-        }
-        
-        if !output_text.is_empty() {
-            print!("{}", output_text);
-            std::io::stdout().flush().unwrap();
-        }
-    }
+    println!("开始 PSK800RC2 解调...");
+    let mut demodulator = PSK800RC2Demodulator::new();
+    let rx_bits = demodulator.demodulate(&rx_samples);
     
-    println!("\n接收完成！总共正确接收帧数: {}", correct_frame_num);
-}
-
-fn test_sender_receiver() {
-    println!("开始测试发送和接收功能...");
+    println!("接收到 {} 比特", rx_bits.len());
     
-    // Read content from think-different.txt file
-    let file_content = std::fs::read_to_string("assets/think-different.txt")
-        .expect("Failed to read think-different.txt");
-    
-    println!("原始文件内容:\n{}", file_content);
-    println!("原始文件长度: {} bytes", file_content.len());
-    
-    // Convert text content to bits (ASCII encoding)
-    let text_bits: Vec<u8> = file_content
-        .bytes()
-        .flat_map(|byte| {
-            (0..8).map(move |i| ((byte >> (7 - i)) & 1) as u8)
-        })
-        .collect();
-    
-    let mut rng = rand::rngs::StdRng::from_seed([1u8; 32]);
-    let mut output_track = Vec::new();
-
-    // 100 frames, each 100 bits
-    let mut frames = vec![vec![0u8; 100]; 100];
-
-    // Fill frames with content from think-different.txt
-    let mut bit_index = 0;
-    for i in 0..100 {
-        // Set first 8 bits to frame ID
-        let id = i + 1; // 1-indexed like MATLAB
-        for j in 0..8 {
-            frames[i][j] = ((id >> (7 - j)) & 1) as u8;
-        }
-        
-        // Fill remaining 92 bits with content from file
-        for j in 8..100 {
-            if bit_index < text_bits.len() {
-                frames[i][j] = text_bits[bit_index];
-                bit_index += 1;
-            } else {
-                // If we run out of file content, wrap around
-                bit_index = 0;
-                frames[i][j] = text_bits[bit_index];
-                bit_index += 1;
-            }
-        }
-    }
-
-    // PHY Frame generation
-    let sample_rate = 48000u32;
-    let sample_rate_f32 = sample_rate as f32;
-    let t: Vec<f32> = (0..48000)
-        .map(|i| i as f32 / sample_rate_f32)
-        .collect();
-
-    // Carrier frequency 10kHz
-    let fc = 10000.0;
-    let carrier: Vec<f32> = t
-        .iter()
-        .map(|&time| (2.0 * std::f32::consts::PI * fc * time).sin())
-        .collect();
-
-    // Preamble generation (440 samples)
-    let mut f_p = Vec::with_capacity(440);
-    // First 220: linear from 2kHz to 10kHz
-    for i in 0..220 {
-        f_p.push(2000.0 + (8000.0 * i as f32 / 219.0));
-    }
-    // Next 220: linear from 10kHz to 2kHz
-    for i in 0..220 {
-        f_p.push(10000.0 - (8000.0 * i as f32 / 219.0));
-    }
-
-    // Generate preamble using cumulative trapezoidal integration
-    let mut omega = 0.0;
-    let mut preamble = Vec::with_capacity(440);
-    preamble.push((2.0 * std::f32::consts::PI * f_p[0] * t[0]).sin());
-
-    for i in 1..440 {
-        let dt = t[i] - t[i - 1];
-        omega += std::f32::consts::PI * (f_p[i] + f_p[i - 1]) * dt;
-        preamble.push(omega.sin());
-    }
-
-    // Process each frame
-    for i in 0..100 {
-        let frame = &frames[i];
-
-        // Add CRC8 (simplified implementation)
-        let mut frame_crc = frame.clone();
-        frame_crc.extend_from_slice(&[0u8; 8]); // Add 8 CRC bits (placeholder)
-
-        // Modulation: 44 samples per bit, baudrate ~1000bps
-        let mut frame_wave = Vec::with_capacity(frame_crc.len() * 44);
-        for (j, &bit) in frame_crc.iter().enumerate() {
-            let start_idx = j * 44;
-            let end_idx = (j + 1) * 44;
-            let amplitude = if bit == 1 { 1.0 } else { -1.0 };
-
-            for k in start_idx..end_idx.min(carrier.len()) {
-                frame_wave.push(carrier[k] * amplitude);
-            }
-        }
-
-        // Add preamble
-        let mut frame_wave_pre = preamble.clone();
-        frame_wave_pre.extend(frame_wave);
-
-        // Add random inter-frame spacing
-        let inter_frame_space1: usize = rng.random_range(0..100);
-        let inter_frame_space2: usize = rng.random_range(0..100);
-
-        output_track.extend(vec![0.0; inter_frame_space1]);
-        output_track.extend(frame_wave_pre);
-        output_track.extend(vec![0.0; inter_frame_space2]);
-    }
-
-    debug!("Total length: {} samples", output_track.len());
-
-    // dump json
-    utils::dump::dump_to_json("./tmp/output.json", &utils::dump::AudioData {
-        sample_rate,
-        audio_data: output_track.clone(),
-        duration: output_track.len() as f32 / sample_rate as f32,
-        channels: 1,
-    })
-        .expect("Failed to dump output track to JSON");
-    info!("Dumped output track to ./tmp/output.json");
-
-    utils::dump::dump_to_wav("./tmp/output.wav", &utils::dump::AudioData {
-        sample_rate,
-        audio_data: output_track.clone(),
-        duration: output_track.len() as f32 / sample_rate as f32,
-        channels: 1,
-    })
-        .expect("Failed to dump output track to WAV");
-    info!("Dumped output track to ./tmp/output.wav");
-
-    // Now decode the output_track
-    let rx_fifo: Vec<f32> = output_track;
-
-    let mut power = 0.0f32;
-    let mut start_index = 0usize;
-    let mut sync_fifo = vec![0.0f32; 440];
-    let mut sync_power_local_max = 0.0f32;
-
-    let mut decode_fifo = Vec::new();
-    let mut correct_frame_num = 0;
-    let mut decoded_content = Vec::new();
-    let mut decoded_text = String::new();
-
-    let mut state = 0; // 0: sync, 1: decode
-
-    // This part is a bit of a hack for the simulation
-    let sample_rate_f32_decode = 48000.0;
-    let t_decode: Vec<f32> = (0..rx_fifo.len())
-        .map(|i| i as f32 / sample_rate_f32_decode)
-        .collect();
-    let fc_decode = 10000.0;
-    let carrier_decode: Vec<f32> = t_decode
-        .iter()
-        .map(|&time| (2.0 * std::f32::consts::PI * fc_decode * time).sin())
-        .collect();
-
-    for i in 0..rx_fifo.len() {
-        let current_sample = rx_fifo[i];
-
-        power = power * (1.0 - 1.0 / 64.0) + current_sample * current_sample / 64.0;
-
-        if state == 0 {
-            // Packet sync
-            sync_fifo.rotate_left(1);
-            sync_fifo[439] = current_sample;
-
-            let sync_power = sync_fifo
-                .iter()
-                .zip(preamble.iter())
-                .map(|(a, b)| a * b)
-                .sum::<f32>()
-                / 200.0;
-
-            if (sync_power > power * 2.0)
-                && (sync_power > sync_power_local_max)
-                && (sync_power > 0.05)
-            {
-                sync_power_local_max = sync_power;
-                start_index = i;
-            } else if (i > start_index + 200) && (start_index != 0) {
-                sync_power_local_max = 0.0;
-                sync_fifo.fill(0.0);
-                state = 1;
-
-                decode_fifo = rx_fifo[start_index + 1..i].to_vec();
-            }
-        } else if state == 1 {
-            decode_fifo.push(current_sample);
-
-            if decode_fifo.len() == 44 * 108 {
-                // Decode
-                let decode_len = decode_fifo.len();
-                let carrier_slice = &carrier_decode[..decode_len.min(carrier_decode.len())];
-
-                // Remove carrier (simplified smoothing)
-                let mut decode_remove_carrier = Vec::with_capacity(decode_len);
-                for j in 0..decode_len {
-                    let start = j.saturating_sub(5);
-                    let end = (j + 6).min(decode_len);
-                    let sum: f32 = (start..end)
-                        .map(|k| decode_fifo[k] * carrier_slice.get(k).unwrap_or(&0.0))
-                        .sum();
-                    decode_remove_carrier.push(sum / (end - start) as f32);
-                }
-
-                let mut decode_power_bit = vec![false; 108];
-                for j in 0..108 {
-                    let start_idx = 10 + j * 44;
-                    let end_idx = (30 + j * 44).min(decode_remove_carrier.len());
-                    if start_idx < decode_remove_carrier.len() && start_idx < end_idx {
-                        let sum: f32 = decode_remove_carrier[start_idx..end_idx].iter().sum();
-                        decode_power_bit[j] = sum > 0.0;
-                    }
-                }
-
-                // CRC check (simplified - just compare first 8 bits with expected ID)
-                let mut temp_index = 0u8;
-                for k in 0..8 {
-                    if decode_power_bit[k] {
-                        temp_index += 1 << (7 - k);
-                    }
-                }
-
-                if temp_index > 0 && temp_index <= 100 {
-                    correct_frame_num += 1;
-                    
-                    // Extract data bits (skip first 8 bits which are ID)
-                    let data_bits = &decode_power_bit[8..100];
-                    decoded_content.extend_from_slice(data_bits);
-                    
-                    // Convert accumulated bits to text
-                    while decoded_content.len() >= 8 {
-                        let mut byte = 0u8;
-                        for j in 0..8 {
-                            if decoded_content[j] {
-                                byte |= 1 << (7 - j);
-                            }
-                        }
-                        decoded_text.push(byte as char);
-                        decoded_content.drain(0..8);
-                    }
-                }
-
-                start_index = 0;
-                decode_fifo.clear();
-                state = 0;
-            }
-        }
-    }
-
-    // Handle any remaining bits
-    if decoded_content.len() >= 8 {
-        while decoded_content.len() >= 8 {
-            let mut byte = 0u8;
-            for j in 0..8 {
-                if decoded_content[j] {
-                    byte |= 1 << (7 - j);
-                }
-            }
-            decoded_text.push(byte as char);
-            decoded_content.drain(0..8);
-        }
-    }
-    
-    println!("\n解码完成！");
-    println!("正确接收帧数: {}", correct_frame_num);
-    println!("解码的文件长度: {} bytes", decoded_text.len());
-    println!("解码内容:\n{}", decoded_text);
-    
-    // Compare with original (按照较小的长度来比较)
-    let original_trimmed = file_content.trim();
-    let decoded_trimmed = decoded_text.trim();
-    
-    let min_len = original_trimmed.len().min(decoded_trimmed.len());
-    let original_compare = &original_trimmed[..min_len];
-    let decoded_compare = &decoded_trimmed[..min_len];
-    
-    println!("比较长度: {} bytes", min_len);
-    
-    if original_compare == decoded_compare {
-        println!("✅ 测试通过！解码内容的前{}字节与原始文件完全匹配", min_len);
-        if decoded_trimmed.len() > original_trimmed.len() {
-            println!("注意：解码内容更长，这是因为帧填充时循环使用了原始内容");
-        }
+    // 转换为字节并解码
+    let rx_bytes = bits_to_bytes(&rx_bits);
+    if let Ok(decoded_text) = String::from_utf8(rx_bytes) {
+        println!("解码结果: {}", decoded_text);
     } else {
-        println!("❌ 测试失败！解码内容与原始文件不匹配");
-        println!("原始内容长度: {}", original_trimmed.len());
-        println!("解码内容长度: {}", decoded_trimmed.len());
-        
-        // Find first difference
-        for i in 0..min_len {
-            if original_compare.chars().nth(i) != decoded_compare.chars().nth(i) {
-                println!("第一个不同的字符位置: {}", i);
-                println!("原始: {:?}", original_compare.chars().nth(i));
-                println!("解码: {:?}", decoded_compare.chars().nth(i));
-                break;
-            }
-        }
+        println!("解码失败：接收到的数据不是有效的 UTF-8");
     }
 }
+
