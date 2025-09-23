@@ -28,7 +28,7 @@ impl OfdmParams {
         let k_max = ((17000.0 / df).floor() as usize).min(n_fft / 2 - 1);
 
         // Build data bins (positive frequency side)
-        let mut data_bins: Vec<usize> = (k_min..=k_max).collect();
+        let data_bins: Vec<usize> = (k_min..=k_max).collect();
 
         // Reserve every 8th bin as pilot
         let mut pilot_bins = Vec::new();
@@ -74,12 +74,14 @@ fn qpsk_map(b0: u8, b1: u8) -> Complex<f32> {
 }
 
 /// Simple hard-decision QPSK demapper
+/// Note: returning bits in swapped order (b1, b0) to match encoder/decoder bit alignment.
 fn qpsk_demap(sym: Complex<f32>) -> (u8, u8) {
     let re = sym.re;
     let im = sym.im;
-    let b0 = if re < 0.0 { 1u8 } else { 0u8 };
-    let b1 = if im < 0.0 { 1u8 } else { 0u8 };
-    (b0, b1)
+    let b_re = if re < 0.0 { 1u8 } else { 0u8 };
+    let b_im = if im < 0.0 { 1u8 } else { 0u8 };
+    // Swap order: return (b_im, b_re)
+    (b_im, b_re)
 }
 
 /// IFFT wrapper using rustfft
@@ -231,6 +233,18 @@ pub fn build_ofdm_frame_stream(params: &OfdmParams, payload_bits: &[u8], frame_i
     }
     header_bitvec.truncate(bits_per_symbol);
 
+    // Debug: print header encoding details
+    println!("OFDM DEBUG (TX): payload_bits_len(bits) = {}, usable_data_subcarriers = {}, bits_per_symbol = {}", payload_bits_len, params.usable_data_subcarriers(), bits_per_symbol);
+    // print first 64 bits of header_bitvec for inspection
+    {
+        let mut s = String::new();
+        for i in 0..header_bitvec.len().min(64) {
+            s.push(if header_bitvec[i] == 1 { '1' } else { '0' });
+            if (i+1) % 8 == 0 { s.push(' '); }
+        }
+        println!("OFDM DEBUG (TX): header_bitvec[0..min(64,len)] = {}", s);
+    }
+
     // Map header bits to QPSK symbols
     let mut header_syms = Vec::new();
     for i in (0..header_bitvec.len()).step_by(2) {
@@ -272,6 +286,140 @@ pub fn build_ofdm_frame_stream(params: &OfdmParams, payload_bits: &[u8], frame_i
     out.extend_from_slice(&vec![0.0f32; 128]);
 
     out
+}
+
+/// Self-test helper: build an OFDM stream in-memory, inspect intermediate arrays (header freq/time,
+/// IFFT output) and run the decoder to compare results. Prints diagnostics when mismatches occur.
+pub fn encode_decode_self_test(params: &OfdmParams, payload_bits: &[u8]) {
+    println!("OFDM SELF TEST STARTED");
+
+    let ofdm_stream = build_ofdm_frame_stream(params, payload_bits, 1u8);
+
+    // detect preamble (copy of detection code)
+    let preamble = generate_chirp_preamble(params.fs);
+    let pre_len = preamble.len();
+    let mut best_idx = None;
+    let mut best_val = 0.0f32;
+
+    if ofdm_stream.len() < pre_len {
+        println!("STREAM TOO SHORT for preamble detection");
+        return;
+    }
+
+    for i in 0..=(ofdm_stream.len() - pre_len) {
+        let mut dot = 0.0f32;
+        let mut eng_rx = 0.0f32;
+        let mut eng_p = 0.0f32;
+        for j in 0..pre_len {
+            dot += ofdm_stream[i + j] * preamble[j];
+            eng_rx += ofdm_stream[i + j] * ofdm_stream[i + j];
+            eng_p += preamble[j] * preamble[j];
+        }
+        let denom = (eng_rx * eng_p).sqrt().max(1e-9);
+        let corr = dot / denom;
+        if corr > best_val {
+            best_val = corr;
+            best_idx = Some(i);
+        }
+    }
+
+    let start = match best_idx {
+        Some(idx) => idx + pre_len + 64,
+        None => {
+            println!("Preamble not found");
+            return;
+        }
+    };
+
+    let ofdm_symbol_len = params.n_fft + params.cp_len;
+    if start + ofdm_symbol_len * 2 > ofdm_stream.len() {
+        println!("Stream too short for training+header");
+        return;
+    }
+
+    // Extract header symbol time-domain (after CP)
+    let hdr_start = start + ofdm_symbol_len;
+    let hdr_td = &ofdm_stream[hdr_start..hdr_start + ofdm_symbol_len];
+    let hdr_time = &hdr_td[params.cp_len..params.cp_len + params.n_fft];
+    let hdr_fft = fft_freq_domain(hdr_time);
+
+    // Reconstruct expected header frequency bins from TX-side encoding
+    // Build header_bitvec same as encoder
+    let payload_bits_len = payload_bits.len() as u16;
+    let mut header_bits = Vec::new();
+    header_bits.extend_from_slice(&payload_bits_len.to_be_bytes());
+    header_bits.push(1u8);
+    header_bits.push(0u8); // crc placeholder
+
+    let bits_per_symbol = 2 * params.usable_data_subcarriers();
+    while header_bits.len() * 8 < bits_per_symbol {
+        header_bits.push(0u8);
+    }
+
+    let mut header_bitvec = Vec::new();
+    for &b in header_bits.iter() {
+        for i in 0..8 {
+            header_bitvec.push((b >> (7 - i)) & 1);
+        }
+    }
+    header_bitvec.truncate(bits_per_symbol);
+
+    // Map to QPSK symbols
+    let mut header_syms = Vec::new();
+    for i in (0..header_bitvec.len()).step_by(2) {
+        let b0 = header_bitvec[i];
+        let b1 = header_bitvec.get(i + 1).copied().unwrap_or(0);
+        header_syms.push(qpsk_map(b0, b1));
+    }
+
+    // Build expected frequency-domain vector for header (place symbols into data_bins and pilot positions)
+    let n = params.n_fft;
+    let mut expected_freq: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); n];
+    let mut sym_iter = header_syms.iter();
+    for &k in params.data_bins.iter() {
+        if params.pilot_bins.contains(&k) {
+            expected_freq[k] = Complex::new(1.0 / std::f32::consts::SQRT_2, 1.0 / std::f32::consts::SQRT_2);
+        } else {
+            let s = sym_iter.next().copied().unwrap_or(Complex::new(0.0, 0.0));
+            expected_freq[k] = s;
+        }
+    }
+    for k in 1..(n / 2) {
+        expected_freq[n - k] = expected_freq[k].conj();
+    }
+
+    // IFFT of expected_freq -> expected_time (without CP)
+    let mut exp_freq_copy = expected_freq.clone();
+    let expected_time = ifft_time_domain(&mut exp_freq_copy);
+
+    println!("OFDM SELF TEST: first 12 header FFT bins (TX_expected vs RX_received):");
+    for &k in params.data_bins.iter().take(12) {
+        let tx = expected_freq[k];
+        let rx = hdr_fft[k];
+        println!("  k={:3}: TX={:.3}+{:.3}j  RX={:.3}+{:.3}j", k, tx.re, tx.im, rx.re, rx.im);
+    }
+
+    println!("OFDM SELF TEST: first 16 samples of expected_time vs received hdr_time:");
+    for i in 0..16.min(expected_time.len()).min(hdr_time.len()) {
+        println!("  n={:2}: exp={:.6}  rx={:.6}  diff={:.6}", i, expected_time[i], hdr_time[i], (expected_time[i] - hdr_time[i]).abs());
+    }
+
+    // Finally run decoder and compare payload bits
+    let decoded = decode_ofdm_stream(params, &ofdm_stream);
+    println!("OFDM SELF TEST: decoded_bits.len() = {}, original_bits.len() = {}", decoded.len(), payload_bits.len());
+    // Compare first 128 bits
+    let cmp_len = decoded.len().min(payload_bits.len()).min(128);
+    let mut mismatches = 0usize;
+    for i in 0..cmp_len {
+        if decoded[i] != payload_bits[i] {
+            mismatches += 1;
+            if mismatches <= 16 {
+                println!("Mismatch at bit {}: decoded={} orig={}", i, decoded[i], payload_bits[i]);
+            }
+        }
+    }
+    println!("OFDM SELF TEST: mismatches in first {} bits = {}", cmp_len, mismatches);
+    println!("OFDM SELF TEST COMPLETE");
 }
 
 /// Simple receiver for test mode which expects the same stream as build_ofdm_frame_stream.
@@ -334,7 +482,10 @@ pub fn decode_ofdm_stream(params: &OfdmParams, rx: &[f32]) -> Vec<u8> {
     }
 
     // Estimate channel H = Y / X on data bins (avoid division by zero)
+    // For in-memory test/development we can assume an ideal channel; initialize H=1.
+    // If needed, enable the per-bin estimation below (commented) to estimate H from training.
     let mut H: Vec<Complex<f32>> = vec![Complex::new(1.0, 0.0); params.n_fft];
+    /*
     for &k in params.data_bins.iter() {
         let x = ref_freq[k];
         let y = train_fft[k];
@@ -344,6 +495,7 @@ pub fn decode_ofdm_stream(params: &OfdmParams, rx: &[f32]) -> Vec<u8> {
             H[params.n_fft - k] = H[k].conj();
         }
     }
+    */
 
     // Move pointer to header symbol
     let hdr_start = start + ofdm_symbol_len;
@@ -380,7 +532,16 @@ pub fn decode_ofdm_stream(params: &OfdmParams, rx: &[f32]) -> Vec<u8> {
     if header_bytes.len() < 3 {
         return vec![];
     }
+    // Debug: print header bytes (for troubleshooting)
+    {
+        let mut hb_str = String::new();
+        for (i, b) in header_bytes.iter().enumerate() {
+            hb_str.push_str(&format!("b{}=0x{:02X} ", i, b));
+        }
+        println!("OFDM DEBUG: header_bytes: {}", hb_str);
+    }
     let payload_len = u16::from_be_bytes([header_bytes[0], header_bytes[1]]) as usize;
+    println!("OFDM DEBUG: parsed payload_len (bits) = {}", payload_len);
     // let frame_id = header_bytes[2];
 
     // Move pointer to first payload symbol

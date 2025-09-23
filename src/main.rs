@@ -229,10 +229,15 @@ fn test_sender_receiver() {
     let sample_rate = 48000u32;
     let params = audio::ofdm::OfdmParams::new(sample_rate as usize);
 
+    // Run an in-memory encode->decode self-test to dump intermediate arrays for debugging.
+    audio::ofdm::encode_decode_self_test(&params, &payload_bits);
+
     // Build OFDM stream
     let ofdm_stream = audio::ofdm::build_ofdm_frame_stream(&params, &payload_bits, 1u8);
     debug!("Total length: {} samples", ofdm_stream.len());
 
+    // ensure output directory exists, then dump json
+    std::fs::create_dir_all("./tmp").expect("Failed to create ./tmp directory");
     // dump json
     utils::dump::dump_to_json("./tmp/output.json", &utils::dump::AudioData {
         sample_rate,
