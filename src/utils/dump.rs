@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use symphonia;
 
 #[derive(Serialize, Deserialize)]
 pub struct AudioData {

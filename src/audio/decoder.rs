@@ -5,7 +5,6 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
-use tracing::info;
 
 pub fn decode_flac_to_f32(
     file_path: &str,
