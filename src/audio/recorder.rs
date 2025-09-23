@@ -26,7 +26,7 @@ impl AppShared {
                 capacity_samples,
             ))),
             playback_buffer: Arc::new(Mutex::new(VecDeque::new())),
-            app_state: Arc::new(Mutex::new(AppState::Recording)),
+            app_state: Arc::new(Mutex::new(AppState::Idle)),
             sample_counter: Arc::new(Mutex::new(0usize)),
         }
     }

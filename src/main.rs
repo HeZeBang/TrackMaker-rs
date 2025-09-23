@@ -21,14 +21,6 @@ fn main() {
     init_logging();
     print_banner();
 
-    let selections = &["Sender", "Receiver"];
-    let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select mode")
-        .default(0)
-        .items(&selections[..])
-        .interact()
-        .unwrap();
-
     let (client, status) = jack::Client::new(
         JACK_CLIENT_NAME,
         jack::ClientOptions::NO_START_SERVER,
@@ -74,6 +66,14 @@ fn main() {
         out_port_name.as_str(),
     );
 
+    let selections = &["Sender", "Receiver"];
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select mode")
+        .default(0)
+        .items(&selections[..])
+        .interact()
+        .unwrap();
+    
     if selection == 0 {
         // Sender
         run_sender(shared, progress_manager, sample_rate as u32);
@@ -153,6 +153,9 @@ fn run_receiver(
             "receiver",
         )
         .unwrap();
+
+    // Start recording
+    *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
