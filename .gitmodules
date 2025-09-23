@@ -1,0 +1,3 @@
+[submodule "ref/fldigi"]
+	path = ref/fldigi
+	url = https://github.com/w1hkj/fldigi.git
