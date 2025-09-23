@@ -9,12 +9,14 @@ use audio::psk::{PskModulator, PskDemodulator, utils as psk_utils};
 use device::jack::{
     print_jack_info,
 };
-use rand::{self, Rng, SeedableRng};
+use rand::{self, Rng};
 use tracing::info;
 use ui::print_banner;
 use ui::progress::{ProgressManager, templates};
 use utils::consts::*;
 use utils::logging::init_logging;
+use std::fs;
+use std::path::Path;
 
 use crate::device::jack::connect_system_ports;
 
@@ -101,28 +103,60 @@ fn run_sender(
     
     let modulator = PskModulator::new(sample_rate_f32, carrier_freq, symbol_rate);
     
-    // random data for 100 frame with 100 bit/frame
-    let seed = 1u64; // seed 1 is a magic number
-    let mut rng = rand::rngs::StdRng::from_seed([seed as u8; 32]);
-
+    // Read text data from file
+    let text_file_path = "assets/think-different.txt";
+    let text_message = match fs::read_to_string(text_file_path) {
+        Ok(content) => {
+            info!("Successfully read text from: {}", text_file_path);
+            content.trim().to_string() // Remove trailing whitespace
+        }
+        Err(e) => {
+            info!("Failed to read file {}: {}, using fallback text", text_file_path, e);
+            "Hello World! This is a fallback message for PSK transmission. 你好世界！".to_string()
+        }
+    };
+    
+    let text_bytes = text_message.as_bytes();
+    
     let mut output_track = Vec::new();
-
-    // 100 frames, each 100 bits
-    let mut frames = vec![vec![0u8; 100]; 100];
-
-    // Fill with random 0s and 1s
-    for i in 0..100 {
-        for j in 0..100 {
-            frames[i][j] = rng.random_range(0..=1);
+    
+    // Calculate number of frames needed (each frame carries 88 bits of data: 100 bits - 8 ID bits - 4 padding)
+    let bits_per_frame = 88; // 100 total - 8 ID bits - 4 padding
+    let bytes_per_frame = bits_per_frame / 8; // 11 bytes per frame
+    
+    let total_frames = (text_bytes.len() + bytes_per_frame - 1) / bytes_per_frame; // Round up
+    let mut frames = Vec::new();
+    
+    info!("Text to transmit: {}", text_message);
+    info!("Text length: {} bytes, {} frames needed", text_bytes.len(), total_frames);
+    
+    // Split text into frames
+    for frame_idx in 0..total_frames {
+        let mut frame_bits = vec![0u8; 100];
+        
+        // Set frame ID (first 8 bits)
+        let frame_id = (frame_idx + 1) as u8;
+        for bit_idx in 0..8 {
+            frame_bits[bit_idx] = ((frame_id >> (7 - bit_idx)) & 1) as u8;
         }
-    }
-
-    // Set first 8 bits to id
-    for i in 0..100 {
-        let id = i + 1; // 1-indexed like MATLAB
-        for j in 0..8 {
-            frames[i][j] = ((id >> (7 - j)) & 1) as u8;
+        
+        // Add data bits (next 88 bits = 11 bytes)
+        let start_byte = frame_idx * bytes_per_frame;
+        let end_byte = std::cmp::min(start_byte + bytes_per_frame, text_bytes.len());
+        
+        for byte_idx in start_byte..end_byte {
+            let byte_value = text_bytes[byte_idx];
+            let frame_byte_idx = byte_idx - start_byte;
+            let bit_start = 8 + frame_byte_idx * 8; // Start after ID bits
+            
+            for bit_idx in 0..8 {
+                if bit_start + bit_idx < 96 { // Leave 4 bits for padding/CRC
+                    frame_bits[bit_start + bit_idx] = ((byte_value >> (7 - bit_idx)) & 1) as u8;
+                }
+            }
         }
+        
+        frames.push(frame_bits);
     }
 
     // Generate chirp preamble for synchronization (440 samples)
@@ -133,10 +167,10 @@ fn run_sender(
         440      // 440 samples duration
     );
 
-    // Process each frame using PSK
-    for i in 0..100 {
-        let frame = &frames[i];
+    let mut rng = rand::rng();
 
+    // Process each frame using PSK
+    for (i, frame) in frames.iter().enumerate() {
         // Add CRC8 (simplified implementation)
         let mut frame_crc = frame.clone();
         frame_crc.extend_from_slice(&[0u8; 8]); // Add 8 CRC bits (placeholder)
@@ -155,6 +189,8 @@ fn run_sender(
         output_track.extend(vec![0.0; inter_frame_space1]);
         output_track.extend(frame_wave_pre);
         output_track.extend(vec![0.0; inter_frame_space2]);
+        
+        info!("Frame {}: ID={}, data length={} bytes", i + 1, i + 1, bytes_per_frame);
     }
 
     let output_track_len = output_track.len();
@@ -283,6 +319,9 @@ fn run_receiver(
 
     info!("Found {} potential frames", frame_starts.len());
 
+    // Store received text data
+    let mut received_frames: Vec<(u8, Vec<u8>)> = Vec::new(); // (frame_id, data_bytes)
+
     // Demodulate each detected frame
     for (frame_idx, &frame_start) in frame_starts.iter().enumerate() {
         let frame_end = frame_start + frame_length_samples;
@@ -293,7 +332,7 @@ fn run_receiver(
             // Demodulate using PSK
             let demodulated_bits = demodulator.demodulate_bpsk(frame_signal);
             
-            if demodulated_bits.len() >= 8 {
+            if demodulated_bits.len() >= 96 { // At least 96 bits (8 ID + 88 data)
                 // Extract frame ID from first 8 bits
                 let mut frame_id = 0u8;
                 for k in 0..8 {
@@ -302,7 +341,21 @@ fn run_receiver(
                     }
                 }
 
-                if frame_id > 0 && frame_id <= 100 {
+                if frame_id > 0 {
+                    // Extract data bytes (11 bytes = 88 bits)
+                    let mut data_bytes = Vec::new();
+                    for byte_idx in 0..11 {
+                        let mut byte_value = 0u8;
+                        for bit_idx in 0..8 {
+                            let bit_pos = 8 + byte_idx * 8 + bit_idx; // Start after ID bits
+                            if bit_pos < demodulated_bits.len() && demodulated_bits[bit_pos] == 1 {
+                                byte_value |= 1 << (7 - bit_idx);
+                            }
+                        }
+                        data_bytes.push(byte_value);
+                    }
+                    
+                    received_frames.push((frame_id, data_bytes));
                     info!("Frame {}: Correct, ID: {}", frame_idx + 1, frame_id);
                     correct_frame_num += 1;
                 } else {
@@ -322,5 +375,112 @@ fn run_receiver(
     if !frame_starts.is_empty() {
         let success_rate = (correct_frame_num as f32 / frame_starts.len() as f32) * 100.0;
         info!("Success Rate: {:.1}%", success_rate);
+    }
+    
+    // Reconstruct text from received frames
+    if !received_frames.is_empty() {
+        // Sort frames by ID
+        received_frames.sort_by_key(|(id, _)| *id);
+        
+        let mut reconstructed_text = Vec::new();
+        let mut last_frame_id = 0u8;
+        
+        for (frame_id, data_bytes) in received_frames {
+            // Check for missing frames
+            if frame_id != last_frame_id + 1 && last_frame_id != 0 {
+                info!("Warning: Missing frame(s) between {} and {}", last_frame_id, frame_id);
+            }
+            
+            // Add non-zero bytes to reconstructed text
+            for &byte in &data_bytes {
+                if byte != 0 { // Stop at null bytes (padding)
+                    reconstructed_text.push(byte);
+                } else {
+                    break;
+                }
+            }
+            
+            last_frame_id = frame_id;
+        }
+        
+        // Convert to string and display
+        match String::from_utf8(reconstructed_text.clone()) {
+            Ok(text) => {
+                info!("=== RECEIVED TEXT ===");
+                info!("{}", text);
+                info!("=== END TEXT ===");
+                
+                // Save received text to tmp directory
+                let tmp_dir = Path::new("tmp");
+                if !tmp_dir.exists() {
+                    if let Err(e) = fs::create_dir_all(tmp_dir) {
+                        info!("Failed to create tmp directory: {}", e);
+                    }
+                }
+                
+                let received_file_path = tmp_dir.join("received_text.txt");
+                match fs::write(&received_file_path, &text) {
+                    Ok(_) => {
+                        info!("Received text saved to: {}", received_file_path.display());
+                        
+                        // Also save the original text for comparison
+                        let original_file_path = tmp_dir.join("original_text.txt");
+                        let original_text = match fs::read_to_string("assets/think-different.txt") {
+                            Ok(content) => content.trim().to_string(),
+                            Err(_) => "Original text not available".to_string(),
+                        };
+                        
+                        if let Err(e) = fs::write(&original_file_path, &original_text) {
+                            info!("Failed to save original text: {}", e);
+                        } else {
+                            info!("Original text saved to: {}", original_file_path.display());
+                            
+                            // Compare texts
+                            if text.trim() == original_text.trim() {
+                                info!("✅ TEXT TRANSMISSION PERFECT MATCH!");
+                            } else {
+                                info!("⚠️  Text transmission has differences");
+                                info!("Original length: {} bytes", original_text.len());
+                                info!("Received length: {} bytes", text.len());
+                                
+                                // Find first difference
+                                let orig_chars: Vec<char> = original_text.chars().collect();
+                                let recv_chars: Vec<char> = text.chars().collect();
+                                let min_len = std::cmp::min(orig_chars.len(), recv_chars.len());
+                                
+                                for i in 0..min_len {
+                                    if orig_chars[i] != recv_chars[i] {
+                                        info!("First difference at position {}: '{}' vs '{}'", 
+                                             i, orig_chars[i], recv_chars[i]);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        info!("Failed to save received text: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                info!("Error converting to UTF-8: {}", e);
+                info!("Raw bytes: {:?}", reconstructed_text);
+                
+                // Save raw bytes for debugging
+                let tmp_dir = Path::new("tmp");
+                if !tmp_dir.exists() {
+                    let _ = fs::create_dir_all(tmp_dir);
+                }
+                let raw_file_path = tmp_dir.join("received_raw_bytes.bin");
+                if let Err(e) = fs::write(&raw_file_path, &reconstructed_text) {
+                    info!("Failed to save raw bytes: {}", e);
+                } else {
+                    info!("Raw bytes saved to: {}", raw_file_path.display());
+                }
+            }
+        }
+    } else {
+        info!("No valid frames received");
     }
 }
