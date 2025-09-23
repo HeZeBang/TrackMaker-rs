@@ -1,0 +1,3 @@
+[submodule "lib/fldigi"]
+	path = lib/fldigi
+	url = https://github.com/w1hkj/fldigi.git
