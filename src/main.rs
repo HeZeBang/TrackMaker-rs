@@ -1,7 +1,6 @@
 use clap::Parser;
 use dialoguer::{theme::ColorfulTheme, Select};
 use jack;
-use std::io::Write;
 mod audio;
 mod device;
 mod ui;
@@ -109,10 +108,12 @@ impl PSK800RC2Modulator {
             
             // 脉冲成形
             symbol_buffer.rotate_left(self.samples_per_symbol);
+            let buffer_len = symbol_buffer.len();
+            let start_idx = buffer_len - self.samples_per_symbol;
             for i in 0..self.samples_per_symbol {
-                symbol_buffer[symbol_buffer.len() - self.samples_per_symbol + i] = 0.0;
+                symbol_buffer[start_idx + i] = 0.0;
             }
-            symbol_buffer[symbol_buffer.len() - self.samples_per_symbol] = symbol;
+            symbol_buffer[start_idx] = symbol;
             
             // 应用根余弦滤波器
             let mut filtered_samples = vec![0.0f32; self.samples_per_symbol];
@@ -453,7 +454,7 @@ fn main() {
 fn run_psk800rc2_sender(
     shared: recorder::AppShared,
     progress_manager: ProgressManager,
-    sample_rate: u32,
+    _sample_rate: u32,
 ) {
     // 读取测试数据
     let file_content = std::fs::read_to_string("assets/think-different.txt")
@@ -509,7 +510,7 @@ fn run_psk800rc2_sender(
 fn run_psk800rc2_receiver(
     shared: recorder::AppShared,
     progress_manager: ProgressManager,
-    sample_rate: u32,
+    _sample_rate: u32,
     max_recording_duration_samples: u32,
 ) {
     progress_manager
