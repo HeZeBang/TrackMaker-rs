@@ -1,11 +1,9 @@
-use trackmaker_rs::{audio, device, ui, utils};
-use dialoguer::{theme::ColorfulTheme, Select};
+use dialoguer::{Select, theme::ColorfulTheme};
 use jack;
+use trackmaker_rs::{audio, device, ui, utils};
 
 use audio::recorder;
-use device::jack::{
-    print_jack_info,
-};
+use device::jack::print_jack_info;
 use rand::{self, Rng, SeedableRng};
 use tracing::info;
 use ui::print_banner;
@@ -77,7 +75,12 @@ fn main() {
         run_sender(shared, progress_manager, sample_rate as u32);
     } else {
         // Receiver
-        run_receiver(shared, progress_manager, sample_rate as u32, max_duration_samples as u32);
+        run_receiver(
+            shared,
+            progress_manager,
+            sample_rate as u32,
+            max_duration_samples as u32,
+        );
     }
 
     tracing::info!("Exiting gracefully...");
@@ -190,12 +193,12 @@ fn run_sender(
     let output_track_len = output_track.len();
 
     {
-        let mut playback = shared.playback_buffer.lock().unwrap();
+        let mut playback = shared
+            .playback_buffer
+            .lock()
+            .unwrap();
         playback.extend(output_track);
-        info!(
-            "Output track length: {} samples",
-            playback.len()
-        );
+        info!("Output track length: {} samples", playback.len());
     }
 
     progress_manager
@@ -207,14 +210,23 @@ fn run_sender(
         )
         .unwrap();
 
-    *shared.app_state.lock().unwrap() = recorder::AppState::Playing;
+    *shared
+        .app_state
+        .lock()
+        .unwrap() = recorder::AppState::Playing;
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         ui::update_progress(&shared, output_track_len, &progress_manager);
 
-        let state = { shared.app_state.lock().unwrap().clone() };
+        let state = {
+            shared
+                .app_state
+                .lock()
+                .unwrap()
+                .clone()
+        };
         if let recorder::AppState::Idle = state {
             progress_manager.finish_all();
             break;
@@ -290,8 +302,14 @@ fn run_receiver(
     }
 
     let rx_fifo: std::collections::VecDeque<f32> = {
-        let record = shared.record_buffer.lock().unwrap();
-        record.iter().copied().collect()
+        let record = shared
+            .record_buffer
+            .lock()
+            .unwrap();
+        record
+            .iter()
+            .copied()
+            .collect()
     };
 
     let mut power = 0.0f32;
@@ -322,7 +340,8 @@ fn run_receiver(
     for i in 0..rx_fifo.len() {
         let current_sample = rx_fifo[i];
 
-        power = power * (1.0 - 1.0 / 64.0) + current_sample * current_sample / 64.0;
+        power =
+            power * (1.0 - 1.0 / 64.0) + current_sample * current_sample / 64.0;
         power_debug[i] = power;
 
         if state == 0 {
@@ -351,7 +370,10 @@ fn run_receiver(
                 state = 1;
 
                 // Convert VecDeque slice to Vec
-                decode_fifo = rx_fifo.range(start_index + 1..i).copied().collect();
+                decode_fifo = rx_fifo
+                    .range(start_index + 1..i)
+                    .copied()
+                    .collect();
             }
         } else if state == 1 {
             decode_fifo.push(current_sample);
@@ -359,7 +381,8 @@ fn run_receiver(
             if decode_fifo.len() == 44 * 108 {
                 // Decode
                 let decode_len = decode_fifo.len();
-                let carrier_slice = &carrier_decode[..decode_len.min(carrier_decode.len())];
+                let carrier_slice =
+                    &carrier_decode[..decode_len.min(carrier_decode.len())];
 
                 // Remove carrier (simplified smoothing)
                 let mut decode_remove_carrier = Vec::with_capacity(decode_len);
@@ -367,7 +390,12 @@ fn run_receiver(
                     let start = j.saturating_sub(5);
                     let end = (j + 6).min(decode_len);
                     let sum: f32 = (start..end)
-                        .map(|k| decode_fifo[k] * carrier_slice.get(k).unwrap_or(&0.0))
+                        .map(|k| {
+                            decode_fifo[k]
+                                * carrier_slice
+                                    .get(k)
+                                    .unwrap_or(&0.0)
+                        })
                         .sum();
                     decode_remove_carrier.push(sum / (end - start) as f32);
                 }
@@ -376,8 +404,12 @@ fn run_receiver(
                 for j in 0..108 {
                     let start_idx = 10 + j * 44;
                     let end_idx = (30 + j * 44).min(decode_remove_carrier.len());
-                    if start_idx < decode_remove_carrier.len() && start_idx < end_idx {
-                        let sum: f32 = decode_remove_carrier[start_idx..end_idx].iter().sum();
+                    if start_idx < decode_remove_carrier.len()
+                        && start_idx < end_idx
+                    {
+                        let sum: f32 = decode_remove_carrier[start_idx..end_idx]
+                            .iter()
+                            .sum();
                         decode_power_bit[j] = sum > 0.0;
                     }
                 }

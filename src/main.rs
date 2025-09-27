@@ -1,5 +1,6 @@
-use dialoguer::{theme::ColorfulTheme, Select};
+use dialoguer::{Input, Select, theme::ColorfulTheme};
 use jack;
+mod acoustic;
 mod audio;
 mod device;
 mod transmission;
@@ -7,13 +8,13 @@ mod ui;
 mod utils;
 use audio::recorder;
 use device::jack::print_jack_info;
-use transmission::{PskSender, PskReceiver};
+use std::path::{Path, PathBuf};
 use tracing::info;
+use transmission::{PskReceiver, PskSender};
 use ui::print_banner;
 use ui::progress::{ProgressManager, templates};
 use utils::consts::*;
 use utils::logging::init_logging;
-use std::path::Path;
 
 use crate::device::jack::connect_system_ports;
 
@@ -66,20 +67,34 @@ fn main() {
         out_port_name.as_str(),
     );
 
-    let selections = &["Sender", "Receiver"];
+    let selections = &[
+        "Sender (play via JACK)",
+        "Receiver (record via JACK)",
+        "Export transmission to WAV",
+        "Decode transmission from WAV",
+    ];
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Select mode")
         .default(0)
         .items(&selections[..])
         .interact()
         .unwrap();
-    
-    if selection == 0 {
-        // Sender
-        run_sender(shared, progress_manager, sample_rate as u32);
-    } else {
-        // Receiver
-        run_receiver(shared, progress_manager, sample_rate as u32, max_duration_samples as u32);
+
+    match selection {
+        0 => {
+            run_sender(shared, progress_manager, sample_rate as u32);
+        }
+        1 => {
+            run_receiver(
+                shared,
+                progress_manager,
+                sample_rate as u32,
+                max_duration_samples as u32,
+            );
+        }
+        2 => export_transmission_to_wav(sample_rate as u32),
+        3 => decode_transmission_from_wav(),
+        _ => unreachable!(),
     }
 
     tracing::info!("Exiting gracefully...");
@@ -91,20 +106,23 @@ fn main() {
 fn run_sender(
     shared: recorder::AppShared,
     progress_manager: ProgressManager,
-    sample_rate: u32,
+    _sample_rate: u32,
 ) {
     // Create PSK sender with default configuration
     let sender = PskSender::new_default();
-    
+
     // Transmit text from file
     let text_file_path = "assets/think-different.txt";
     let output_track = sender.transmit_text_file(text_file_path);
-    
+
     let output_track_len = output_track.len();
 
     // Copy to shared playback buffer
     {
-        let mut playback = shared.playback_buffer.lock().unwrap();
+        let mut playback = shared
+            .playback_buffer
+            .lock()
+            .unwrap();
         playback.extend(output_track);
         info!(
             "Output track length: {} samples (PSK modulated)",
@@ -121,14 +139,23 @@ fn run_sender(
         )
         .unwrap();
 
-    *shared.app_state.lock().unwrap() = recorder::AppState::Playing;
+    *shared
+        .app_state
+        .lock()
+        .unwrap() = recorder::AppState::Playing;
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         ui::update_progress(&shared, output_track_len, &progress_manager);
 
-        let state = { shared.app_state.lock().unwrap().clone() };
+        let state = {
+            shared
+                .app_state
+                .lock()
+                .unwrap()
+                .clone()
+        };
         if let recorder::AppState::Idle = state {
             progress_manager.finish_all();
             break;
@@ -139,7 +166,7 @@ fn run_sender(
 fn run_receiver(
     shared: recorder::AppShared,
     progress_manager: ProgressManager,
-    sample_rate: u32,
+    _sample_rate: u32,
     max_recording_duration_samples: u32,
 ) {
     // Create PSK receiver with default configuration
@@ -155,7 +182,10 @@ fn run_receiver(
         .unwrap();
 
     // Start recording
-    *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
+    *shared
+        .app_state
+        .lock()
+        .unwrap() = recorder::AppState::Recording;
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -181,8 +211,14 @@ fn run_receiver(
 
     // Get received signal
     let rx_signal: Vec<f32> = {
-        let record = shared.record_buffer.lock().unwrap();
-        record.iter().copied().collect()
+        let record = shared
+            .record_buffer
+            .lock()
+            .unwrap();
+        record
+            .iter()
+            .copied()
+            .collect()
     };
 
     // Process the received signal and save results
@@ -192,4 +228,83 @@ fn run_receiver(
         "assets/think-different.txt",
         output_dir,
     );
+}
+
+fn export_transmission_to_wav(sample_rate: u32) {
+    let sender = PskSender::new_default();
+    let text_file_path = "assets/think-different.txt";
+    let waveform = sender.transmit_text_file(text_file_path);
+
+    if waveform.is_empty() {
+        info!("No data generated for export");
+        return;
+    }
+
+    let default_path = PathBuf::from("tmp/transmission.wav");
+    let default_path_str = default_path
+        .display()
+        .to_string();
+
+    let output_path: String = Input::new()
+        .with_prompt("Output WAV file path")
+        .default(default_path_str)
+        .interact_text()
+        .unwrap();
+
+    let output_path = PathBuf::from(output_path);
+    match acoustic::io::write_to_wav(&waveform, sample_rate, &output_path) {
+        Ok(_) => info!("Exported transmission to {}", output_path.display()),
+        Err(err) => tracing::error!(
+            "Failed to export transmission to {}: {err}",
+            output_path.display()
+        ),
+    }
+}
+
+fn decode_transmission_from_wav() {
+    let default_path = PathBuf::from("tmp/transmission.wav");
+    let default_path_str = default_path
+        .display()
+        .to_string();
+
+    let input_path: String = Input::new()
+        .with_prompt("Input WAV file path")
+        .default(default_path_str)
+        .interact_text()
+        .unwrap();
+
+    let input_path = PathBuf::from(input_path);
+    let signal = match acoustic::io::read_wav(&input_path) {
+        Ok(samples) => samples,
+        Err(err) => {
+            tracing::error!(
+                "Failed to read input WAV {}: {err}",
+                input_path.display()
+            );
+            return;
+        }
+    };
+
+    if signal.is_empty() {
+        tracing::warn!("Input WAV contained no samples");
+        return;
+    }
+
+    let receiver = PskReceiver::new_default();
+    let output_dir = Path::new("tmp");
+    match receiver.receive_text_with_comparison(
+        &signal,
+        "assets/think-different.txt",
+        output_dir,
+    ) {
+        Some(text) => info!(
+            "Decoded transmission from {} ({} bytes)",
+            input_path.display(),
+            text.len()
+        ),
+        None => tracing::error!(
+            "Failed to decode transmission from {}",
+            input_path.display()
+        ),
+    }
 }

@@ -1,3 +1,4 @@
+pub mod acoustic;
 pub mod audio;
 pub mod device;
 pub mod transmission;
