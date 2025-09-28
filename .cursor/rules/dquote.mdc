@@ -1,0 +1,6 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+你是 MacOS 的 zsh 环境，请尽可能使用单引号，否则容易出现多行

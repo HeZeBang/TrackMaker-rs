@@ -40,6 +40,24 @@ impl Modem {
     pub fn bits_per_symbol(&self) -> usize {
         self.bits_per_symbol
     }
+    
+    pub fn decode(&self, symbols: Vec<Complex64>) -> Vec<Vec<bool>> {
+        symbols.into_iter().map(|received| {
+            // Maximum-likelihood decoding using nearest neighbor
+            let mut min_error = f64::INFINITY;
+            let mut best_bits = vec![false; self.bits_per_symbol];
+            
+            for (bits, &symbol) in &self.encode_map {
+                let error = (received - symbol).norm();
+                if error < min_error {
+                    min_error = error;
+                    best_bits = bits.clone();
+                }
+            }
+            
+            best_bits
+        }).collect()
+    }
 }
 
 // Pseudo-random bit sequence generator

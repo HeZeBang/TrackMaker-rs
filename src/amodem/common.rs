@@ -34,3 +34,17 @@ pub fn iterate<T>(data: impl Iterator<Item = T>, size: usize) -> impl Iterator<I
 pub fn take<T: Copy>(iter: &mut impl Iterator<Item = T>, n: usize) -> Vec<T> {
     iter.take(n).collect()
 }
+
+// Helper function to load PCM data (matching Python's common.loads)
+pub fn loads(data: &[u8]) -> Vec<f64> {
+    data.chunks(2)
+        .map(|chunk| {
+            if chunk.len() == 2 {
+                let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+                sample as f64 / SCALING
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
