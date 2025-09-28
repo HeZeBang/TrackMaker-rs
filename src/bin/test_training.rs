@@ -4,7 +4,7 @@ fn main() {
     let config = Configuration::bitrate_1();
     let equalizer = Equalizer::new(&config);
     
-    let symbols = equalizer.train_symbols(200);
+    let symbols = equalizer.train_symbols(200, &config);
     let signal = equalizer.modulator(&symbols);
     
     println!("Rust training signal length: {}", signal.len());
