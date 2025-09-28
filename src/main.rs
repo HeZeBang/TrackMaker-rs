@@ -16,7 +16,7 @@ use device::jack::{
     connect_output_to_first_system_input, disconnect_input_sources,
     disconnect_output_sinks, print_jack_info,
 };
-use ui::print_banner;
+use ui::{print_banner, progress::ProgressManager};
 use utils::logging::init_logging;
 use amodem::{config::Configuration, detect::Detector, recv::Receiver, send, common};
 use rubato::{Resampler, SincFixedIn, SincInterpolationType, SincInterpolationParameters, WindowFunction};
@@ -404,7 +404,7 @@ fn play_pcm_file(pcm_path: &str, duration: f32) {
     use std::io::Read;
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     
     // 读取 PCM 文件
     let (file_sample_rate, file_channels, file_bit_depth, samples) = match read_pcm_with_metadata(pcm_path) {
@@ -447,12 +447,25 @@ fn play_pcm_file(pcm_path: &str, duration: f32) {
         }
     };
     
+    // 创建进度管理器
+    let progress_manager = ProgressManager::new();
+    let total_samples = resampled_samples.len() as u64;
+    
+    // 创建播放进度条
+    progress_manager.create_bar(
+        "playback",
+        total_samples,
+        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} samples ({percent}%) {msg}",
+        "🎵 播放中..."
+    ).unwrap();
+    
     // 创建播放状态
     let state = PlaybackState {
         samples: Arc::new(Mutex::new(resampled_samples)),
         position: Arc::new(Mutex::new(0)),
         is_playing: Arc::new(Mutex::new(true)),
         should_loop: false,
+        progress_manager: progress_manager.clone(),
     };
     
     // 注册输出端口
@@ -503,6 +516,28 @@ fn play_pcm_file(pcm_path: &str, duration: f32) {
     
     println!("🎵 开始播放 PCM 文件...");
     
+    // 启动进度更新线程
+    let progress_manager_clone = progress_manager.clone();
+    let state_clone = state.clone();
+    let progress_handle = thread::spawn(move || {
+        let start_time = Instant::now();
+        while start_time.elapsed().as_secs_f32() < duration {
+            let current_pos = {
+                let pos = state_clone.position.lock().unwrap();
+                *pos
+            };
+            
+            progress_manager_clone.set_position("playback", current_pos as u64).unwrap();
+            
+            // 计算播放百分比
+            let percent = (current_pos as f32 / total_samples as f32 * 100.0) as u8;
+            let msg = format!("🎵 播放中... {}%", percent);
+            progress_manager_clone.set_message("playback", &msg).unwrap();
+            
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+    
     // 等待播放完成
     thread::sleep(Duration::from_secs_f32(duration));
     
@@ -512,7 +547,11 @@ fn play_pcm_file(pcm_path: &str, duration: f32) {
         *playing = false;
     }
     
-    println!("✅ 播放完成");
+    // 等待进度更新线程结束
+    let _ = progress_handle.join();
+    
+    // 完成进度条
+    progress_manager.finish("playback", "✅ 播放完成").unwrap();
     
     // 断开连接并停用客户端
     if let Err(err) = active_client.deactivate() {
@@ -526,6 +565,7 @@ struct PlaybackState {
     position: Arc<Mutex<usize>>,
     is_playing: Arc<Mutex<bool>>,
     should_loop: bool,
+    progress_manager: ProgressManager,
 }
 
 fn read_pcm_with_metadata(path: &str) -> std::io::Result<(u32, u16, u16, Vec<f32>)> {

@@ -2,6 +2,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone)]
 pub struct ProgressManager {
     mp: MultiProgress,
     bars: Arc<Mutex<HashMap<String, ProgressBar>>>,
