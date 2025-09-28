@@ -3,6 +3,14 @@ name = "trackmaker-rs"
 version = "0.0.1"
 edition = "2024"
 
+[[bin]]
+name = "trackmaker-amodem"
+path = "src/main.rs"
+
+[[bin]]
+name = "pcm-player"
+path = "src/bin/pcm_player.rs"
+
 [dependencies]
 jack = "0.13.3"
 indicatif = "0.17"
