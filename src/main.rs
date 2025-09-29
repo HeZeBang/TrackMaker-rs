@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use clap::{Parser, Subcommand};
+use tracing::{info, warn, error, debug};
 
 mod audio;
 mod device;
@@ -39,7 +40,7 @@ enum Commands {
         output: PathBuf,
         
         /// Duration to record in seconds
-        #[arg(short, long, default_value = "10.0")]
+        #[arg(short, long, default_value = "100")]
         duration: f32,
         
         /// Bitrate configuration (1 or 2)
@@ -80,6 +81,7 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
+    init_logging();
     
     match cli.command {
         Commands::Receive { output, duration, bitrate } => {
@@ -97,18 +99,17 @@ fn main() {
 fn receive_mode(output: PathBuf, duration: f32, bitrate: u32) {
     print_banner();
     
-    println!("🎧 Amodem Receive Mode");
-    println!("📁 Output file: {}", output.display());
-    println!("⏱️  Duration: {:.1} seconds", duration);
-    println!("📡 Bitrate: {} kb/s", bitrate);
-    println!();
+    info!("Amodem Receive Mode");
+    info!("Output file: {}", output.display());
+    info!("Duration: {:.1} seconds", duration);
+    info!("Bitrate: {} kb/s", bitrate);
     
     // Get configuration
     let config = match bitrate {
         1 => Configuration::bitrate_1(),
         2 => Configuration::bitrate_2(),
         _ => {
-            eprintln!("❌ Invalid bitrate: {}. Supported values: 1, 2", bitrate);
+            error!("Invalid bitrate: {}. Supported values: 1, 2", bitrate);
             return;
         }
     };
@@ -163,9 +164,9 @@ fn receive_mode(output: PathBuf, duration: f32, bitrate: u32) {
     // Connect to system input
     connect_input_from_first_system_output(active_client.as_client(), &in_port_name);
     
-    println!("🔍 Waiting for audio input...");
-    println!("📡 Listening for amodem signal on JACK input");
-    println!("⏳ Recording for {:.1} seconds...", duration);
+    info!("Waiting for audio input...");
+    info!("Listening for amodem signal on JACK input");
+    info!("Recording for {:.1} seconds...", duration);
     
     // Wait for recording to complete
     loop {
@@ -175,7 +176,7 @@ fn receive_mode(output: PathBuf, duration: f32, bitrate: u32) {
         }
     }
     
-    println!("✅ Recording complete");
+    info!("Recording complete");
     
     // Disconnect and deactivate
     disconnect_input_sources(active_client.as_client(), &in_port_name);
@@ -183,36 +184,36 @@ fn receive_mode(output: PathBuf, duration: f32, bitrate: u32) {
     
     // Get recorded audio
     let recorded_samples = audio_buffer.lock().unwrap().clone();
-    println!("📊 Recorded {} samples", recorded_samples.len());
+    info!("Recorded {} samples", recorded_samples.len());
     
     // Convert to amodem format (f64, 8kHz)
     let amodem_samples_f32 = resample_audio(&recorded_samples, sample_rate as f32, config.fs as f32);
     let amodem_samples: Vec<f64> = amodem_samples_f32.iter().map(|&x| x as f64).collect();
-    println!("🔄 Resampled to {} samples at {:.1} kHz", amodem_samples.len(), config.fs / 1000.0);
+    info!("Resampled to {} samples at {:.1} kHz", amodem_samples.len(), config.fs / 1000.0);
     
     // Save raw audio for debugging with metadata
     let pcm_data = common::dumps_with_metadata(&amodem_samples, config.fs as u32, 1, 16);
     std::fs::write("tmp/recorded.pcm", &pcm_data).unwrap();
-    println!("💾 Raw audio saved to tmp/recorded.pcm ({} Hz, 16-bit, mono)", config.fs as u32);
+    info!("Raw audio saved to tmp/recorded.pcm ({} Hz, 16-bit, mono)", config.fs as u32);
     
     // Decode using amodem
-    println!("🔍 Decoding amodem signal...");
+    info!("Decoding amodem signal...");
     match decode_amodem_signal(&amodem_samples, &config) {
         Ok(decoded_data) => {
             // Write decoded data to output file
             std::fs::write(&output, &decoded_data).unwrap();
-            println!("✅ Successfully decoded {} bytes to {}", decoded_data.len(), output.display());
+            info!("Successfully decoded {} bytes to {}", decoded_data.len(), output.display());
             
             // Display decoded content
             if let Ok(text) = String::from_utf8(decoded_data.clone()) {
-                println!("📄 Decoded content:");
-                println!("{}", text);
+                info!("Decoded content:");
+                info!("{}", text);
             } else {
-                println!("📄 Decoded binary data ({} bytes)", decoded_data.len());
+                info!("Decoded binary data ({} bytes)", decoded_data.len());
             }
         }
         Err(e) => {
-            eprintln!("❌ Failed to decode amodem signal: {}", e);
+            error!("Failed to decode amodem signal: {}", e);
             std::fs::write(&output, format!("Decode error: {}", e)).unwrap();
         }
     }
@@ -221,15 +222,14 @@ fn receive_mode(output: PathBuf, duration: f32, bitrate: u32) {
 fn send_mode(input: PathBuf, duration: f32, bitrate: u32) {
     print_banner();
     
-    println!("📡 Amodem Send Mode");
-    println!("📁 Input file: {}", input.display());
-    println!("⏱️  Duration: {:.1} seconds", duration);
-    println!("📡 Bitrate: {} kb/s", bitrate);
-    println!();
+    info!("Amodem Send Mode");
+    info!("Input file: {}", input.display());
+    info!("Duration: {:.1} seconds", duration);
+    info!("Bitrate: {} kb/s", bitrate);
     
     // Check if input file exists
     if !input.exists() {
-        eprintln!("❌ Input file does not exist: {}", input.display());
+        error!("Input file does not exist: {}", input.display());
         return;
     }
     
@@ -238,7 +238,7 @@ fn send_mode(input: PathBuf, duration: f32, bitrate: u32) {
         1 => Configuration::bitrate_1(),
         2 => Configuration::bitrate_2(),
         _ => {
-            eprintln!("❌ Invalid bitrate: {}. Supported values: 1, 2", bitrate);
+            error!("Invalid bitrate: {}. Supported values: 1, 2", bitrate);
             return;
         }
     };
@@ -247,99 +247,97 @@ fn send_mode(input: PathBuf, duration: f32, bitrate: u32) {
     let input_data = match std::fs::read(&input) {
         Ok(data) => data,
         Err(e) => {
-            eprintln!("❌ Failed to read input file: {}", e);
+            error!("Failed to read input file: {}", e);
             return;
         }
     };
     
-    println!("📄 Read {} bytes from input file", input_data.len());
+    info!("Read {} bytes from input file", input_data.len());
     
     // Generate amodem audio
-    println!("🎵 Generating amodem audio...");
+    info!("Generating amodem audio...");
     let audio_samples = generate_amodem_audio(&input_data, &config);
-    println!("🎵 Generated {} audio samples", audio_samples.len());
+    info!("Generated {} audio samples", audio_samples.len());
     
     // Save generated audio for debugging with metadata
     let pcm_data = common::dumps_with_metadata(&audio_samples, config.fs as u32, 1, 16);
     let pcm_path = "tmp/generated.pcm";
     std::fs::write(pcm_path, &pcm_data).unwrap();
-    println!("💾 Generated audio saved to {} ({} Hz, 16-bit, mono)", pcm_path, config.fs as u32);
+    info!("Generated audio saved to {} ({} Hz, 16-bit, mono)", pcm_path, config.fs as u32);
     
     // Use PCM player to play the generated audio
-    println!("🎵 Starting PCM playback...");
+    info!("Starting PCM playback...");
     play_pcm_file(pcm_path, duration);
 }
 
 fn test_mode(message: String, duration: f32, bitrate: u32) {
     print_banner();
     
-    println!("🧪 Amodem Test Mode (Direct Memory)");
-    println!("💬 Test message: \"{}\"", message);
-    println!("⏱️  Duration: {:.1} seconds per phase", duration);
-    println!("📡 Bitrate: {} kb/s", bitrate);
-    println!();
+    info!("Amodem Test Mode (Direct Memory)");
+    info!("Test message: \"{}\"", message);
+    info!("Duration: {:.1} seconds per phase", duration);
+    info!("Bitrate: {} kb/s", bitrate);
     
     // Get configuration
     let config = match bitrate {
         1 => Configuration::bitrate_1(),
         2 => Configuration::bitrate_2(),
         _ => {
-            eprintln!("❌ Invalid bitrate: {}. Supported values: 1, 2", bitrate);
+            error!("Invalid bitrate: {}. Supported values: 1, 2", bitrate);
             return;
         }
     };
     
     // Phase 1: Generate amodem audio in memory
-    println!("📡 Phase 1: Generating amodem audio...");
+    info!("Phase 1: Generating amodem audio...");
     let message_bytes = message.as_bytes();
     let audio_samples = generate_amodem_audio(message_bytes, &config);
-    println!("🎵 Generated {} audio samples", audio_samples.len());
+    info!("Generated {} audio samples", audio_samples.len());
     
     // Save generated audio for debugging with metadata
     let pcm_data = common::dumps_with_metadata(&audio_samples, config.fs as u32, 1, 16);
     std::fs::write("tmp/test_generated.pcm", &pcm_data).unwrap();
-    println!("💾 Generated audio saved to tmp/test_generated.pcm ({} Hz, 16-bit, mono)", config.fs as u32);
+    info!("Generated audio saved to tmp/test_generated.pcm ({} Hz, 16-bit, mono)", config.fs as u32);
     
     // Phase 2: Decode the audio directly from memory
-    println!("🔍 Phase 2: Decoding amodem signal...");
+    info!("Phase 2: Decoding amodem signal...");
     match decode_amodem_signal(&audio_samples, &config) {
         Ok(decoded_data) => {
             // Compare results
-            println!();
-            println!("📊 Test Results:");
-            println!("📤 Sent: \"{}\"", message);
+            info!("Test Results:");
+            info!("Sent: \"{}\"", message);
             
             // Display decoded content
             if let Ok(decoded_text) = String::from_utf8(decoded_data.clone()) {
-                println!("📥 Received: \"{}\"", decoded_text.trim());
+                info!("Received: \"{}\"", decoded_text.trim());
                 
                 if message == decoded_text.trim() {
-                    println!("✅ Test PASSED! Message received correctly.");
+                    info!("Test PASSED! Message received correctly.");
                 } else {
-                    println!("❌ Test FAILED! Message mismatch.");
-                    println!("   Expected length: {} bytes", message.len());
-                    println!("   Received length: {} bytes", decoded_text.len());
+                    error!("Test FAILED! Message mismatch.");
+                    error!("   Expected length: {} bytes", message.len());
+                    error!("   Received length: {} bytes", decoded_text.len());
                 }
             } else {
-                println!("📥 Received: {} bytes of binary data", decoded_data.len());
-                println!("📄 Raw bytes: {:02x?}", &decoded_data[..decoded_data.len().min(50)]);
+                info!("Received: {} bytes of binary data", decoded_data.len());
+                info!("Raw bytes: {:02x?}", &decoded_data[..decoded_data.len().min(50)]);
                 
                 // Check if it's the same binary data
                 if message_bytes == &decoded_data[..] {
-                    println!("✅ Test PASSED! Binary data matches.");
+                    info!("Test PASSED! Binary data matches.");
                 } else {
-                    println!("❌ Test FAILED! Binary data mismatch.");
-                    println!("   Expected length: {} bytes", message_bytes.len());
-                    println!("   Received length: {} bytes", decoded_data.len());
+                    error!("Test FAILED! Binary data mismatch.");
+                    error!("   Expected length: {} bytes", message_bytes.len());
+                    error!("   Received length: {} bytes", decoded_data.len());
                 }
             }
             
             // Save decoded result for inspection
             std::fs::write("tmp/test_result.txt", &decoded_data).unwrap();
-            println!("💾 Decoded result saved to tmp/test_result.txt");
+            info!("Decoded result saved to tmp/test_result.txt");
         }
         Err(e) => {
-            eprintln!("❌ Failed to decode amodem signal: {}", e);
+            error!("Failed to decode amodem signal: {}", e);
             std::fs::write("tmp/test_result.txt", format!("Decode error: {}", e)).unwrap();
         }
     }
@@ -410,17 +408,17 @@ fn play_pcm_file(pcm_path: &str, duration: f32) {
     let (file_sample_rate, file_channels, file_bit_depth, samples) = match read_pcm_with_metadata(pcm_path) {
         Ok(result) => result,
         Err(e) => {
-            eprintln!("❌ 读取 PCM 文件失败: {}", e);
+            error!("Failed to read PCM file: {}", e);
             return;
         }
     };
     
     if samples.is_empty() {
-        eprintln!("❌ PCM 文件为空");
+        error!("PCM file is empty");
         return;
     }
     
-    println!("📁 读取 PCM 文件: {} Hz, {} 声道, {} 位, {} 样本", 
+    info!("Read PCM file: {} Hz, {} channels, {} bits, {} samples", 
              file_sample_rate, file_channels, file_bit_depth, samples.len());
     
     // 设置 JACK 客户端
@@ -430,19 +428,19 @@ fn play_pcm_file(pcm_path: &str, duration: f32) {
     ) {
         Ok(client) => client,
         Err(e) => {
-            eprintln!("❌ JACK 客户端创建失败: {}", e);
+            error!("Failed to create JACK client: {}", e);
             return;
         }
     };
     
     let jack_sample_rate = client.sample_rate();
-    println!("🎵 JACK 采样率: {} Hz", jack_sample_rate);
+    info!("JACK sample rate: {} Hz", jack_sample_rate);
     
     // 重采样到 JACK 采样率
     let resampled_samples = match high_quality_resample(&samples, file_sample_rate, jack_sample_rate as u32) {
         Ok(samples) => samples,
         Err(e) => {
-            eprintln!("❌ 重采样失败: {}", e);
+            error!("Resampling failed: {}", e);
             return;
         }
     };
@@ -456,7 +454,7 @@ fn play_pcm_file(pcm_path: &str, duration: f32) {
         "playback",
         total_samples,
         "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} samples ({percent}%) {msg}",
-        "🎵 播放中..."
+        "Playing..."
     ).unwrap();
     
     // 创建播放状态
@@ -472,7 +470,7 @@ fn play_pcm_file(pcm_path: &str, duration: f32) {
     let out_port = match client.register_port("pcm_out", jack::AudioOut::default()) {
         Ok(port) => port,
         Err(e) => {
-            eprintln!("❌ 端口注册失败: {}", e);
+            error!("Failed to register port: {}", e);
             return;
         }
     };
@@ -480,7 +478,7 @@ fn play_pcm_file(pcm_path: &str, duration: f32) {
     let out_port_name = match out_port.name() {
         Ok(name) => name,
         Err(e) => {
-            eprintln!("❌ 获取端口名称失败: {}", e);
+            error!("Failed to get port name: {}", e);
             return;
         }
     };
@@ -493,7 +491,7 @@ fn play_pcm_file(pcm_path: &str, duration: f32) {
     let active_client = match client.activate_async((), process) {
         Ok(client) => client,
         Err(e) => {
-            eprintln!("❌ 客户端激活失败: {}", e);
+            error!("Failed to activate client: {}", e);
             return;
         }
     };
@@ -507,21 +505,31 @@ fn play_pcm_file(pcm_path: &str, duration: f32) {
     
     if let Some(system_in) = system_input_ports.first() {
         match active_client.as_client().connect_ports_by_name(&out_port_name, system_in) {
-            Ok(_) => println!("🔗 已连接输出: {} -> {}", out_port_name, system_in),
-            Err(e) => eprintln!("⚠️  连接输出失败: {}", e),
+            Ok(_) => info!("Connected output: {} -> {}", out_port_name, system_in),
+            Err(e) => warn!("Failed to connect output: {}", e),
         }
     } else {
-        eprintln!("⚠️  未找到系统输入端口");
+        warn!("No system input ports found");
     }
     
-    println!("🎵 开始播放 PCM 文件...");
+    info!("Starting PCM file playback...");
+    
+    // 计算实际播放时长（基于音频长度）
+    let actual_duration = total_samples as f32 / jack_sample_rate as f32;
+    let play_duration = if duration > 0.0 && duration < actual_duration {
+        duration // 如果指定了更短的时长，使用指定时长
+    } else {
+        actual_duration // 否则播放完整音频
+    };
+    
+    info!("Audio duration: {:.2} seconds, playback duration: {:.2} seconds", actual_duration, play_duration);
     
     // 启动进度更新线程
     let progress_manager_clone = progress_manager.clone();
     let state_clone = state.clone();
     let progress_handle = thread::spawn(move || {
         let start_time = Instant::now();
-        while start_time.elapsed().as_secs_f32() < duration {
+        while start_time.elapsed().as_secs_f32() < play_duration {
             let current_pos = {
                 let pos = state_clone.position.lock().unwrap();
                 *pos
@@ -531,7 +539,7 @@ fn play_pcm_file(pcm_path: &str, duration: f32) {
             
             // 计算播放百分比
             let percent = (current_pos as f32 / total_samples as f32 * 100.0) as u8;
-            let msg = format!("🎵 播放中... {}%", percent);
+            let msg = format!("Playing... {}%", percent);
             progress_manager_clone.set_message("playback", &msg).unwrap();
             
             thread::sleep(Duration::from_millis(100));
@@ -539,7 +547,7 @@ fn play_pcm_file(pcm_path: &str, duration: f32) {
     });
     
     // 等待播放完成
-    thread::sleep(Duration::from_secs_f32(duration));
+    thread::sleep(Duration::from_secs_f32(play_duration));
     
     // 停止播放
     {
@@ -551,11 +559,11 @@ fn play_pcm_file(pcm_path: &str, duration: f32) {
     let _ = progress_handle.join();
     
     // 完成进度条
-    progress_manager.finish("playback", "✅ 播放完成").unwrap();
+    progress_manager.finish("playback", "Playback completed").unwrap();
     
     // 断开连接并停用客户端
     if let Err(err) = active_client.deactivate() {
-        eprintln!("⚠️  停用客户端时出错: {}", err);
+        warn!("Error deactivating client: {}", err);
     }
 }
 
@@ -579,8 +587,8 @@ fn read_pcm_with_metadata(path: &str) -> std::io::Result<(u32, u16, u16, Vec<f32
     // 尝试读取带元数据的 PCM 文件
     match common::loads_with_metadata(&data) {
         Ok((metadata, samples_f64)) => {
-            println!("📁 读取带元数据的 PCM 文件: {}", path);
-            println!("📊 元数据: {} Hz, {} 声道, {} 位, {} 样本", 
+            info!("Reading PCM file with metadata: {}", path);
+            info!("Metadata: {} Hz, {} channels, {} bits, {} samples", 
                      metadata.sample_rate, metadata.channels, metadata.bit_depth, metadata.data_length);
             
             let samples_f32: Vec<f32> = samples_f64.iter().map(|&x| x as f32).collect();
@@ -588,7 +596,7 @@ fn read_pcm_with_metadata(path: &str) -> std::io::Result<(u32, u16, u16, Vec<f32
         }
         Err(_) => {
             // 如果不是带元数据的文件，回退到原始方法
-            println!("📁 文件不是带元数据的 PCM 格式，使用默认参数读取");
+            info!("File is not in metadata PCM format, reading with default parameters");
             let samples = read_pcm_file(path, 8000, 1, 16)?;
             Ok((8000, 1, 16, samples))
         }
@@ -602,8 +610,8 @@ fn read_pcm_file(path: &str, sample_rate: u32, channels: u16, bit_depth: u16) ->
     let mut file = BufReader::new(File::open(path)?);
     let mut samples = Vec::new();
     
-    println!("📁 读取 PCM 文件: {}", path);
-    println!("📊 参数: {}Hz, {}声道, {}位", sample_rate, channels, bit_depth);
+    info!("Reading PCM file: {}", path);
+    info!("Parameters: {}Hz, {} channels, {} bits", sample_rate, channels, bit_depth);
     
     match bit_depth {
         8 => {
@@ -689,7 +697,7 @@ fn read_pcm_file(path: &str, sample_rate: u32, channels: u16, bit_depth: u16) ->
         samples = mono_samples;
     }
     
-    println!("📊 读取了 {} 个样本", samples.len());
+    info!("Read {} samples", samples.len());
     Ok(samples)
 }
 
@@ -703,7 +711,7 @@ fn high_quality_resample(
     }
     
     let ratio = output_rate as f64 / input_rate as f64;
-    println!("🔄 高质量重采样: {} Hz -> {} Hz (比例: {:.3})", input_rate, output_rate, ratio);
+    info!("High-quality resampling: {} Hz -> {} Hz (ratio: {:.3})", input_rate, output_rate, ratio);
     
     // 配置高质量重采样参数
     let params = SincInterpolationParameters {
@@ -731,7 +739,7 @@ fn high_quality_resample(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("重采样处理失败: {}", e)))?;
     
     let result = output[0].clone();
-    println!("✅ 高质量重采样完成: {} -> {} 样本", input_samples.len(), result.len());
+    info!("High-quality resampling completed: {} -> {} samples", input_samples.len(), result.len());
     Ok(result)
 }
 
