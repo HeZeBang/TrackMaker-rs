@@ -295,6 +295,53 @@ fn create_process_callback(
     }
 }
 
+fn save_playback_to_wav(path: &str, samples: &[f32], sample_rate: u32) -> io::Result<()> {
+    use std::io::Write;
+    if samples.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = File::create(path)?;
+
+    let num_channels: u16 = 1;
+    let bits_per_sample: u16 = 16;
+    let byte_rate = sample_rate * num_channels as u32 * bits_per_sample as u32 / 8;
+    let block_align = num_channels * bits_per_sample / 8;
+
+    let data: Vec<i16> = samples.iter()
+        .map(|s| {
+            let v = s.clamp(-1.0, 1.0);
+            (v * 32767.0) as i16
+        })
+        .collect();
+
+    let data_size = (data.len() * 2) as u32;
+    let chunk_size = 36 + data_size;
+
+    // RIFF 头
+    file.write_all(b"RIFF")?;
+    file.write_all(&chunk_size.to_le_bytes())?;
+    file.write_all(b"WAVE")?;
+    // fmt 子块
+    file.write_all(b"fmt ")?;
+    file.write_all(&16u32.to_le_bytes())?;              // PCM fmt chunk size
+    file.write_all(&1u16.to_le_bytes())?;               // AudioFormat = 1 (PCM)
+    file.write_all(&num_channels.to_le_bytes())?;
+    file.write_all(&sample_rate.to_le_bytes())?;
+    file.write_all(&byte_rate.to_le_bytes())?;
+    file.write_all(&block_align.to_le_bytes())?;
+    file.write_all(&bits_per_sample.to_le_bytes())?;
+    // data 子块
+    file.write_all(b"data")?;
+    file.write_all(&data_size.to_le_bytes())?;
+    for v in data {
+        file.write_all(&v.to_le_bytes())?;
+    }
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     // 初始化日志
     tracing_subscriber::fmt::init();
@@ -327,6 +374,13 @@ fn main() -> io::Result<()> {
     // 重采样到 JACK 采样率
     let resampled_samples = high_quality_resample(&samples, actual_sample_rate, jack_sample_rate as u32)?;
     
+    // 新增: 保存将要播放的音频到 tmp
+    if let Err(e) = save_playback_to_wav("tmp/last_playback.wav", &resampled_samples, jack_sample_rate as u32) {
+        warn!("保存回放音频失败: {}", e);
+    } else {
+        info!("已保存回放音频到 tmp/last_playback.wav");
+    }
+
     // 创建播放状态（使用重采样后的样本）
     let state = PlaybackState::new(resampled_samples, cli.loop_play);
     
