@@ -2,8 +2,9 @@ use num_complex::Complex64;
 use std::io::Write;
 use crate::amodem::{
     config::Configuration,
-    dsp::Modem,
+    dsp::{Demux, Modem},
     equalizer::Equalizer,
+    sampling::Sampler,
 };
 
 pub struct Receiver {
@@ -42,20 +43,20 @@ impl Receiver {
     }
     
     pub fn debug_demodulate(&self, signal: &[f64], gain: f64) -> Result<Vec<Complex64>, String> {
-        self.demodulate_python_style(signal, gain)
+        self.demodulate_python_style(signal, gain, 1.0)
     }
     
     pub fn get_modem(&self) -> &Modem {
         &self.modem
     }
     
-    pub fn run<W: Write>(&mut self, signal: Vec<f64>, gain: f64, mut output: W) -> Result<(), String> {
+    pub fn run<W: Write>(&mut self, signal: Vec<f64>, gain: f64, freq: f64, mut output: W) -> Result<(), String> {
         eprintln!("Receiving");
         
         // Note: skip_start is now handled in main_recv.rs, no need to skip again here
         
         // Use Python-style demodulation
-        let symbols = self.demodulate_python_style(&signal, gain)?;
+        let symbols = self.demodulate_python_style(&signal, gain, freq)?;
         
         // Skip training sequence exactly like Python
         let training_skip = 550; // prefix(250) + silence(50) + training(200) + silence(50)
@@ -98,46 +99,29 @@ impl Receiver {
         Ok(())
     }
     
-    fn demodulate_python_style(&self, signal: &[f64], gain: f64) -> Result<Vec<Complex64>, String> {
-        // Implement Python-style demodulation using Demux
-        // This follows the exact Python logic from dsp.Demux
-        
-        let mut symbols = Vec::new();
-        let _signal_iter = signal.iter().cloned(); // For future use
-        
-        // Create Python-style Demux filter
-        // Python: self.filters = [exp_iwt(-w, Nsym) / (0.5*self.Nsym) for w in omegas]
-        let omega = self.omegas[0];
-        let filter: Vec<Complex64> = (0..self.nsym).map(|i| {
-            let phase = -omega * i as f64;
-            let exp_val = Complex64::new(phase.cos(), phase.sin());
-            exp_val / (0.5 * self.nsym as f64)
-        }).collect();
-        
-        eprintln!("🔧 Python-style Demux filter (first 4): {:?}", &filter[..4]);
-        
-        // Process signal in chunks like Python's Demux.next()
-        for chunk in signal.chunks(self.nsym) {
-            if chunk.len() == self.nsym {
-                // Apply gain
-                let scaled_chunk: Vec<f64> = chunk.iter().map(|&x| x * gain).collect();
-                
-                // Python: return np.dot(self.filters, frame)
-                // For single carrier: correlation = sum(filter[i] * frame[i])
-                let mut correlation = Complex64::new(0.0, 0.0);
-                for (i, &sample) in scaled_chunk.iter().enumerate() {
-                    correlation += filter[i] * sample;
-                }
-                
-                symbols.push(correlation);
-            }
+    fn demodulate_python_style(&self, signal: &[f64], gain: f64, freq: f64) -> Result<Vec<Complex64>, String> {
+        if self.omegas.is_empty() {
+            return Err("Receiver has no configured carriers".to_string());
         }
-        
+
+        let sampler = Sampler::new(signal, freq);
+        let mut demux = Demux::new(sampler, &self.omegas, self.nsym, gain);
+        let mut symbols = Vec::new();
+
+        while let Some(symbol_row) = demux.next() {
+            let carrier_symbol = symbol_row
+                .get(self.carrier_index)
+                .copied()
+                .or_else(|| symbol_row.first().copied())
+                .unwrap_or_else(|| Complex64::new(0.0, 0.0));
+            symbols.push(carrier_symbol);
+        }
+
         eprintln!("🎯 Extracted {} symbols using Python-style Demux", symbols.len());
         if symbols.len() > 0 {
             eprintln!("First 5 symbols: {:?}", &symbols[..5.min(symbols.len())]);
         }
-        
+
         Ok(symbols)
     }
     

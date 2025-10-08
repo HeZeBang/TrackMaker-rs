@@ -349,11 +349,12 @@ fn decode_amodem_signal(samples: &[f64], config: &Configuration) -> Result<Vec<u
     let mut receiver = Receiver::new(config);
     
     // Detect carrier and get signal
-    let (signal, amplitude, _freq_error) = detector.run(samples.iter().cloned())?;
+    let (signal, amplitude, freq_error) = detector.run(samples.iter().cloned())?;
+    let freq = 1.0 / (1.0 + freq_error);
     
     // Decode the signal
     let mut output = Vec::new();
-    receiver.run(signal, 1.0 / amplitude, &mut output)?;
+    receiver.run(signal, 1.0 / amplitude, freq, &mut output)?;
     
     Ok(output)
 }
@@ -398,8 +399,6 @@ fn resample_audio(input: &[f32], input_rate: f32, output_rate: f32) -> Vec<f32> 
 }
 
 fn play_pcm_file(pcm_path: &str, duration: f32) {
-    use std::fs::File;
-    use std::io::Read;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};

@@ -41,7 +41,7 @@ pub fn recv<R: Read, W: Write>(
     
     // Create receiver and run
     let mut receiver = Receiver::new(config);
-    receiver.run(signal, gain, dst)?;
+    receiver.run(signal, gain, freq, dst)?;
     
     Ok(true)
 }
