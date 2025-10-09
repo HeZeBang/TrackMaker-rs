@@ -181,3 +181,85 @@ $$
   - 遇到 EOF 帧即结束。
 - 将每个有效载荷写入输出，恢复原始数据流。
 
+## 流式识别
+
+这里我们特别研究一下如何流式识别
+
+### 前导检测
+
+amodem 按照符号长度连续的切块，并且计算每块与载波的相干度，达到阈值持续就认为检测到载波。
+
+```py
+# detect.py
+def _wait(self, samples):
+    counter = 0
+    bufs = collections.deque([], maxlen=self.maxlen)
+    for offset, buf in common.iterate(samples, self.Nsym, index=True):
+        if offset > self.max_offset:
+            raise ValueError('Timeout waiting for carrier')
+        bufs.append(buf)
+
+        coeff = dsp.coherence(buf, self.omega)
+        if abs(coeff) > self.COHERENCE_THRESHOLD:
+            counter += 1
+        else:
+            counter = 0
+
+        if counter == self.CARRIER_THRESHOLD:
+            return offset, bufs
+```
+
+在检测到的载波附近，做一次相关搜索，精确定位前导开始的样本偏移。同时估计前导幅度与频偏，供后续采样器与增益/频率校正。
+
+```py
+def run(self, samples):
+    offset, bufs = self._wait(samples)
+    ...
+    bufs = list(bufs)[-self.CARRIER_THRESHOLD-self.SEARCH_WINDOW:]
+    n = self.SEARCH_WINDOW + self.CARRIER_DURATION - self.CARRIER_THRESHOLD
+    trailing = list(itertools.islice(samples, n * self.Nsym))
+    bufs.append(np.array(trailing))
+
+    buf = np.concatenate(bufs)
+    offset = self.find_start(buf)
+    ...
+    prefix_length = self.CARRIER_DURATION * self.Nsym
+    amplitude, freq_err = self.estimate(buf[:prefix_length])
+    return itertools.chain(buf, samples), amplitude, freq_err
+```
+
+```py
+def find_start(self, buf):
+    carrier = dsp.exp_iwt(self.omega, self.Nsym)
+    carrier = np.tile(carrier, self.START_PATTERN_LENGTH)
+    zeroes = carrier * 0.0
+    signal = np.concatenate([zeroes, carrier])
+    signal = (2 ** 0.5) * signal / dsp.norm(signal)
+
+    corr = np.abs(np.correlate(buf, signal))
+    ...
+    index = np.argmax(coeffs)
+    log.info('Carrier coherence: %.3f%%', coeffs[index] * 100)
+    offset = index + len(zeroes)
+    return offset
+```
+
+接下来再是静音等待和校正环节
+
+### 结尾检测
+
+帧化使用长度前缀 + CRC32，发送端最后发一帧空负载 EOF=b''。解码端在流式逐帧取数中遇到 EOF 即结束。
+
+```py
+def decode(self, data):
+    data = iter(data)
+    while True:
+        length, = _take_fmt(data, self.prefix_fmt)
+        frame = _take_len(data, length)
+        block = self.checksum.decode(frame)
+        if block == self.EOF:
+            log.debug('EOF frame detected')
+            return
+
+        yield block
+```

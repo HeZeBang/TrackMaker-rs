@@ -49,47 +49,73 @@ impl Detector {
         }
     }
     
-    pub fn run(&self, samples: impl Iterator<Item = f64>) -> Result<(Vec<f64>, f64, f64), String> {
-        // Collect all samples first so we can process them properly
-        let all_samples: Vec<f64> = samples.collect();
-        
-        // SIMPLIFIED DETECTION: Just find the first significant signal
-        let mut carrier_start = 0;
-        for (i, chunk) in all_samples.chunks(self.nsym).enumerate() {
-            let energy = chunk.iter().map(|&x| x * x).sum::<f64>();
-            if energy > 0.1 { // Simple energy threshold
-                carrier_start = i * self.nsym;
-                eprintln!("Carrier detected at symbol {} (sample {})", i, carrier_start);
-                break;
-            }
-            if i > 1000 { // Avoid infinite search
+    pub fn run(&self, mut samples: impl Iterator<Item = f64>) -> Result<(Vec<f64>, f64, f64), String> {
+        // 1) 等待载波：按符号切块、计算相干度、累计达到阈值
+        let (offset_samples, mut bufs) = self.wait_for_carrier(&mut samples)?;
+
+        // 2) 计算开始时间日志（近似显示）
+        let start_time_ms = (offset_samples as f64 / self.nsym as f64) * self.tsym * 1e3;
+        eprintln!(
+            "Carrier detected at ~{:.1} ms @ {:.1} kHz",
+            start_time_ms,
+            self.freq / 1e3
+        );
+
+        // 3) 组装用于精确定位的缓冲：取尾部窗口 + 额外追踪
+        let search_window = self.search_window;
+        let carrier_duration = self.carrier_duration;
+        let carrier_threshold = self.carrier_threshold;
+
+        // 仅保留最近 (carrier_threshold + search_window) 个符号块
+        let keep = carrier_threshold + search_window;
+        if bufs.len() > keep {
+            bufs.drain(0..(bufs.len() - keep));
+        }
+
+        // 需要从后续 samples 再补充 n 个符号块样本
+        let n_trailing = search_window + carrier_duration - carrier_threshold;
+        let mut trailing: Vec<f64> = Vec::with_capacity(n_trailing * self.nsym);
+        for _ in 0..(n_trailing * self.nsym) {
+            if let Some(v) = samples.next() {
+                trailing.push(v);
+            } else {
                 break;
             }
         }
-        
-        let start_time = carrier_start as f64 / self.freq * 1000.0;
-        eprintln!("Carrier detected at ~{:.1} ms @ {:.1} kHz", 
-                 start_time, self.freq / 1e3);
-        
-        // Return all samples from carrier start onward
-        let original_len = all_samples.len();
-        let final_signal = if carrier_start < original_len {
-            all_samples[carrier_start..].to_vec()
+
+        // 拼接 buf 以做相关
+        let mut buf: Vec<f64> = bufs.into_iter().flatten().collect();
+        buf.extend(trailing.iter());
+
+        // 4) 相关搜索精确定位起点
+        let offset_in_buf = self.find_start(&buf);
+        let start_time_ms = ((offset_samples as f64 - (carrier_threshold - 1) as f64 * self.nsym as f64)
+            / self.nsym as f64
+            + (offset_in_buf as f64 / self.nsym as f64 - self.search_window as f64))
+            * self.tsym
+            * 1e3;
+        eprintln!("Carrier starts at {:.3} ms", start_time_ms);
+
+        // 5) 估计幅度与频偏（在前导长度范围内）
+        let prefix_len = carrier_duration * self.nsym;
+        let slice_end = (offset_in_buf + prefix_len).min(buf.len());
+        let amplitude;
+        let freq_err;
+        if offset_in_buf < slice_end {
+            let est_on = &buf[offset_in_buf..slice_end];
+            let (a, f) = self.estimate(est_on);
+            amplitude = a;
+            freq_err = f;
         } else {
-            all_samples
-        };
-        
-        eprintln!("🔧 Returning {} samples from index {} (original had {})", 
-                  final_signal.len(), carrier_start, original_len);
-        
-        let amplitude = 1.0;
-        let freq_error = 0.0;
-        
-        eprintln!("Carrier coherence: {:.3}%", 100.0);
-        eprintln!("Carrier symbols amplitude: {:.3}", amplitude);
-        eprintln!("Frequency error: {:.3} ppm", freq_error * 1e6);
-        
-        Ok((final_signal, amplitude, freq_error))
+            amplitude = 1.0;
+            freq_err = 0.0;
+        }
+
+        // 6) 返回：从精确起点后的 buf + 尚未消耗的 samples 组成的完整后续信号
+        let mut final_signal = buf[offset_in_buf..].to_vec();
+        final_signal.extend(samples);
+
+        Ok((final_signal, amplitude, freq_err))
     }
     
     fn wait_for_carrier(&self, samples: impl Iterator<Item = f64>) -> Result<(usize, Vec<Vec<f64>>), String> {
@@ -138,5 +164,76 @@ impl Detector {
             .sum();
         
         dot_product / norm_x
+    }
+
+    // 归一化互相关定位起点
+    fn find_start(&self, buf: &[f64]) -> usize {
+        // 构造载波模板（实部），重复 start_pattern_length 次
+        let mut carrier: Vec<f64> = Vec::with_capacity(self.nsym * self.start_pattern_length);
+        for _ in 0..self.start_pattern_length {
+            for i in 0..self.nsym {
+                let phase = self.omega * i as f64;
+                carrier.push(phase.cos());
+            }
+        }
+
+        let zeroes_len = carrier.len();
+        let mut tmpl = vec![0.0f64; zeroes_len];
+        tmpl.extend_from_slice(&carrier);
+
+        if buf.len() < tmpl.len() {
+            return 0;
+        }
+        let mut best_idx = 0usize;
+        let mut best_coeff = f64::MIN;
+        let tmpl_energy = tmpl.iter().map(|v| v * v).sum::<f64>().sqrt();
+        for i in 0..=(buf.len() - tmpl.len()) {
+            let window = &buf[i..i + tmpl.len()];
+            let win_energy = window.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if win_energy == 0.0 { continue; }
+            let dot = window.iter().zip(tmpl.iter()).map(|(a, b)| a * b).sum::<f64>();
+            let coeff = dot / (tmpl_energy * win_energy);
+            if coeff > best_coeff {
+                best_coeff = coeff;
+                best_idx = i;
+            }
+        }
+        best_idx + zeroes_len
+    }
+
+    // 估计幅度与频偏
+    fn estimate(&self, buf: &[f64]) -> (f64, f64) {
+        if buf.len() < self.nsym * 3 { return (1.0, 0.0); }
+        let mut symbols: Vec<Complex64> = Vec::new();
+        for frame in buf.chunks(self.nsym) {
+            if frame.len() < self.nsym { break; }
+            let mut sum = Complex64::new(0.0, 0.0);
+            let scale = 0.5 * frame.len() as f64;
+            for (i, &x) in frame.iter().enumerate() {
+                let phase = -self.omega * i as f64;
+                let w = Complex64::new(phase.cos(), phase.sin()) / scale;
+                sum += w * x;
+            }
+            symbols.push(sum);
+        }
+        let skip = 5usize;
+        let symbols = if symbols.len() > 2 * skip { &symbols[skip..symbols.len() - skip] } else { &symbols[..] };
+        if symbols.is_empty() { return (1.0, 0.0); }
+        let amplitude = symbols.iter().map(|c| c.norm()).sum::<f64>() / (symbols.len() as f64);
+
+        let phases: Vec<f64> = symbols.iter().map(|c| c.arg() / (2.0 * std::f64::consts::PI)).collect();
+        let n = phases.len();
+        if n < 2 { return (amplitude, 0.0); }
+        let x_mean = (n as f64 - 1.0) / 2.0;
+        let y_mean = phases.iter().sum::<f64>() / n as f64;
+        let mut num = 0.0; let mut den = 0.0;
+        for (i, &y) in phases.iter().enumerate() {
+            let xi = i as f64;
+            num += (xi - x_mean) * (y - y_mean);
+            den += (xi - x_mean) * (xi - x_mean);
+        }
+        let a = if den != 0.0 { num / den } else { 0.0 };
+        let freq_err = a / (self.tsym * self.freq);
+        (amplitude, freq_err)
     }
 }

@@ -84,6 +84,51 @@ pub fn encode(data: &[u8]) -> Vec<bool> {
     result
 }
 
+// 将位流按低位在前的顺序转为字节流（与 Python BitPacker 匹配）
+pub fn bits_to_bytes<I: Iterator<Item = bool>>(mut bits: I) -> impl Iterator<Item = u8> {
+    std::iter::from_fn(move || {
+        let mut byte = 0u8;
+        for i in 0..8 {
+            if let Some(bit) = bits.next() {
+                if bit { byte |= 1 << i; }
+            } else {
+                return None;
+            }
+        }
+        Some(byte)
+    })
+}
+
+// 从位流解码帧：长度前缀(1字节) + [CRC32(4字节)+payload]
+// 遇到 frame_len==0 即 EOF，返回 None 终止
+pub fn decode_frames_from_bits<I: Iterator<Item = bool>>(bits: I) -> impl Iterator<Item = Vec<u8>> {
+    let mut bytes = bits_to_bytes(bits);
+    std::iter::from_fn(move || {
+        // 读取长度
+        let len = bytes.next()? as usize;
+        if len == 0 { return None; }
+        // 读取帧数据 len 字节
+        let mut frame = Vec::with_capacity(len);
+        for _ in 0..len {
+            if let Some(b) = bytes.next() {
+                frame.push(b);
+            } else {
+                return None; // 不完整，终止
+            }
+        }
+        // 校验并输出 payload
+        if frame.len() < 4 { return None; }
+        let checksum = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
+        let payload = &frame[4..];
+        let mut hasher = Hasher::new();
+        hasher.update(payload);
+        if hasher.finalize() != checksum {
+            return None; // 校验失败，终止本次
+        }
+        Some(payload.to_vec())
+    })
+}
+
 pub fn decode(data: &[u8]) -> Result<Vec<u8>, String> {
     let mut result = Vec::new();
     let mut offset = 0;
