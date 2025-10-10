@@ -1,3 +1,3 @@
 [submodule "ref/amodem"]
 	path = ref/amodem
-	url = https://github.com/romanz/amodem.git
+	url = git@github.com:HeZeBang/amodem.git
