@@ -32,6 +32,7 @@ fn main() {
     println!("message:               {:?}", orig_str);
     println!("original data:         {:?}", data);
     println!("error correction code: {:?}", encoded.ecc());
+    println!("error corr. in ascii:  {:?}", String::from_utf8_lossy(&encoded.ecc()));
     println!("corrupted:             {:?}", corrupted);
     println!("repaired:              {:?}", recv_str);
 }

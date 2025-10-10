@@ -111,4 +111,8 @@ impl Configuration {
     pub fn bitrate_2() -> Self {
         Self::new(8000.0, 4, vec![2000.0])
     }
+    
+    pub fn bitrate_8() -> Self {
+        Self::new(8000.0, 16, vec![1000.0, 2000.0])
+    }
 }

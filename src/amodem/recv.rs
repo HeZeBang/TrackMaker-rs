@@ -16,10 +16,16 @@ pub struct Receiver {
     equalizer: Equalizer,
     carrier_index: usize,
     output_size: usize,
+    use_reed_solomon: bool,
+    ecc_len: usize,
 }
 
 impl Receiver {
     pub fn new(config: &Configuration) -> Self {
+        Self::with_reed_solomon(config, false, 8)
+    }
+    
+    pub fn with_reed_solomon(config: &Configuration, use_reed_solomon: bool, ecc_len: usize) -> Self {
         let modem = Modem::new(config.symbols.clone());
         let frequencies = config.frequencies.clone();
         let omegas: Vec<f64> = frequencies.iter()
@@ -39,6 +45,8 @@ impl Receiver {
             equalizer,
             carrier_index,
             output_size: 0,
+            use_reed_solomon,
+            ecc_len,
         }
     }
     
@@ -85,11 +93,19 @@ impl Receiver {
         let bits_iter = bit_tuples.into_iter().flat_map(|tuple| tuple.into_iter());
 
         // 使用基于位流的帧解码器，遇到 EOF 自动结束
-        let mut frames_iter = crate::amodem::framing::decode_frames_from_bits(bits_iter);
         eprintln!("Starting demodulation");
-        while let Some(frame) = frames_iter.next() {
-            output.write_all(&frame).map_err(|e| e.to_string())?;
-            self.output_size += frame.len();
+        if self.use_reed_solomon {
+            let frames_iter = crate::amodem::framing::decode_frames_from_bits_with_reed_solomon(bits_iter, self.ecc_len);
+            for frame in frames_iter {
+                output.write_all(&frame).map_err(|e| e.to_string())?;
+                self.output_size += frame.len();
+            }
+        } else {
+            let frames_iter = crate::amodem::framing::decode_frames_from_bits(bits_iter);  
+            for frame in frames_iter {
+                output.write_all(&frame).map_err(|e| e.to_string())?;
+                self.output_size += frame.len();
+            }
         }
 
         // 简要统计

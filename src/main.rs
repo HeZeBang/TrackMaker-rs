@@ -11,6 +11,7 @@ mod device;
 mod ui;
 mod utils;
 mod amodem;
+mod error_correction;
 
 use device::jack::{
     connect_input_from_first_system_output,
@@ -20,6 +21,7 @@ use device::jack::{
 use ui::{print_banner, progress::ProgressManager};
 use utils::logging::init_logging;
 use amodem::{config::Configuration, detect::Detector, recv::Receiver, send, common};
+
 use rubato::{Resampler, SincFixedIn, SincInterpolationType, SincInterpolationParameters, WindowFunction};
 
 #[derive(Parser)]
@@ -36,7 +38,7 @@ enum Commands {
     /// Receive mode: decode audio from JACK input to file
     Receive {
         /// Output file for decoded data
-        #[arg(short, long, default_value = "decoded_output.txt")]
+        #[arg(short, long, default_value = "tmp/decoded_output.txt")]
         output: PathBuf,
         
         /// Duration to record in seconds
@@ -46,6 +48,14 @@ enum Commands {
         /// Bitrate configuration (1 or 2)
         #[arg(short, long, default_value = "1")]
         bitrate: u32,
+        
+        /// Enable Reed-Solomon error correction
+        #[arg(long)]
+        reed_solomon: bool,
+        
+        /// Reed-Solomon error correction code length (default: 16)
+        #[arg(long, default_value = "16")]
+        ecc_len: usize,
     },
     
     /// Send mode: encode file content and play through JACK
@@ -61,6 +71,14 @@ enum Commands {
         /// Bitrate configuration (1 or 2)
         #[arg(short, long, default_value = "1")]
         bitrate: u32,
+        
+        /// Enable Reed-Solomon error correction
+        #[arg(long)]
+        reed_solomon: bool,
+        
+        /// Reed-Solomon error correction code length (default: 16)
+        #[arg(long, default_value = "16")]
+        ecc_len: usize,
     },
     
     /// Test mode: send and receive in sequence
@@ -76,6 +94,14 @@ enum Commands {
         /// Bitrate configuration (1 or 2)
         #[arg(short, long, default_value = "1")]
         bitrate: u32,
+        
+        /// Enable Reed-Solomon error correction
+        #[arg(long)]
+        reed_solomon: bool,
+        
+        /// Reed-Solomon error correction code length (default: 16)
+        #[arg(long, default_value = "16")]
+        ecc_len: usize,
     },
 }
 
@@ -84,25 +110,28 @@ fn main() {
     init_logging();
     
     match cli.command {
-        Commands::Receive { output, duration, bitrate } => {
-            receive_mode(output, duration, bitrate);
+        Commands::Receive { output, duration, bitrate, reed_solomon, ecc_len } => {
+            receive_mode(output, duration, bitrate, reed_solomon, ecc_len);
         }
-        Commands::Send { input, duration, bitrate } => {
-            send_mode(input, duration, bitrate);
+        Commands::Send { input, duration, bitrate, reed_solomon, ecc_len } => {
+            send_mode(input, duration, bitrate, reed_solomon, ecc_len);
         }
-        Commands::Test { message, duration, bitrate } => {
-            test_mode(message, duration, bitrate);
+        Commands::Test { message, duration, bitrate, reed_solomon, ecc_len } => {
+            test_mode(message, duration, bitrate, reed_solomon, ecc_len);
         }
     }
 }
 
-fn receive_mode(output: PathBuf, duration: f32, bitrate: u32) {
+fn receive_mode(output: PathBuf, duration: f32, bitrate: u32, reed_solomon: bool, ecc_len: usize) {
     print_banner();
     
     info!("Amodem Receive Mode");
     info!("Output file: {}", output.display());
     info!("Duration: {:.1} seconds", duration);
     info!("Bitrate: {} kb/s", bitrate);
+    if reed_solomon {
+        info!("Reed-Solomon error correction enabled (ECC length: {})", ecc_len);
+    }
     
     // Get configuration
     let config = match bitrate {
@@ -196,9 +225,12 @@ fn receive_mode(output: PathBuf, duration: f32, bitrate: u32) {
     std::fs::write("tmp/recorded.pcm", &pcm_data).unwrap();
     info!("Raw audio saved to tmp/recorded.pcm ({} Hz, 16-bit, mono)", config.fs as u32);
     
-    // Decode using amodem
+    // Decode using amodem (Reed-Solomon is now handled at frame level)
     info!("Decoding amodem signal...");
-    match decode_amodem_signal(&amodem_samples, &config) {
+    if reed_solomon {
+        info!("Reed-Solomon error correction will be applied at frame level (ECC length: {})", ecc_len);
+    }
+    match decode_amodem_signal_with_reed_solomon(&amodem_samples, &config, reed_solomon, ecc_len) {
         Ok(decoded_data) => {
             // Write decoded data to output file
             std::fs::write(&output, &decoded_data).unwrap();
@@ -219,13 +251,16 @@ fn receive_mode(output: PathBuf, duration: f32, bitrate: u32) {
     }
 }
 
-fn send_mode(input: PathBuf, duration: f32, bitrate: u32) {
+fn send_mode(input: PathBuf, duration: f32, bitrate: u32, reed_solomon: bool, ecc_len: usize) {
     print_banner();
     
     info!("Amodem Send Mode");
     info!("Input file: {}", input.display());
     info!("Duration: {:.1} seconds", duration);
     info!("Bitrate: {} kb/s", bitrate);
+    if reed_solomon {
+        info!("Reed-Solomon error correction enabled (ECC length: {})", ecc_len);
+    }
     
     // Check if input file exists
     if !input.exists() {
@@ -254,9 +289,12 @@ fn send_mode(input: PathBuf, duration: f32, bitrate: u32) {
     
     info!("Read {} bytes from input file", input_data.len());
     
-    // Generate amodem audio
+    // Generate amodem audio (Reed-Solomon is now handled at frame level)
     info!("Generating amodem audio...");
-    let audio_samples = generate_amodem_audio(&input_data, &config);
+    if reed_solomon {
+        info!("Reed-Solomon error correction will be applied at frame level (ECC length: {})", ecc_len);
+    }
+    let audio_samples = generate_amodem_audio_with_reed_solomon(&input_data, &config, reed_solomon, ecc_len);
     info!("Generated {} audio samples", audio_samples.len());
     
     // Save generated audio for debugging with metadata
@@ -270,13 +308,16 @@ fn send_mode(input: PathBuf, duration: f32, bitrate: u32) {
     play_pcm_file(pcm_path, duration);
 }
 
-fn test_mode(message: String, duration: f32, bitrate: u32) {
+fn test_mode(message: String, duration: f32, bitrate: u32, reed_solomon: bool, ecc_len: usize) {
     print_banner();
     
     info!("Amodem Test Mode (Direct Memory)");
     info!("Test message: \"{}\"", message);
     info!("Duration: {:.1} seconds per phase", duration);
     info!("Bitrate: {} kb/s", bitrate);
+    if reed_solomon {
+        info!("Reed-Solomon error correction enabled (ECC length: {})", ecc_len);
+    }
     
     // Get configuration
     let config = match bitrate {
@@ -291,7 +332,13 @@ fn test_mode(message: String, duration: f32, bitrate: u32) {
     // Phase 1: Generate amodem audio in memory
     info!("Phase 1: Generating amodem audio...");
     let message_bytes = message.as_bytes();
-    let audio_samples = generate_amodem_audio(message_bytes, &config);
+    
+    // Generate amodem audio (Reed-Solomon is now handled at frame level)
+    if reed_solomon {
+        info!("Reed-Solomon error correction will be applied at frame level (ECC length: {})", ecc_len);
+    }
+    
+    let audio_samples = generate_amodem_audio_with_reed_solomon(message_bytes, &config, reed_solomon, ecc_len);
     info!("Generated {} audio samples", audio_samples.len());
     
     // Save generated audio for debugging with metadata
@@ -301,7 +348,7 @@ fn test_mode(message: String, duration: f32, bitrate: u32) {
     
     // Phase 2: Decode the audio directly from memory
     info!("Phase 2: Decoding amodem signal...");
-    match decode_amodem_signal(&audio_samples, &config) {
+    match decode_amodem_signal_with_reed_solomon(&audio_samples, &config, reed_solomon, ecc_len) {
         Ok(decoded_data) => {
             // Compare results
             info!("Test Results:");
@@ -343,26 +390,30 @@ fn test_mode(message: String, duration: f32, bitrate: u32) {
     }
 }
 
-fn decode_amodem_signal(samples: &[f64], config: &Configuration) -> Result<Vec<u8>, String> {
+
+
+fn decode_amodem_signal_with_reed_solomon(samples: &[f64], config: &Configuration, use_reed_solomon: bool, ecc_len: usize) -> Result<Vec<u8>, String> {
     // Create detector and receiver
     let detector = Detector::new(config);
-    let mut receiver = Receiver::new(config);
+    let mut receiver = Receiver::with_reed_solomon(config, use_reed_solomon, ecc_len);
     
     // Detect carrier and get signal
     let (signal, amplitude, freq_error) = detector.run(samples.iter().cloned())?;
     let freq = 1.0 / (1.0 + freq_error);
     
-    // Decode the signal
+    // Decode the signal directly using the receiver (it handles framing internally)
     let mut output = Vec::new();
     receiver.run(signal, 1.0 / amplitude, freq, &mut output)?;
     
     Ok(output)
 }
 
-fn generate_amodem_audio(data: &[u8], config: &Configuration) -> Vec<f64> {
+
+
+fn generate_amodem_audio_with_reed_solomon(data: &[u8], config: &Configuration, use_reed_solomon: bool, ecc_len: usize) -> Vec<f64> {
     let mut output = Vec::new();
     
-    send::send(config, &data[..], &mut output, 1.0, 0.0).unwrap();
+    send::send_with_reed_solomon(config, &data[..], &mut output, 1.0, 0.0, use_reed_solomon, ecc_len).unwrap();
     
     // Load the generated PCM data
     common::loads(&output)

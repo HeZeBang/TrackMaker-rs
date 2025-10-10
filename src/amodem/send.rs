@@ -135,6 +135,18 @@ pub fn send<R: std::io::Read, W: Write>(
     gain: f64, 
     extra_silence: f64
 ) -> std::io::Result<()> {
+    send_with_reed_solomon(config, src, dst, gain, extra_silence, false, 8)
+}
+
+pub fn send_with_reed_solomon<R: std::io::Read, W: Write>(
+    config: &Configuration, 
+    mut src: R, 
+    dst: W, 
+    gain: f64, 
+    extra_silence: f64,
+    use_reed_solomon: bool,
+    ecc_len: usize
+) -> std::io::Result<()> {
     let mut sender = Sender::new(dst, config, gain);
     
     // Pre-padding with silence
@@ -152,7 +164,11 @@ pub fn send<R: std::io::Read, W: Write>(
     src.read_to_end(&mut data)?;
     
     // Encode data to bits
-    let bits = framing::encode(&data);
+    let bits = if use_reed_solomon {
+        framing::encode_with_reed_solomon(&data, ecc_len)
+    } else {
+        framing::encode(&data)
+    };
     
     eprintln!("Starting modulation");
     sender.modulate(bits.into_iter())?;
