@@ -1,5 +1,7 @@
 use crc32fast::Hasher;
 use reed_solomon::Encoder;
+use tracing::{error, warn, debug};
+use tracing_subscriber::field::debug;
 
 pub struct Checksum;
 
@@ -180,17 +182,27 @@ fn decode_frames_from_bits_with_params<I: Iterator<Item = bool>>(
             }
         }
         // 校验并输出 payload
-        if frame.len() < 4 { 
-            println!("Length Mismatch");
-            return None; 
+        debug!("Frame Actual length: {}", frame.len());
+        if frame.len() < 4 {
+            warn!("Length Field Mismatch: frame length {}, but expect at least 4", frame.len());
+            return None;
         }
+
         let checksum = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
         let data_with_ecc = &frame[4..];
         let mut hasher = Hasher::new();
         hasher.update(data_with_ecc);
-        if hasher.finalize() != checksum {
-            println!("Hash mismatch");
-            return None; // 校验失败，终止本次
+        let checksum_computed = hasher.finalize();
+        if checksum_computed != checksum {
+            warn!(
+                "Hash mismatch: read 0x{:08X}, but expect 0x{:08X}",
+                checksum,
+                checksum_computed
+            );
+            if !use_reed_solomon {
+                error!("Checksum mismatch without Reed-Solomon, terminating.");
+                return None; // 无纠错时直接终止
+            } 
         }
         
         // 处理Reed-Solomon纠错
@@ -202,78 +214,13 @@ fn decode_frames_from_bits_with_params<I: Iterator<Item = bool>>(
         } else {
             data_with_ecc.to_vec()
         };
+
+        // EOF After ECC
+        if payload.is_empty() {
+            warn!("Detected EOF : no payload");
+            return None;
+        }
         
         Some(payload)
     })
-}
-
-pub fn decode(data: &[u8]) -> Result<Vec<u8>, String> {
-    decode_with_params(data, false, 0)
-}
-
-pub fn decode_with_reed_solomon(data: &[u8], ecc_len: usize) -> Result<Vec<u8>, String> {
-    decode_with_params(data, true, ecc_len)
-}
-
-fn decode_with_params(data: &[u8], use_reed_solomon: bool, ecc_len: usize) -> Result<Vec<u8>, String> {
-    let mut result = Vec::new();
-    let mut offset = 0;
-    
-    while offset < data.len() {
-        // Read frame length
-        if offset >= data.len() {
-            break;
-        }
-        let frame_len = data[offset] as usize;
-        offset += 1;
-        
-        if frame_len == 0 {
-            // EOF frame
-            break;
-        }
-        
-        // Read frame data
-        if offset + frame_len > data.len() {
-            return Err("Incomplete frame".to_string());
-        }
-        
-        let frame_data = &data[offset..offset + frame_len];
-        offset += frame_len;
-        
-        // Verify checksum
-        if frame_data.len() < 4 {
-            return Err("Frame too short for checksum".to_string());
-        }
-        
-        let expected_checksum = u32::from_be_bytes([
-            frame_data[0], frame_data[1], frame_data[2], frame_data[3]
-        ]);
-        let data_with_ecc = &frame_data[4..];
-        
-        let mut hasher = Hasher::new();
-        hasher.update(data_with_ecc);
-        let actual_checksum = hasher.finalize();
-        
-        if expected_checksum != actual_checksum {
-            return Err("Checksum mismatch".to_string());
-        }
-        
-        // 处理Reed-Solomon纠错
-        let payload = if use_reed_solomon && ecc_len > 0 && data_with_ecc.len() >= ecc_len {
-            // 提取原始payload（去掉Reed-Solomon纠错码）
-            let payload_len = data_with_ecc.len() - ecc_len;
-            let original_payload = &data_with_ecc[..payload_len];
-            let _ecc_data = &data_with_ecc[payload_len..];
-            
-            // 这里可以实现Reed-Solomon纠错逻辑
-            // 暂时直接返回原始payload
-            original_payload
-        } else {
-            data_with_ecc
-        };
-        
-        result.extend_from_slice(payload);
-    }
-    
-    Ok(result)
 }
