@@ -1,0 +1,4 @@
+#!/bin/sh
+cargo fmt || $HOME/.cargo/bin/cargo fmt
+git add .
+exit 0
