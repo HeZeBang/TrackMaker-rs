@@ -1,7 +1,7 @@
 extern crate reed_solomon;
 
-use reed_solomon::Encoder;
 use reed_solomon::Decoder;
+use reed_solomon::Encoder;
 
 fn main() {
     let data = b"Hello World!";
@@ -24,7 +24,9 @@ fn main() {
 
     // Try to recover data
     let known_erasures = [0];
-    let recovered = dec.correct(&mut corrupted, Some(&known_erasures)).unwrap();
+    let recovered = dec
+        .correct(&mut corrupted, Some(&known_erasures))
+        .unwrap();
 
     let orig_str = std::str::from_utf8(data).unwrap();
     let recv_str = std::str::from_utf8(recovered.data()).unwrap();
@@ -32,7 +34,10 @@ fn main() {
     println!("message:               {:?}", orig_str);
     println!("original data:         {:?}", data);
     println!("error correction code: {:?}", encoded.ecc());
-    println!("error corr. in ascii:  {:?}", String::from_utf8_lossy(&encoded.ecc()));
+    println!(
+        "error corr. in ascii:  {:?}",
+        String::from_utf8_lossy(&encoded.ecc())
+    );
     println!("corrupted:             {:?}", corrupted);
     println!("repaired:              {:?}", recv_str);
 }

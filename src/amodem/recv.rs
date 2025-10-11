@@ -1,11 +1,11 @@
-use num_complex::Complex64;
-use std::io::Write;
 use crate::amodem::{
     config::Configuration,
     dsp::{Demux, Modem},
     equalizer::Equalizer,
     sampling::Sampler,
 };
+use num_complex::Complex64;
+use std::io::Write;
 
 pub struct Receiver {
     modem: Modem,
@@ -24,18 +24,23 @@ impl Receiver {
     pub fn new(config: &Configuration) -> Self {
         Self::with_reed_solomon(config, false, 8)
     }
-    
-    pub fn with_reed_solomon(config: &Configuration, use_reed_solomon: bool, ecc_len: usize) -> Self {
+
+    pub fn with_reed_solomon(
+        config: &Configuration,
+        use_reed_solomon: bool,
+        ecc_len: usize,
+    ) -> Self {
         let modem = Modem::new(config.symbols.clone());
         let frequencies = config.frequencies.clone();
-        let omegas: Vec<f64> = frequencies.iter()
+        let omegas: Vec<f64> = frequencies
+            .iter()
             .map(|&f| 2.0 * std::f64::consts::PI * f / config.fs)
             .collect();
         let nsym = config.nsym;
         let tsym = config.tsym;
         let equalizer = Equalizer::new(config);
         let carrier_index = config.carrier_index;
-        
+
         Self {
             modem,
             frequencies,
@@ -49,16 +54,26 @@ impl Receiver {
             ecc_len,
         }
     }
-    
-    pub fn debug_demodulate(&self, signal: &[f64], gain: f64) -> Result<Vec<Complex64>, String> {
+
+    pub fn debug_demodulate(
+        &self,
+        signal: &[f64],
+        gain: f64,
+    ) -> Result<Vec<Complex64>, String> {
         self.demodulate_python_style(signal, gain, 1.0)
     }
-    
+
     pub fn get_modem(&self) -> &Modem {
         &self.modem
     }
-    
-    pub fn run<W: Write>(&mut self, signal: Vec<f64>, gain: f64, freq: f64, mut output: W) -> Result<(), String> {
+
+    pub fn run<W: Write>(
+        &mut self,
+        signal: Vec<f64>,
+        gain: f64,
+        freq: f64,
+        mut output: W,
+    ) -> Result<(), String> {
         eprintln!("Receiving");
 
         // 迭代式解调：构造采样器与 demux，一边产出符号一边处理
@@ -83,27 +98,46 @@ impl Receiver {
 
         if !data_symbols.is_empty() {
             eprintln!("🔍 First 5 data symbols:");
-            for (i, sym) in data_symbols.iter().take(5).enumerate() {
-                eprintln!("  Data[{}]: {:.3} + {:.3}i (mag: {:.3})", i, sym.re, sym.im, sym.norm());
+            for (i, sym) in data_symbols
+                .iter()
+                .take(5)
+                .enumerate()
+            {
+                eprintln!(
+                    "  Data[{}]: {:.3} + {:.3}i (mag: {:.3})",
+                    i,
+                    sym.re,
+                    sym.im,
+                    sym.norm()
+                );
             }
         }
 
         // 将符号逐步映射成比特（拉平成单一位流）
-        let bit_tuples = self.modem.decode(data_symbols);
-        let bits_iter = bit_tuples.into_iter().flat_map(|tuple| tuple.into_iter());
+        let bit_tuples = self
+            .modem
+            .decode(data_symbols);
+        let bits_iter = bit_tuples
+            .into_iter()
+            .flat_map(|tuple| tuple.into_iter());
 
         // 使用基于位流的帧解码器，遇到 EOF 自动结束
         eprintln!("Starting demodulation");
         if self.use_reed_solomon {
             let frames_iter = crate::amodem::framing::decode_frames_from_bits_with_reed_solomon(bits_iter, self.ecc_len);
             for frame in frames_iter {
-                output.write_all(&frame).map_err(|e| e.to_string())?;
+                output
+                    .write_all(&frame)
+                    .map_err(|e| e.to_string())?;
                 self.output_size += frame.len();
             }
         } else {
-            let frames_iter = crate::amodem::framing::decode_frames_from_bits(bits_iter);  
+            let frames_iter =
+                crate::amodem::framing::decode_frames_from_bits(bits_iter);
             for frame in frames_iter {
-                output.write_all(&frame).map_err(|e| e.to_string())?;
+                output
+                    .write_all(&frame)
+                    .map_err(|e| e.to_string())?;
                 self.output_size += frame.len();
             }
         }
@@ -113,8 +147,13 @@ impl Receiver {
         eprintln!("Received {:.3} kB", received_kb);
         Ok(())
     }
-    
-    fn demodulate_python_style(&self, signal: &[f64], gain: f64, freq: f64) -> Result<Vec<Complex64>, String> {
+
+    fn demodulate_python_style(
+        &self,
+        signal: &[f64],
+        gain: f64,
+        freq: f64,
+    ) -> Result<Vec<Complex64>, String> {
         if self.omegas.is_empty() {
             return Err("Receiver has no configured carriers".to_string());
         }
@@ -132,14 +171,17 @@ impl Receiver {
             symbols.push(carrier_symbol);
         }
 
-        eprintln!("🎯 Extracted {} symbols using Python-style Demux", symbols.len());
+        eprintln!(
+            "🎯 Extracted {} symbols using Python-style Demux",
+            symbols.len()
+        );
         if symbols.len() > 0 {
             eprintln!("First 5 symbols: {:?}", &symbols[..5.min(symbols.len())]);
         }
 
         Ok(symbols)
     }
-    
+
     fn decode_frames(&self, _bits: Vec<bool>) -> Result<Vec<Vec<u8>>, String> {
         // 不再使用，保留签名以最小侵入
         Ok(vec![])

@@ -1,16 +1,16 @@
+pub mod common;
 pub mod config;
-pub mod send;
-pub mod recv;
 pub mod detect;
-pub mod sampling;
-pub mod framing;
 pub mod dsp;
 pub mod equalizer;
-pub mod common;
+pub mod framing;
 pub mod main_recv;
+pub mod recv;
+pub mod sampling;
+pub mod send;
 
 pub use config::*;
-pub use send::*;
-pub use recv::*;
 pub use detect::*;
 pub use main_recv::*;
+pub use recv::*;
+pub use send::*;

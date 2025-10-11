@@ -52,7 +52,12 @@ pub struct Demux<'a> {
 }
 
 impl<'a> Demux<'a> {
-    pub fn new(sampler: Sampler<'a>, omegas: &[f64], nsym: usize, gain: f64) -> Self {
+    pub fn new(
+        sampler: Sampler<'a>,
+        omegas: &[f64],
+        nsym: usize,
+        gain: f64,
+    ) -> Self {
         let norm = 0.5 * nsym as f64;
         let filters = omegas
             .iter()
@@ -92,7 +97,10 @@ impl<'a> Iterator for Demux<'a> {
         let mut result = Vec::with_capacity(self.filters.len());
         for filter in &self.filters {
             let mut acc = Complex64::new(0.0, 0.0);
-            for (coeff, sample) in filter.iter().zip(frame.iter()) {
+            for (coeff, sample) in filter
+                .iter()
+                .zip(frame.iter())
+            {
                 acc += *coeff * *sample;
             }
             result.push(acc);
@@ -112,7 +120,10 @@ pub fn exp_iwt(omega: f64, n: usize) -> Vec<Complex64> {
 
 #[allow(dead_code)]
 pub fn norm(x: &[Complex64]) -> f64 {
-    x.iter().map(|v| v.norm_sqr()).sum::<f64>().sqrt()
+    x.iter()
+        .map(|v| v.norm_sqr())
+        .sum::<f64>()
+        .sqrt()
 }
 
 #[allow(dead_code)]
@@ -120,7 +131,11 @@ pub fn rms(x: &[Complex64]) -> f64 {
     if x.is_empty() {
         return 0.0;
     }
-    let mean = x.iter().map(|v| v.norm_sqr()).sum::<f64>() / x.len() as f64;
+    let mean = x
+        .iter()
+        .map(|v| v.norm_sqr())
+        .sum::<f64>()
+        / x.len() as f64;
     mean.sqrt()
 }
 
@@ -131,7 +146,11 @@ pub fn coherence(x: &[f64], omega: f64) -> Complex64 {
         return Complex64::new(0.0, 0.0);
     }
     let hc = exp_iwt(-omega, n);
-    let norm_x = x.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let norm_x = x
+        .iter()
+        .map(|v| v * v)
+        .sum::<f64>()
+        .sqrt();
     if norm_x == 0.0 {
         return Complex64::new(0.0, 0.0);
     }
@@ -202,8 +221,7 @@ impl Modem {
         let bit_vec: Vec<bool> = bits.collect();
         common::iterate(bit_vec.into_iter(), self.bits_per_symbol)
             .map(|bit_chunk| {
-                self
-                    .encode_map
+                self.encode_map
                     .get(&bit_chunk)
                     .copied()
                     .unwrap_or(Complex64::new(0.0, 0.0))
@@ -256,7 +274,12 @@ impl Prbs {
             size += 1;
         }
 
-        Self { reg, poly, mask, size }
+        Self {
+            reg,
+            poly,
+            mask,
+            size,
+        }
     }
 }
 

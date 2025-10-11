@@ -12,7 +12,7 @@ impl<'a> Sampler<'a> {
             freq,
         }
     }
-    
+
     pub fn take(&mut self, size: usize) -> Option<Vec<f64>> {
         if size == 0 {
             return Some(Vec::new());
@@ -46,7 +46,7 @@ impl<'a> Sampler<'a> {
 
         Some(result)
     }
-    
+
     pub fn has_data(&self) -> bool {
         (self.position as usize) < self.signal.len()
     }
