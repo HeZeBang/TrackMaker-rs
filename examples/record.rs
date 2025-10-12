@@ -1,12 +1,12 @@
-use jack;
-use trackmaker_rs::*;
 use audio::recorder;
 use device::jack::{
     connect_input_from_first_system_output,
     connect_output_to_first_system_input, disconnect_input_sources,
     disconnect_output_sinks, print_jack_info,
 };
+use jack;
 use tracing::info;
+use trackmaker_rs::*;
 use ui::print_banner;
 use ui::progress::{ProgressManager, templates};
 use utils::consts::*;

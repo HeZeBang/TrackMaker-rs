@@ -8,7 +8,8 @@ use std::str::FromStr;
 fn main() {
     // 1. open a client
     let (client, _status) =
-        jack::Client::new("rust_jack_sine", jack::ClientOptions::default()).unwrap();
+        jack::Client::new("rust_jack_sine", jack::ClientOptions::default())
+            .unwrap();
 
     // 2. register port
     let out_port = client
@@ -32,7 +33,9 @@ fn main() {
         },
         |state, _, ps| -> jack::Control {
             // Get output buffer
-            let out = state.out_port.as_mut_slice(ps);
+            let out = state
+                .out_port
+                .as_mut_slice(ps);
 
             // Check frequency requests
             while let Ok(f) = state.rx.try_recv() {
@@ -61,7 +64,9 @@ fn main() {
     );
 
     // 4. Activate the client. Also connect the ports to the system audio.
-    let active_client = client.activate_async((), process).unwrap();
+    let active_client = client
+        .activate_async((), process)
+        .unwrap();
     active_client
         .as_client()
         .connect_ports_by_name("rust_jack_sine:sine_out", "system:playback_1")
@@ -73,7 +78,9 @@ fn main() {
     // processing starts here
 
     // 5. wait or do some processing while your handler is running in real time.
-    println!("Enter an integer value to change the first frequency (second frequency is fixed at 10000Hz).");
+    println!(
+        "Enter an integer value to change the first frequency (second frequency is fixed at 10000Hz)."
+    );
     println!("Current frequencies: 1000Hz + 10000Hz");
     while let Some(f) = read_freq() {
         tx.send(f).unwrap();
@@ -93,7 +100,9 @@ fn main() {
 fn read_freq() -> Option<f64> {
     let mut user_input = String::new();
     match io::stdin().read_line(&mut user_input) {
-        Ok(_) => u16::from_str(user_input.trim()).ok().map(|n| n as f64),
+        Ok(_) => u16::from_str(user_input.trim())
+            .ok()
+            .map(|n| n as f64),
         Err(_) => None,
     }
 }
