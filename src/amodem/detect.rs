@@ -123,6 +123,9 @@ impl Detector {
             freq_err = 0.0;
         }
 
+        debug!("Estimated amplitude: {:.3}", amplitude);
+        debug!("Estimated frequency error: {:.3} ppm", freq_err * 1e6);
+
         // 6) 返回：从精确起点后的 buf + 尚未消耗的 samples 组成的完整后续信号
         let mut final_signal = buf[offset_in_buf..].to_vec();
         final_signal.extend(samples);
@@ -192,51 +195,84 @@ impl Detector {
 
     // 归一化互相关定位起点
     fn find_start(&self, buf: &[f64]) -> usize {
-        // 构造载波模板（实部），重复 start_pattern_length 次
-        let mut carrier: Vec<f64> =
+        // 1. 构造复数模板 (I/Q)
+        let mut carrier: Vec<Complex64> =
             Vec::with_capacity(self.nsym * self.start_pattern_length);
         for _ in 0..self.start_pattern_length {
             for i in 0..self.nsym {
                 let phase = self.omega * i as f64;
-                carrier.push(phase.cos());
+                carrier.push(Complex64::new(phase.cos(), phase.sin()));
             }
         }
 
         let zeroes_len = carrier.len();
-        let mut tmpl = vec![0.0f64; zeroes_len];
-        tmpl.extend_from_slice(&carrier);
+        let mut tmpl: Vec<Complex64> =
+            vec![Complex64::new(0.0, 0.0); zeroes_len];
+        tmpl.extend(carrier);
+
+        // 2. 归一化模板 (与 Python 对齐)
+        let tmpl_norm = tmpl
+            .iter()
+            .map(|c| c.norm_sqr())
+            .sum::<f64>()
+            .sqrt();
+        if tmpl_norm == 0.0 {
+            return 0;
+        }
+        let scale = 2.0f64.sqrt() / tmpl_norm;
+        let tmpl: Vec<Complex64> = tmpl
+            .into_iter()
+            .map(|c| c * scale)
+            .collect();
 
         if buf.len() < tmpl.len() {
             return 0;
         }
-        let mut best_idx = 0usize;
-        let mut best_coeff = f64::MIN;
-        let tmpl_energy = tmpl
+
+        // 3. 计算相关性
+        let mut best_idx = 0;
+        let mut max_coeff = 0.0;
+
+        // 计算滑动窗口能量
+        let mut window_energies = Vec::with_capacity(buf.len() - tmpl.len() + 1);
+        let mut current_energy_sq = buf[0..tmpl.len()]
             .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt();
+            .map(|&x| x * x)
+            .sum::<f64>();
+        window_energies.push(current_energy_sq.sqrt());
+
+        for i in 1..=(buf.len() - tmpl.len()) {
+            let old_val = buf[i - 1];
+            let new_val = buf[i + tmpl.len() - 1];
+            current_energy_sq =
+                current_energy_sq - old_val * old_val + new_val * new_val;
+            window_energies.push(current_energy_sq.sqrt());
+        }
+
         for i in 0..=(buf.len() - tmpl.len()) {
             let window = &buf[i..i + tmpl.len()];
-            let win_energy = window
-                .iter()
-                .map(|v| v * v)
-                .sum::<f64>()
-                .sqrt();
-            if win_energy == 0.0 {
-                continue;
-            }
-            let dot = window
+
+            // 复数相关
+            let corr: Complex64 = window
                 .iter()
                 .zip(tmpl.iter())
-                .map(|(a, b)| a * b)
-                .sum::<f64>();
-            let coeff = dot / (tmpl_energy * win_energy);
-            if coeff > best_coeff {
-                best_coeff = coeff;
+                .map(|(&x, &t)| t.conj() * x)
+                .sum();
+
+            let norm_b = window_energies[i];
+            let coeff = if norm_b > 0.0 {
+                corr.norm() / norm_b
+            } else {
+                0.0
+            };
+
+            if coeff > max_coeff {
+                max_coeff = coeff;
                 best_idx = i;
             }
         }
+
+        debug!("Carrier coherence: {:.3}%", max_coeff * 100.0);
         best_idx + zeroes_len
     }
 
