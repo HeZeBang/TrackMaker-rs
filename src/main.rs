@@ -125,8 +125,16 @@ fn main() {
             bitrate,
             reed_solomon,
             ecc_len,
+            input,
         } => {
-            receive_mode(output, duration, bitrate, reed_solomon, ecc_len);
+            receive_mode(
+                output,
+                duration,
+                bitrate,
+                reed_solomon,
+                ecc_len,
+                input,
+            );
         }
         Commands::Send {
             input,
@@ -155,12 +163,12 @@ fn receive_mode(
     bitrate: u32,
     reed_solomon: bool,
     ecc_len: usize,
+    input_file: Option<PathBuf>,
 ) {
     print_banner();
 
     info!("Amodem Receive Mode");
     info!("Output file: {}", output.display());
-    info!("Duration: {:.1} seconds", duration);
     info!("Bitrate: {} kb/s", bitrate);
     if reed_solomon {
         info!(
@@ -179,101 +187,153 @@ fn receive_mode(
         }
     };
 
-    // Setup JACK
-    let (client, status) = jack::Client::new(
-        "amodem-receive",
-        jack::ClientOptions::NO_START_SERVER,
-    )
-    .unwrap();
+    let amodem_samples = if let Some(input_path) = input_file {
+        // Read from WAV file
+        info!("Reading audio from WAV file: {}", input_path.display());
 
-    tracing::info!("JACK client status: {:?}", status);
-    let (sample_rate, _buffer_size) = print_jack_info(&client);
-
-    let recording_duration_samples = (sample_rate as f32 * duration) as usize;
-
-    // Shared audio buffer for recording
-    let audio_buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
-    let buffer_clone = audio_buffer.clone();
-    let finished = Arc::new(Mutex::new(false));
-    let finished_clone = finished.clone();
-
-    // Register JACK ports
-    let in_port = client
-        .register_port(utils::consts::INPUT_PORT_NAME, jack::AudioIn::default())
-        .unwrap();
-
-    let in_port_name = in_port.name().unwrap();
-
-    // Process callback for recording
-    let process_cb =
-        move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
-            let input_buffer = in_port.as_slice(ps);
-
-            for &frame in input_buffer.iter() {
-                let mut buffer = buffer_clone.lock().unwrap();
-                buffer.push(frame);
-
-                // Check if we have enough samples
-                if buffer.len() >= recording_duration_samples {
-                    *finished_clone.lock().unwrap() = true;
-                    return jack::Control::Quit;
-                }
-            }
-
-            jack::Control::Continue
-        };
-
-    let process = jack::contrib::ClosureProcessHandler::new(process_cb);
-
-    let active_client = client
-        .activate_async((), process)
-        .unwrap();
-
-    // Connect to system input
-    connect_input_from_first_system_output(
-        active_client.as_client(),
-        &in_port_name,
-    );
-
-    info!("Waiting for audio input...");
-    info!("Listening for amodem signal on JACK input");
-    info!("Recording for {:.1} seconds...", duration);
-
-    // Wait for recording to complete
-    loop {
-        thread::sleep(Duration::from_millis(100));
-        if *finished.lock().unwrap() {
-            break;
+        if !input_path.exists() {
+            error!("Input file does not exist: {}", input_path.display());
+            return;
         }
-    }
 
-    info!("Recording complete");
+        match read_wav_file(&input_path) {
+            Ok((samples, sample_rate)) => {
+                info!("Read {} samples from WAV file", samples.len());
+                let amodem_samples_f32 = resample_audio(
+                    &samples
+                        .iter()
+                        .map(|&x| x as f32)
+                        .collect::<Vec<f32>>(),
+                    sample_rate as f32,
+                    config.fs as f32,
+                );
+                let amodem_samples: Vec<f64> = amodem_samples_f32
+                    .iter()
+                    .map(|&x| x as f64)
+                    .collect();
+                info!(
+                    "Resampled to {} samples at {:.1} kHz",
+                    amodem_samples.len(),
+                    config.fs / 1000.0
+                );
 
-    // Disconnect and deactivate
-    disconnect_input_sources(active_client.as_client(), &in_port_name);
-    active_client
-        .deactivate()
+                amodem_samples
+            }
+            Err(e) => {
+                error!("Failed to read WAV file: {}", e);
+                return;
+            }
+        }
+    } else {
+        // Read from JACK input
+        info!("Duration: {:.1} seconds", duration);
+        info!("Reading audio from JACK input...");
+
+        // Setup JACK
+        let (client, status) = jack::Client::new(
+            "amodem-receive",
+            jack::ClientOptions::NO_START_SERVER,
+        )
         .unwrap();
 
-    // Get recorded audio
-    let recorded_samples = audio_buffer
-        .lock()
-        .unwrap()
-        .clone();
-    info!("Recorded {} samples", recorded_samples.len());
+        tracing::info!("JACK client status: {:?}", status);
+        let (sample_rate, _buffer_size) = print_jack_info(&client);
 
-    // Convert to amodem format (f64, 8kHz)
-    let amodem_samples_f32 =
-        resample_audio(&recorded_samples, sample_rate as f32, config.fs as f32);
-    let amodem_samples: Vec<f64> = amodem_samples_f32
-        .iter()
-        .map(|&x| x as f64)
-        .collect();
-    info!(
-        "Resampled to {} samples at {:.1} kHz",
-        amodem_samples.len(),
-        config.fs / 1000.0
-    );
+        let recording_duration_samples =
+            (sample_rate as f32 * duration) as usize;
+
+        // Shared audio buffer for recording
+        let audio_buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let buffer_clone = audio_buffer.clone();
+        let finished = Arc::new(Mutex::new(false));
+        let finished_clone = finished.clone();
+
+        // Register JACK ports
+        let in_port = client
+            .register_port(
+                utils::consts::INPUT_PORT_NAME,
+                jack::AudioIn::default(),
+            )
+            .unwrap();
+
+        let in_port_name = in_port.name().unwrap();
+
+        // Process callback for recording
+        let process_cb =
+            move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
+                let input_buffer = in_port.as_slice(ps);
+
+                for &frame in input_buffer.iter() {
+                    let mut buffer = buffer_clone.lock().unwrap();
+                    buffer.push(frame);
+
+                    // Check if we have enough samples
+                    if buffer.len() >= recording_duration_samples {
+                        *finished_clone.lock().unwrap() = true;
+                        return jack::Control::Quit;
+                    }
+                }
+
+                jack::Control::Continue
+            };
+
+        let process = jack::contrib::ClosureProcessHandler::new(process_cb);
+
+        let active_client = client
+            .activate_async((), process)
+            .unwrap();
+
+        // Connect to system input
+        connect_input_from_first_system_output(
+            active_client.as_client(),
+            &in_port_name,
+        );
+
+        info!("Waiting for audio input...");
+        info!("Listening for amodem signal on JACK input");
+        info!("Recording for {:.1} seconds...", duration);
+
+        // Wait for recording to complete
+        loop {
+            thread::sleep(Duration::from_millis(100));
+            if *finished.lock().unwrap() {
+                break;
+            }
+        }
+
+        info!("Recording complete");
+
+        // Disconnect and deactivate
+        disconnect_input_sources(active_client.as_client(), &in_port_name);
+        active_client
+            .deactivate()
+            .unwrap();
+
+        // Get recorded audio
+        let recorded_samples = audio_buffer
+            .lock()
+            .unwrap()
+            .clone();
+        info!("Recorded {} samples", recorded_samples.len());
+
+        // Convert to amodem format (f64, 8kHz)
+        let amodem_samples_f32 = resample_audio(
+            &recorded_samples,
+            sample_rate as f32,
+            config.fs as f32,
+        );
+        let amodem_samples: Vec<f64> = amodem_samples_f32
+            .iter()
+            .map(|&x| x as f64)
+            .collect();
+        info!(
+            "Resampled to {} samples at {:.1} kHz",
+            amodem_samples.len(),
+            config.fs / 1000.0
+        );
+
+        amodem_samples
+    };
 
     // Save raw audio for debugging with metadata
     let pcm_data =
@@ -589,6 +649,159 @@ fn resample_audio(input: &[f32], input_rate: f32, output_rate: f32) -> Vec<f32> 
     }
 
     output
+}
+
+fn read_wav_file(path: &PathBuf) -> Result<(Vec<f64>, u32), String> {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file =
+        File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+    let mut header = [0u8; 44]; // Standard WAV header size
+    file.read_exact(&mut header)
+        .map_err(|e| format!("Failed to read WAV header: {}", e))?;
+
+    // Check RIFF signature
+    if &header[0..4] != b"RIFF" {
+        return Err("Invalid WAV file: missing RIFF signature".to_string());
+    }
+
+    // Check WAVE signature
+    if &header[8..12] != b"WAVE" {
+        return Err("Invalid WAV file: missing WAVE signature".to_string());
+    }
+
+    // Parse fmt chunk
+    let channels = u16::from_le_bytes([header[22], header[23]]) as usize;
+    let sample_rate =
+        u32::from_le_bytes([header[24], header[25], header[26], header[27]]);
+    let bits_per_sample = u16::from_le_bytes([header[34], header[35]]) as usize;
+    let _byte_rate =
+        u32::from_le_bytes([header[28], header[29], header[30], header[31]])
+            as usize;
+
+    info!(
+        "WAV file: {} Hz, {} channels, {} bits/sample",
+        sample_rate, channels, bits_per_sample
+    );
+
+    // Skip to data chunk
+    let mut data_found = false;
+    let mut data_size = 0usize;
+    let mut offset = 36;
+
+    loop {
+        let mut chunk_header = [0u8; 8];
+        file.seek(SeekFrom::Start(offset as u64))
+            .map_err(|e| format!("Failed to seek in file: {}", e))?;
+
+        if file
+            .read_exact(&mut chunk_header)
+            .is_err()
+        {
+            break;
+        }
+
+        let chunk_id = &chunk_header[0..4];
+        let chunk_size = u32::from_le_bytes([
+            chunk_header[4],
+            chunk_header[5],
+            chunk_header[6],
+            chunk_header[7],
+        ]) as usize;
+
+        if chunk_id == b"data" {
+            data_found = true;
+            data_size = chunk_size;
+            offset += 8;
+            break;
+        }
+
+        offset += 8 + chunk_size;
+    }
+
+    if !data_found {
+        return Err("No data chunk found in WAV file".to_string());
+    }
+
+    file.seek(SeekFrom::Start(offset as u64))
+        .map_err(|e| format!("Failed to seek to data chunk: {}", e))?;
+
+    let mut samples = Vec::new();
+
+    match bits_per_sample {
+        16 => {
+            let num_samples = data_size / 2;
+            let mut buffer = vec![0u8; data_size];
+            file.read_exact(&mut buffer)
+                .map_err(|e| format!("Failed to read audio data: {}", e))?;
+
+            for i in 0..num_samples {
+                let sample =
+                    i16::from_le_bytes([buffer[i * 2], buffer[i * 2 + 1]])
+                        as f64
+                        / 32768.0;
+                samples.push(sample);
+            }
+        }
+        24 => {
+            let num_samples = data_size / 3;
+            let mut buffer = vec![0u8; data_size];
+            file.read_exact(&mut buffer)
+                .map_err(|e| format!("Failed to read audio data: {}", e))?;
+
+            for i in 0..num_samples {
+                let sample = i32::from_le_bytes([
+                    buffer[i * 3],
+                    buffer[i * 3 + 1],
+                    buffer[i * 3 + 2],
+                    0,
+                ]) as f64
+                    / 8388608.0;
+                samples.push(sample);
+            }
+        }
+        32 => {
+            let num_samples = data_size / 4;
+            let mut buffer = vec![0u8; data_size];
+            file.read_exact(&mut buffer)
+                .map_err(|e| format!("Failed to read audio data: {}", e))?;
+
+            for i in 0..num_samples {
+                let sample = i32::from_le_bytes([
+                    buffer[i * 4],
+                    buffer[i * 4 + 1],
+                    buffer[i * 4 + 2],
+                    buffer[i * 4 + 3],
+                ]) as f64
+                    / 2147483648.0;
+                samples.push(sample);
+            }
+        }
+        _ => {
+            return Err(format!(
+                "Unsupported bits per sample: {}",
+                bits_per_sample
+            ));
+        }
+    }
+
+    // If multi-channel, mix down to mono by averaging
+    if channels > 1 {
+        let mut mono_samples = Vec::new();
+        for chunk in samples.chunks(channels) {
+            let avg: f64 = chunk.iter().sum::<f64>() / channels as f64;
+            mono_samples.push(avg);
+        }
+        samples = mono_samples;
+    }
+
+    if samples.is_empty() {
+        return Err("No audio samples found in file".to_string());
+    }
+
+    info!("Successfully read {} samples from WAV file", samples.len());
+    Ok((samples, sample_rate))
 }
 
 fn play_pcm_file(pcm_path: &str, duration: f32) {
