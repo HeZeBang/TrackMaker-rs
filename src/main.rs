@@ -40,13 +40,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Receive mode: decode audio from JACK input to file
+    /// Receive mode: decode audio from JACK input or file to output file
     Receive {
         /// Output file for decoded data
         #[arg(short, long, default_value = "tmp/decoded_output.txt")]
         output: PathBuf,
 
-        /// Duration to record in seconds
+        /// Duration to record in seconds (ignored when reading from file)
         #[arg(short, long, default_value = "100")]
         duration: f32,
 
@@ -61,6 +61,10 @@ enum Commands {
         /// Reed-Solomon error correction code length (default: 16)
         #[arg(long, default_value = "16")]
         ecc_len: usize,
+
+        /// Input WAV file to read audio from (if empty, read from JACK)
+        #[arg(short, long)]
+        input: Option<PathBuf>,
     },
 
     /// Send mode: encode file content and play through JACK
@@ -195,7 +199,7 @@ fn receive_mode(
 
     // Register JACK ports
     let in_port = client
-        .register_port("input", jack::AudioIn::default())
+        .register_port(utils::consts::INPUT_PORT_NAME, jack::AudioIn::default())
         .unwrap();
 
     let in_port_name = in_port.name().unwrap();
@@ -665,14 +669,16 @@ fn play_pcm_file(pcm_path: &str, duration: f32) {
     };
 
     // 注册输出端口
-    let out_port =
-        match client.register_port("pcm_out", jack::AudioOut::default()) {
-            Ok(port) => port,
-            Err(e) => {
-                error!("Failed to register port: {}", e);
-                return;
-            }
-        };
+    let out_port = match client.register_port(
+        utils::consts::OUTPUT_PORT_NAME,
+        jack::AudioOut::default(),
+    ) {
+        Ok(port) => port,
+        Err(e) => {
+            error!("Failed to register port: {}", e);
+            return;
+        }
+    };
 
     let out_port_name = match out_port.name() {
         Ok(name) => name,
