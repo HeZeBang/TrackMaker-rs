@@ -4,13 +4,11 @@ use num_complex::Complex64;
 
 use crate::amodem::common;
 
-#[allow(dead_code)]
 pub struct Fir {
     h: Vec<f64>,
     state: Vec<f64>,
 }
 
-#[allow(dead_code)]
 impl Fir {
     pub fn new(h: Vec<f64>) -> Self {
         let len = h.len();
@@ -121,7 +119,6 @@ pub fn norm(x: &[Complex64]) -> f64 {
         .sqrt()
 }
 
-#[allow(dead_code)]
 pub fn rms(x: &[Complex64]) -> f64 {
     if x.is_empty() {
         return 0.0;
@@ -132,6 +129,37 @@ pub fn rms(x: &[Complex64]) -> f64 {
         .sum::<f64>()
         / x.len() as f64;
     mean.sqrt()
+}
+
+/// Calculate RMS along the first axis (time axis) for 2D array
+/// Returns RMS for each column (frequency)
+pub fn rms_2d(x: &[Vec<Complex64>]) -> Vec<f64> {
+    if x.is_empty() || x[0].is_empty() {
+        return Vec::new();
+    }
+
+    let n_cols = x[0].len();
+    let mut result = vec![0.0; n_cols];
+
+    // For each column (frequency)
+    for col in 0..n_cols {
+        let mut sum_sq = 0.0;
+        let mut count = 0;
+
+        // Sum squared magnitudes along the column
+        for row in x {
+            if col < row.len() {
+                sum_sq += row[col].norm_sqr();
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            result[col] = (sum_sq / count as f64).sqrt();
+        }
+    }
+
+    result
 }
 
 #[allow(dead_code)]

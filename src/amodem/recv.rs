@@ -1,6 +1,6 @@
 use crate::amodem::{
     config::Configuration,
-    dsp::{Demux, Fir, Modem},
+    dsp::{Demux, Fir, Modem, rms, rms_2d},
     equalizer::{
         EQUALIZER_LENGTH, Equalizer, SILENCE_LENGTH, get_prefix, train,
     },
@@ -8,7 +8,6 @@ use crate::amodem::{
 };
 use num_complex::Complex64;
 use std::io::Write;
-use symphonia::core::sample;
 use tracing::{debug, info, warn};
 
 pub struct Receiver {
@@ -188,9 +187,110 @@ impl Receiver {
             [prefix + lookahead..equalized.len() - postfix + lookahead]
             .to_vec();
 
-        // self.verify_training(&equalized, &train_symbols)?;
+        // debug!(
+        //     "Equalized signal: {:?}",
+        //     equalized[..10.min(equalized.len())].to_vec()
+        // );
+
+        self.verify_training(&equalized, &train_symbols)?;
 
         Ok(Fir::new(coeffs))
+    }
+
+    fn verify_training(
+        &self,
+        equalized: &[f64],
+        train_symbols: &[Vec<Complex64>],
+    ) -> Result<(), String> {
+        // Demodulate equalized signal
+        let symbols = self
+            .equalizer
+            .demodulator(equalized, EQUALIZER_LENGTH);
+
+        // sliced = np.array(symbols).round()
+        let sliced: Vec<Vec<num_complex::Complex<f64>>> = symbols
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|c| {
+                        num_complex::Complex::new(c.re.round(), c.im.round())
+                    })
+                    .collect()
+            })
+            .collect();
+        // errors = np.array(sliced - train_symbols, dtype=bool)
+        let errors = sliced
+            .iter()
+            .zip(train_symbols.iter())
+            .map(|(s_row, t_row)| {
+                s_row
+                    .iter()
+                    .zip(t_row.iter())
+                    .map(|(s, t)| {
+                        let re_err = (s.re as i64 - t.re as i64).abs() > 1;
+                        let im_err = (s.im as i64 - t.im as i64).abs() > 1;
+                        re_err || im_err
+                    })
+                    .collect::<Vec<bool>>()
+            })
+            .collect::<Vec<Vec<bool>>>();
+        let error_rate = errors
+            .iter()
+            .flatten()
+            .filter(|&&e| e)
+            .count() as f64
+            / (errors.len() * errors[0].len()) as f64;
+
+        info!("Error rate: {:.3}%", error_rate * 100.0);
+
+        // Calculate errors: symbols - train_symbols
+        let mut error_matrix: Vec<Vec<Complex64>> = Vec::new();
+        for (i, symbol_row) in symbols.iter().enumerate() {
+            if i >= train_symbols.len() {
+                break;
+            }
+            let mut error_row = Vec::new();
+            for (j, &received) in symbol_row.iter().enumerate() {
+                if j >= train_symbols[i].len() {
+                    break;
+                }
+                error_row.push(received - train_symbols[i][j]);
+            }
+            if !error_row.is_empty() {
+                error_matrix.push(error_row);
+            }
+        }
+
+        let noise_rms = rms_2d(&error_matrix);
+        let signal_rms = rms_2d(train_symbols);
+
+        // Calculate SNR for each frequency
+        for (i, (&signal, &noise)) in signal_rms
+            .iter()
+            .zip(noise_rms.iter())
+            .enumerate()
+        {
+            if i < self.frequencies.len() {
+                let snr_db = if noise > 1e-10 {
+                    20.0 * (signal / noise).log10()
+                } else {
+                    f64::INFINITY
+                };
+                let freq_khz = self.frequencies[i] / 1000.0;
+                debug!("{:5.1} kHz: SNR = {:5.2} dB", freq_khz, snr_db);
+            }
+        }
+
+        if error_rate > 0.1 {
+            return Err(format!(
+                "Training verification failed: error rate {:.4}",
+                error_rate
+            ));
+        }
+
+        warn!("Training error rate: {:.2}%", error_rate * 100.0);
+        debug!("Training verified");
+        Ok(())
     }
 
     fn plot_coeffs(&self, coeffs: &[f64]) {

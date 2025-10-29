@@ -1,4 +1,4 @@
-use crate::amodem::{config::Configuration, dsp::Prbs};
+use crate::amodem::{config::Configuration, dsp::Prbs, sampling::Sampler};
 use num_complex::Complex64;
 
 pub const EQUALIZER_LENGTH: usize = 200;
@@ -14,6 +14,7 @@ pub struct Equalizer {
     carriers: Vec<Vec<Complex64>>,
     nfreq: usize,
     nsym: usize,
+    omegas: Vec<f64>,
 }
 
 impl Equalizer {
@@ -22,6 +23,12 @@ impl Equalizer {
             carriers: config.carriers.clone(),
             nfreq: config.nfreq,
             nsym: config.nsym,
+            omegas: config
+                .frequencies
+                .clone()
+                .iter()
+                .map(|&f| 2.0 * std::f64::consts::PI * f / config.fs)
+                .collect(),
         }
     }
 
@@ -83,6 +90,31 @@ impl Equalizer {
         }
 
         result
+    }
+
+    /// Demodulate equalized signal back to symbols
+    /// Returns Vec<Vec<Complex64>> where each inner vec is symbols for one time frame
+    pub fn demodulator(
+        &self,
+        equalized: &[f64],
+        equalizer_length: usize,
+    ) -> Vec<Vec<Complex64>> {
+        let signal_iter = equalized
+            .iter()
+            .cloned()
+            .chain(std::iter::repeat(0.0));
+        let mut sampler = Sampler::new(signal_iter, None, 1.0);
+        let symbols = super::dsp::Demux::new(
+            |index| sampler.take(index),
+            &self.omegas.clone(),
+            self.nsym,
+            1.0,
+        );
+
+        // return np.array(list(itertools.islice(symbols, size)))
+        symbols
+            .take(equalizer_length)
+            .collect()
     }
 }
 
