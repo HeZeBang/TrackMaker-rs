@@ -155,7 +155,7 @@ impl Receiver {
         let signal_length = EQUALIZER_LENGTH * self.nsym + prefix + postfix;
 
         let signal = sampler
-            .take(signal_length)
+            .take(signal_length + lookahead)
             .ok_or_else(|| {
                 "Not enough samples from sampler for equalizer training"
                     .to_string()
@@ -164,8 +164,10 @@ impl Receiver {
         let mut expected = train_signal.clone();
         expected.extend(vec![0.0; lookahead]);
 
+        let _signal = signal[prefix..signal.len() - postfix].to_vec();
+
         // Compute filter coefficients using Levinson-Durbin
-        let coeffs = train(&signal, &expected, order, lookahead);
+        let coeffs = train(&_signal, &expected, order, lookahead);
 
         // Plot coefficients using plotly
         self.plot_coeffs(&coeffs);

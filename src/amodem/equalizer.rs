@@ -93,61 +93,94 @@ pub fn train(
     order: usize,
     lookahead: usize,
 ) -> Vec<f64> {
-    let n = order + lookahead;
+    let padding = vec![0.0; lookahead];
+    assert!(
+        signal.len() == expected.len(),
+        "Signal length {} must be equal to expected length {}",
+        signal.len(),
+        expected.len()
+    );
+    let x = [&signal[..], &padding[..]].concat();
+    let y = [&padding[..], &expected[..]].concat();
 
-    // Compute autocorrelation of signal
+    let n = order + lookahead; // filter length
     let mut rxx = vec![0.0; n];
+    let mut rxy = vec![0.0; n];
+
     for i in 0..n {
-        for j in 0..(signal.len().saturating_sub(i)) {
-            rxx[i] += signal[j] * signal[j + i];
+        for k in 0..(x.len() - i) {
+            rxx[i] += x[i + k] * x[k];
+            rxy[i] += y[i + k] * x[k];
         }
     }
 
-    // Compute cross-correlation between signal and expected
-    let mut rxy = vec![0.0; n];
-    for i in 0..n {
-        for j in 0..expected
-            .len()
-            .min(signal.len().saturating_sub(i))
-        {
-            if j + i < signal.len() {
-                rxy[i] += expected[j] * signal[j + i];
+    levinson_solve(&rxx, &rxy)
+}
+
+fn levinson_solve(t: &[f64], y: &[f64]) -> Vec<f64> {
+    let n_len = t.len();
+    assert_eq!(y.len(), n_len, "Input vectors must have same length");
+    assert!(n_len > 0 && (t[0].abs() > 1e-10), "t[0] must be non-zero");
+
+    // Initialize forward and backward vectors
+    let t0_inv = 1.0 / t[0];
+    let mut f_vecs: Vec<Vec<f64>> = vec![vec![t0_inv]];
+    let mut b_vecs: Vec<Vec<f64>> = vec![vec![t0_inv]];
+
+    // Build forward and backward prediction-error filter vectors
+    for n in 1..n_len {
+        let prev_f = &f_vecs[n - 1];
+        let prev_b = &b_vecs[n - 1];
+
+        // Calculate reflection coefficients
+        let ef: f64 = (0..n)
+            .map(|i| t[n - i] * prev_f[i])
+            .sum();
+        let eb: f64 = (0..n)
+            .map(|i| t[i + 1] * prev_b[i])
+            .sum();
+
+        let det = 1.0 - ef * eb;
+        assert!(
+            det.abs() > 1e-10,
+            "Determinant too small, matrix may be singular"
+        );
+
+        // Update forward vector
+        let mut f_new = prev_f.clone();
+        f_new.push(0.0);
+        let mut b_new = vec![0.0];
+        b_new.extend(prev_b.clone());
+
+        let f_next: Vec<f64> = (0..=n)
+            .map(|i| (f_new[i] - ef * b_new[i]) / det)
+            .collect();
+
+        let b_next: Vec<f64> = (0..=n)
+            .map(|i| (b_new[i] - eb * f_new[i]) / det)
+            .collect();
+
+        f_vecs.push(f_next);
+        b_vecs.push(b_next);
+    }
+
+    // Solve for coefficients x using forward substitution
+    let mut x = Vec::new();
+    for n in 0..n_len {
+        x.push(0.0);
+        let ef: f64 = (0..n)
+            .map(|i| t[n - i] * x[i])
+            .sum();
+        let scale = y[n] - ef;
+        let b_n = &b_vecs[n];
+        for (i, &b_val) in b_n.iter().enumerate() {
+            if i < x.len() {
+                x[i] += scale * b_val;
+            } else {
+                x.push(scale * b_val);
             }
         }
     }
 
-    // Levinson-Durbin algorithm
-    let mut coeffs = vec![0.0; n];
-
-    if rxx[0] == 0.0 {
-        return coeffs;
-    }
-
-    coeffs[0] = rxy[0] / rxx[0];
-    let mut e = rxx[0];
-
-    for m in 1..n {
-        // Compute reflection coefficient
-        let mut k = rxy[m];
-        for j in 0..m {
-            k -= coeffs[j] * rxx[m - j];
-        }
-        k /= e;
-
-        // Update coefficients
-        let mut new_coeffs = coeffs.clone();
-        new_coeffs[m] = k;
-        for j in 0..m {
-            new_coeffs[j] = coeffs[j] - k * coeffs[m - 1 - j];
-        }
-        coeffs = new_coeffs;
-
-        // Update error
-        e *= 1.0 - k * k;
-        if e <= 0.0 {
-            break;
-        }
-    }
-
-    coeffs
+    x
 }
