@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use num_complex::Complex64;
 
-use crate::amodem::{common, sampling::Sampler};
+use crate::amodem::common;
 
 #[allow(dead_code)]
 pub struct Fir {
@@ -44,20 +44,15 @@ impl Fir {
     }
 }
 
-pub struct Demux<I: Iterator<Item = f64>> {
-    sampler: Sampler<I>,
+pub struct Demux<S: FnMut(usize) -> Option<Vec<f64>>> {
+    sample_fn: S,
     filters: Vec<Vec<Complex64>>,
     nsym: usize,
     gain: f64,
 }
 
-impl<I: Iterator<Item = f64>> Demux<I> {
-    pub fn new(
-        sampler: Sampler<I>,
-        omegas: &[f64],
-        nsym: usize,
-        gain: f64,
-    ) -> Self {
+impl<S: FnMut(usize) -> Option<Vec<f64>>> Demux<S> {
+    pub fn new(sample_fn: S, omegas: &[f64], nsym: usize, gain: f64) -> Self {
         let norm = 0.5 * nsym as f64;
         let filters = omegas
             .iter()
@@ -70,7 +65,7 @@ impl<I: Iterator<Item = f64>> Demux<I> {
             .collect();
 
         Self {
-            sampler,
+            sample_fn,
             filters,
             nsym,
             gain,
@@ -83,11 +78,11 @@ impl<I: Iterator<Item = f64>> Demux<I> {
     }
 }
 
-impl<I: Iterator<Item = f64>> Iterator for Demux<I> {
+impl<S: FnMut(usize) -> Option<Vec<f64>>> Iterator for Demux<S> {
     type Item = Vec<Complex64>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut frame = self.sampler.take(self.nsym)?;
+        let mut frame = (self.sample_fn)(self.nsym)?;
         if (self.gain - 1.0).abs() > f64::EPSILON {
             for value in &mut frame {
                 *value *= self.gain;

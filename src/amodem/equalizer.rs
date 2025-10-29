@@ -25,11 +25,7 @@ impl Equalizer {
         }
     }
 
-    pub fn train_symbols(
-        &self,
-        length: usize,
-        _config: &Configuration,
-    ) -> Vec<Vec<Complex64>> {
+    pub fn train_symbols(&self, length: usize) -> Vec<Vec<Complex64>> {
         let constant_prefix = 16;
         let mut prbs = Prbs::new(1, 0x1100b, 2);
         let constellation = [

@@ -86,10 +86,9 @@ impl<W: Write> Sender<W> {
         }
 
         // Generate and write training symbols
-        let symbols = self.equalizer.train_symbols(
-            crate::amodem::equalizer::EQUALIZER_LENGTH,
-            &self.config,
-        );
+        let symbols = self
+            .equalizer
+            .train_symbols(crate::amodem::equalizer::EQUALIZER_LENGTH);
         let signal = self
             .equalizer
             .modulator(&symbols);

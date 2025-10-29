@@ -610,7 +610,7 @@ fn decode_amodem_signal_with_reed_solomon(
     let mut _sampler = Sampler::new(signal, None, freq);
 
     let output = Vec::new();
-    _receiver.run(_sampler, gain, Vec::new())?;
+    _receiver.run(&mut _sampler, gain, Vec::new())?;
 
     Ok(output)
 }

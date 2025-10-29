@@ -8,6 +8,7 @@ use crate::amodem::{
 };
 use num_complex::Complex64;
 use std::io::Write;
+use symphonia::core::sample;
 use tracing::{debug, info, warn};
 
 pub struct Receiver {
@@ -72,9 +73,9 @@ impl Receiver {
         }
     }
 
-    pub fn _prefix<I: Iterator<Item = f64>>(
+    fn prefix<S: FnMut(usize) -> Option<Vec<f64>>>(
         &self,
-        symbols: &mut Demux<I>,
+        symbols: &mut Demux<S>,
         gain: f64,
     ) -> Result<(), String> {
         // Get the expected prefix: 200 ones + 50 zeros
@@ -132,93 +133,87 @@ impl Receiver {
         Ok(())
     }
 
-    pub fn get_modem(&self) -> &Modem {
-        &self.modem
-    }
-
-    pub fn _train<I: Iterator<Item = f64>>(
+    fn train<I: Iterator<Item = f64>>(
         &self,
-        symbols: &mut Demux<I>,
+        sampler: &mut Sampler<I>,
         order: usize,
         lookahead: usize,
     ) -> Result<Fir, String> {
         // Generate training symbols
         let train_symbols = self
             .equalizer
-            .train_symbols(EQUALIZER_LENGTH, &self.get_dummy_config());
+            .train_symbols(EQUALIZER_LENGTH);
 
         // Modulate training symbols
         let train_signal = self
             .equalizer
             .modulator(&train_symbols);
 
-        // Calculate required number of symbols to collect
-        // Python: signal_length = equalizer_length * Nsym + prefix + postfix
-        // where prefix = postfix = silence_length * Nsym
-        // So total = 200*Nsym + 50*Nsym + 50*Nsym = 300*Nsym samples
-        // Which is 300 symbols from Demux (each symbol represents Nsym samples)
-        let required_symbols = EQUALIZER_LENGTH + 2 * SILENCE_LENGTH;
-
-        // Collect training symbols from Demux
-        let mut training_symbols: Vec<Vec<Complex64>> = Vec::new();
-        for _ in 0..required_symbols {
-            if let Some(row) = symbols.next() {
-                training_symbols.push(row);
-            } else {
-                return Err("Not enough symbols for training".to_string());
-            }
-        }
-
-        info!("Collected {} symbols for training", training_symbols.len());
-
-        // Convert symbols to raw signal samples (flatten and use magnitude)
-        let mut signal_samples = Vec::new();
-        for row in &training_symbols {
-            for &sym in row {
-                signal_samples.push(sym.norm());
-            }
-        }
-
         // Extract the relevant portions (skip silence_length*Nsym prefix, remove postfix)
         let prefix = SILENCE_LENGTH * self.nsym;
         let postfix = SILENCE_LENGTH * self.nsym;
+        let signal_length = EQUALIZER_LENGTH * self.nsym + prefix + postfix;
 
-        let signal_slice = if prefix <= signal_samples.len()
-            && postfix <= signal_samples.len() - prefix
-        {
-            let end = signal_samples.len() - postfix;
-            &signal_samples[prefix..end]
-        } else {
-            &signal_samples
-        };
+        let signal = sampler
+            .take(signal_length)
+            .ok_or_else(|| {
+                "Not enough samples from sampler for equalizer training"
+                    .to_string()
+            })?;
 
-        // Prepare expected signal (pad with zeros for lookahead)
         let mut expected = train_signal.clone();
         expected.extend(vec![0.0; lookahead]);
 
         // Compute filter coefficients using Levinson-Durbin
-        let coeffs = train(signal_slice, &expected, order, lookahead);
+        let coeffs = train(&signal, &expected, order, lookahead);
+
+        // Plot coefficients using plotly
+        self.plot_coeffs(&coeffs);
+
+        let mut equalization_filter = Fir::new(coeffs.clone());
 
         debug!(
-            "Training completed: consumed {} symbols, computed {} coefficients",
-            training_symbols.len(),
-            coeffs.len()
+            "Training completed: consumed {} symbols, computed {} coefficients, coeffs: {:?}",
+            signal_length / self.nsym,
+            coeffs.len(),
+            coeffs[..10.min(coeffs.len())].to_vec()
         );
+
+        // Pre-load equalization filter with the signal (+lookahead)
+        let mut equalized = equalization_filter.process(signal);
+        // equalized = equalized[prefix+lookahead:-postfix+lookahead]
+        equalized = equalized
+            [prefix + lookahead..equalized.len() - postfix + lookahead]
+            .to_vec();
+
+        // self.verify_training(&equalized, &train_symbols)?;
 
         Ok(Fir::new(coeffs))
     }
 
-    fn get_dummy_config(&self) -> Configuration {
-        // Create a minimal config for train_symbols
-        let fs = 8000.0;
-        let npoints = 4;
-        let frequencies = vec![1000.0; self.frequencies.len()];
-        Configuration::new(fs, npoints, frequencies)
+    fn plot_coeffs(&self, coeffs: &[f64]) {
+        use plotly::Plot;
+        use plotly::layout::Layout;
+        use plotly::scatter::Scatter;
+
+        let x: Vec<usize> = (0..coeffs.len()).collect();
+        let y: Vec<f64> = coeffs.to_vec();
+
+        let trace = Scatter::new(x, y).name("Filter Coefficients");
+
+        let mut plot = Plot::new();
+        plot.add_trace(trace);
+
+        let layout = Layout::new();
+        plot.set_layout(layout);
+
+        plot.write_html("/tmp/coeffs.html");
+        info!("Coefficients plot saved to /tmp/coeffs.html");
     }
 
     pub fn run<I, W>(
         &mut self,
-        sampler: Sampler<I>,
+        sampler: &mut Sampler<I>,
         gain: f64,
         mut output: W,
     ) -> Result<(), String>
@@ -227,19 +222,29 @@ impl Receiver {
         W: Write,
     {
         debug!("Receiving");
-        let mut symbols = Demux::new(sampler, &self.omegas, self.nsym, gain);
 
-        // Verify prefix first
-        self._prefix(&mut symbols, gain)?;
+        // Step 1: Verify prefix - create a temporary Demux for prefix checking
+        {
+            let mut symbols = Demux::new(
+                |nsym| sampler.take(nsym),
+                &self.omegas,
+                self.nsym,
+                gain,
+            );
+            self.prefix(&mut symbols, gain)?;
+        }
+        // symbols is dropped here, releasing the borrow
 
-        // Train equalization filter
-        let _fir = self._train(&mut symbols, 10, 10)?;
+        // Step 2: Train equalization filter
+        let _fir = self.train(sampler, 10, 10)?;
         info!("Equalization filter trained");
 
         // TODO: Apply FIR filter to equalize the signal
         // For now, we'll skip the equalization and proceed directly to demodulation
 
-        // Collect remaining data symbols
+        // Step 3: Collect remaining data symbols - create a new Demux for data collection
+        let mut symbols =
+            Demux::new(|nsym| sampler.take(nsym), &self.omegas, self.nsym, gain);
         let mut data_symbols: Vec<Complex64> = Vec::new();
         while let Some(row) = symbols.next() {
             let carrier_symbol = row
