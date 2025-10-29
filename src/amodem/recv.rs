@@ -1,11 +1,12 @@
 use crate::amodem::{
     config::Configuration,
     dsp::{Demux, Modem},
-    equalizer::Equalizer,
+    equalizer::{Equalizer, get_prefix},
     sampling::Sampler,
 };
 use num_complex::Complex64;
 use std::io::Write;
+use tracing::{debug, info};
 
 pub struct Receiver {
     modem: Modem,
@@ -15,8 +16,14 @@ pub struct Receiver {
     tsym: f64,
     equalizer: Equalizer,
     carrier_index: usize,
+    /// number of bytes written to output stream
     output_size: usize,
     use_reed_solomon: bool,
+    iters_per_update: usize, // ms
+    iters_per_report: usize, // ms
+    modem_bitrate: usize,
+    /// integration feedback gain
+    freq_err_gain: f64,
     ecc_len: usize,
 }
 
@@ -38,8 +45,12 @@ impl Receiver {
             .collect();
         let nsym = config.nsym;
         let tsym = config.tsym;
+        let iters_per_update = 100;
+        let iters_per_report = 1000;
+        let modem_bitrate = config.modem_bps;
         let equalizer = Equalizer::new(config);
         let carrier_index = config.carrier_index;
+        let freq_err_gain = 0.01 * tsym;
 
         Self {
             modem,
@@ -50,17 +61,17 @@ impl Receiver {
             equalizer,
             carrier_index,
             output_size: 0,
+            freq_err_gain,
+            iters_per_update,
+            iters_per_report,
+            modem_bitrate,
             use_reed_solomon,
             ecc_len,
         }
     }
 
-    pub fn debug_demodulate(
-        &self,
-        signal: &[f64],
-        gain: f64,
-    ) -> Result<Vec<Complex64>, String> {
-        self.demodulate_python_style(signal, gain, 1.0)
+    pub fn _prefix(&self, symbols: Vec<Complex64>, gain: Option<f64>) {
+        let gain = gain.unwrap_or(1.0);
     }
 
     pub fn get_modem(&self) -> &Modem {
@@ -69,22 +80,19 @@ impl Receiver {
 
     pub fn run<W: Write>(
         &mut self,
-        signal: Vec<f64>,
+        sampler: Sampler,
         gain: f64,
-        freq: f64,
         mut output: W,
     ) -> Result<(), String> {
-        eprintln!("Receiving");
-
-        // 迭代式解调：构造采样器与 demux，一边产出符号一边处理
-        let sampler = Sampler::new(&signal, freq);
-        let mut demux = Demux::new(sampler, &self.omegas, self.nsym, gain);
+        debug!("Receiving");
+        let mut symbols = Demux::new(sampler, &self.omegas, self.nsym, gain);
+        // self._prefix(symbols, gain);
 
         // 先收集足够的前导 + 训练段用于跳过（保持与 Python 对齐）
         let training_skip = 550usize;
         let mut data_symbols: Vec<Complex64> = Vec::new();
         let mut consumed = 0usize;
-        while let Some(row) = demux.next() {
+        while let Some(row) = symbols.next() {
             let carrier_symbol = row
                 .get(self.carrier_index)
                 .copied()
@@ -146,44 +154,5 @@ impl Receiver {
         let received_kb = self.output_size as f64 / 1e3;
         eprintln!("Received {:.3} kB", received_kb);
         Ok(())
-    }
-
-    fn demodulate_python_style(
-        &self,
-        signal: &[f64],
-        gain: f64,
-        freq: f64,
-    ) -> Result<Vec<Complex64>, String> {
-        if self.omegas.is_empty() {
-            return Err("Receiver has no configured carriers".to_string());
-        }
-
-        let sampler = Sampler::new(signal, freq);
-        let mut demux = Demux::new(sampler, &self.omegas, self.nsym, gain);
-        let mut symbols = Vec::new();
-
-        while let Some(symbol_row) = demux.next() {
-            let carrier_symbol = symbol_row
-                .get(self.carrier_index)
-                .copied()
-                .or_else(|| symbol_row.first().copied())
-                .unwrap_or_else(|| Complex64::new(0.0, 0.0));
-            symbols.push(carrier_symbol);
-        }
-
-        eprintln!(
-            "🎯 Extracted {} symbols using Python-style Demux",
-            symbols.len()
-        );
-        if symbols.len() > 0 {
-            eprintln!("First 5 symbols: {:?}", &symbols[..5.min(symbols.len())]);
-        }
-
-        Ok(symbols)
-    }
-
-    fn decode_frames(&self, _bits: Vec<bool>) -> Result<Vec<Vec<u8>>, String> {
-        // 不再使用，保留签名以最小侵入
-        Ok(vec![])
     }
 }

@@ -115,7 +115,8 @@ impl<W: Write> Sender<W> {
         let nfreq = self.carriers.len();
         let carrier_len = self.carriers[0].len();
 
-        for (i, symbol_chunk) in iterate(symbols.into_iter(), nfreq).enumerate()
+        for (i, symbol_chunk) in
+            iterate(symbols.into_iter(), nfreq, None).enumerate()
         {
             // Pad to nfreq if necessary
             let mut symbols = symbol_chunk;

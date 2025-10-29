@@ -1,3 +1,5 @@
+use ringbuf::{HeapCons, traits::*};
+
 const SCALING: f64 = 32000.0; // out of 2**15
 
 pub fn dumps(samples: &[f64]) -> Vec<u8> {
@@ -33,33 +35,102 @@ pub fn dumps_with_metadata(
     result
 }
 
+// /// Iterate over a signal, taking each time *size* elements.
+// pub fn iterate<T: Clone>(
+//     data: &mut HeapCons<T>,
+//     size: usize,
+//     truncate: Option<bool>,
+// ) -> impl Iterator<Item = (usize, Vec<T>)> {
+//     let truncate = truncate.unwrap_or(true);
+
+//     let mut offset = 0;
+//     let mut done = false;
+
+//     std::iter::from_fn(move || {
+//         if done {
+//             return None;
+//         }
+
+//         let occupied = data.occupied_len();
+//         if occupied < size {
+//             if truncate || occupied == 0 {
+//                 done = true;
+//                 return None;
+//             }
+//             done = true;
+//         }
+
+//         let buf: Vec<T> = data
+//             .pop_iter()
+//             .take(size.min(occupied))
+//             .collect();
+//         let current_offset = offset;
+//         offset += size;
+
+//         Some((current_offset, buf))
+//     })
+// }
+
+pub fn take<T: Copy>(iter: &mut impl Iterator<Item = T>, n: usize) -> Vec<T> {
+    iter.take(n).collect()
+}
+
+/// Iterate over an iterator, taking each time *size* elements (for generic iterators)
 pub fn iterate<T>(
     data: impl Iterator<Item = T>,
     size: usize,
+    truncate: Option<bool>,
 ) -> impl Iterator<Item = Vec<T>> {
-    let mut iter = data;
+    let truncate = truncate.unwrap_or(true);
+    let mut iter = data.peekable();
+
     std::iter::from_fn(move || {
-        let mut chunk = Vec::new();
-        for _ in 0..size {
-            if let Some(item) = iter.next() {
-                chunk.push(item);
-            } else {
-                break;
-            }
-        }
-        if chunk.is_empty() {
+        let buf: Vec<T> = iter
+            .by_ref()
+            .take(size)
+            .collect();
+
+        if buf.is_empty() {
             None
-        } else if chunk.len() < size {
-            // pad with default values if needed
-            None
+        } else if buf.len() < size {
+            if truncate { None } else { Some(buf) }
         } else {
-            Some(chunk)
+            Some(buf)
         }
     })
 }
 
-pub fn take<T: Copy>(iter: &mut impl Iterator<Item = T>, n: usize) -> Vec<T> {
-    iter.take(n).collect()
+pub fn iterate_index<T>(
+    data: impl Iterator<Item = T>,
+    size: usize,
+    truncate: Option<bool>,
+) -> impl Iterator<Item = (usize, Vec<T>)> {
+    let truncate = truncate.unwrap_or(true);
+    let mut iter = data.peekable();
+    let mut offset = 0;
+
+    std::iter::from_fn(move || {
+        let buf: Vec<T> = iter
+            .by_ref()
+            .take(size)
+            .collect();
+
+        if buf.is_empty() {
+            None
+        } else if buf.len() < size {
+            if truncate {
+                None
+            } else {
+                let current = offset;
+                offset += size;
+                Some((current, buf))
+            }
+        } else {
+            let current = offset;
+            offset += size;
+            Some((current, buf))
+        }
+    })
 }
 
 // Helper function to load PCM data (matching Python's common.loads)

@@ -1,15 +1,119 @@
-pub struct Sampler<'a> {
-    signal: &'a [f64],
-    position: f64,
-    freq: f64,
+use std::f64::consts::PI;
+
+fn sinc(x: f64) -> f64 {
+    if x == 0.0 {
+        1.0
+    } else {
+        (PI * x).sin() / (PI * x)
+    }
 }
 
-impl<'a> Sampler<'a> {
-    pub fn new(signal: &'a [f64], freq: f64) -> Self {
+pub struct Interpolator {
+    pub width: usize,
+    pub resolution: usize,
+    pub filt: Vec<Vec<f64>>,
+    pub coeff_len: usize,
+}
+
+impl Interpolator {
+    pub fn new(resolution: usize, width: usize) -> Self {
+        let n = resolution * width;
+        let u: Vec<f64> = (-(n as i32)..(n as i32))
+            .map(|x| x as f64)
+            .collect();
+        let window: Vec<f64> = u
+            .iter()
+            .map(|&x| {
+                (0.5 * PI * x / (n as f64))
+                    .cos()
+                    .powi(2)
+            })
+            .collect();
+        let h: Vec<f64> = u
+            .iter()
+            .zip(window.iter())
+            .map(|(&x, &w)| sinc(x / resolution as f64) * w)
+            .collect();
+
+        let mut filt = Vec::with_capacity(resolution);
+        for index in 0..resolution {
+            let mut filt_part: Vec<f64> = h
+                .iter()
+                .skip(index)
+                .step_by(resolution)
+                .cloned()
+                .collect();
+            filt_part.reverse();
+            filt.push(filt_part);
+        }
+
+        let coeff_len = 2 * width;
+        let lengths: Vec<usize> = filt
+            .iter()
+            .map(|f| f.len())
+            .collect();
+        assert!(
+            lengths
+                .iter()
+                .all(|&l| l == coeff_len)
+        );
+        assert_eq!(filt.len(), resolution);
+
         Self {
-            signal,
-            position: 0.0,
+            width,
+            resolution,
+            filt,
+            coeff_len,
+        }
+    }
+}
+
+pub fn default_interpolator() -> Interpolator {
+    Interpolator::new(1024, 128)
+}
+
+pub struct Sampler {
+    equalizer: Box<dyn Fn(Vec<f64>) -> Vec<f64>>,
+    interp: Interpolator,
+    resolution: usize,
+    filt: Vec<Vec<f64>>,
+    width: usize,
+    freq: f64,
+    src: Box<dyn Iterator<Item = f64>>,
+    offset: f64,
+    buff: Vec<f64>,
+    index: usize,
+}
+
+impl Sampler {
+    pub fn new(
+        signal: Box<dyn Iterator<Item = f64>>,
+        interp: Option<Interpolator>,
+        freq: f64,
+    ) -> Self {
+        let interp = interp.unwrap_or_else(default_interpolator);
+        let resolution = interp.resolution;
+        let width = interp.width;
+        let filt = interp.filt.clone();
+        let equalizer = Box::new(|x: Vec<f64>| x);
+        let padding: Box<dyn Iterator<Item = f64>> =
+            Box::new(std::iter::repeat(0.0).take(width));
+        let src: Box<dyn Iterator<Item = f64>> = Box::new(padding.chain(signal));
+        let offset = (width + 1) as f64;
+        let buff = vec![0.0; interp.coeff_len];
+        let index = 0;
+
+        Self {
+            src,
+            equalizer,
+            interp,
+            resolution,
+            filt,
+            width,
             freq,
+            offset,
+            buff,
+            index,
         }
     }
 
@@ -18,36 +122,47 @@ impl<'a> Sampler<'a> {
             return Some(Vec::new());
         }
 
-        let mut result = Vec::with_capacity(size);
-        let start_pos = self.position;
+        let mut frame = vec![0.0; size];
+        let mut count = 0;
 
-        for _ in 0..size {
-            let base = self.position.floor();
-            let idx = base as usize;
-            if idx >= self.signal.len() {
-                // return None if not enough data remaining to fill the frame
-                self.position = start_pos;
-                return None;
+        for frame_index in 0..size {
+            let offset = self.offset;
+            let k = offset.floor() as usize;
+            let j = ((offset - k as f64) * self.resolution as f64) as usize;
+            let coeffs = &self.filt[j];
+            let end = k + self.width;
+
+            // Process input until buffer is full with samples
+            while self.index < end {
+                if let Some(sample) = self.src.next() {
+                    // Shift buffer left
+                    let buff_len = self.buff.len();
+                    self.buff.copy_within(1.., 0);
+                    self.buff[buff_len - 1] = sample;
+                    self.index += 1;
+                } else {
+                    // Not enough data
+                    return None;
+                }
             }
 
-            // Linear interpolation
-            let frac = self.position - base;
-            let sample = if frac > 0.0 && idx + 1 < self.signal.len() {
-                let current = self.signal[idx];
-                let next = self.signal[idx + 1];
-                current + frac * (next - current)
-            } else {
-                self.signal[idx]
-            };
+            self.offset += self.freq;
 
-            result.push(sample);
-            self.position += self.freq;
+            // Apply interpolation filter
+            let sample = coeffs
+                .iter()
+                .zip(self.buff.iter())
+                .map(|(a, b)| a * b)
+                .sum();
+            frame[frame_index] = sample;
+            count = frame_index + 1;
         }
 
+        let result = (self.equalizer)(frame[..count].to_vec());
         Some(result)
     }
 
     pub fn has_data(&self) -> bool {
-        (self.position as usize) < self.signal.len()
+        self.index > 0
     }
 }

@@ -44,16 +44,16 @@ impl Fir {
     }
 }
 
-pub struct Demux<'a> {
-    sampler: Sampler<'a>,
+pub struct Demux {
+    sampler: Sampler,
     filters: Vec<Vec<Complex64>>,
     nsym: usize,
     gain: f64,
 }
 
-impl<'a> Demux<'a> {
+impl Demux {
     pub fn new(
-        sampler: Sampler<'a>,
+        sampler: Sampler,
         omegas: &[f64],
         nsym: usize,
         gain: f64,
@@ -83,7 +83,7 @@ impl<'a> Demux<'a> {
     }
 }
 
-impl<'a> Iterator for Demux<'a> {
+impl Iterator for Demux {
     type Item = Vec<Complex64>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -219,7 +219,7 @@ impl Modem {
 
     pub fn encode(&self, bits: impl Iterator<Item = bool>) -> Vec<Complex64> {
         let bit_vec: Vec<bool> = bits.collect();
-        common::iterate(bit_vec.into_iter(), self.bits_per_symbol)
+        common::iterate(bit_vec.into_iter(), self.bits_per_symbol, None)
             .map(|bit_chunk| {
                 self.encode_map
                     .get(&bit_chunk)

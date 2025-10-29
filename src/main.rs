@@ -1,5 +1,7 @@
+use amodem::sampling::Sampler;
 use clap::{Parser, Subcommand};
 use jack;
+use ringbuf::{HeapRb, traits::*};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -17,9 +19,8 @@ use amodem::{
     common, config::Configuration, detect::Detector, recv::Receiver, send,
 };
 use device::jack::{
-    connect_input_from_first_system_output,
-    connect_output_to_first_system_input, disconnect_input_sources,
-    disconnect_output_sinks, print_jack_info,
+    connect_input_from_first_system_output, disconnect_input_sources,
+    print_jack_info,
 };
 use ui::{print_banner, progress::ProgressManager};
 use utils::logging::init_logging;
@@ -583,17 +584,42 @@ fn decode_amodem_signal_with_reed_solomon(
 ) -> Result<Vec<u8>, String> {
     // Create detector and receiver
     let detector = Detector::new(config);
-    let mut receiver =
+    let mut _receiver =
         Receiver::with_reed_solomon(config, use_reed_solomon, ecc_len);
 
-    // Detect carrier and get signal
-    let (signal, amplitude, freq_error) =
-        detector.run(samples.iter().cloned())?;
-    let freq = 1.0 / (1.0 + freq_error);
+    // TODO: use real ring buffer
+    let rb = HeapRb::<f64>::new(samples.len());
+    let (mut prod, mut cons) = rb.split();
+    for &s in samples {
+        prod.try_push(s).unwrap();
+    }
 
-    // Decode the signal directly using the receiver (it handles framing internally)
-    let mut output = Vec::new();
-    receiver.run(signal, 1.0 / amplitude, freq, &mut output)?;
+    // TODO: skip start
+    // config.skip_start
+
+    info!("Waiting for carrier tone: {:.1} kHz", config.fc / 1e3);
+    let (signal, amplitude, freq_error) = detector
+        .run(cons.pop_iter())
+        .unwrap();
+
+    let freq = 1.0 / (1.0 + freq_error);
+    debug!("Frequency correction: {:.3} ppm", (freq - 1.0) * 1e6);
+
+    let gain = 1.0 / amplitude;
+    debug!("Gain correction: {:.3}", gain);
+
+    // Convert signal iterator to a 'static boxed iterator
+    // by collecting it into a Vec then converting back to iterator
+    let signal_vec: Vec<f64> = signal.collect();
+    let signal_static: Box<dyn Iterator<Item = f64>> =
+        Box::new(signal_vec.into_iter());
+
+    let _sampler = Sampler::new(signal_static, None, config.fs as f64 * freq);
+
+    let output = Vec::new();
+    _receiver
+        .run(_sampler, gain, Vec::new())
+        .unwrap();
 
     Ok(output)
 }

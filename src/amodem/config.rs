@@ -29,7 +29,7 @@ pub struct Configuration {
     pub carrier_index: usize,
     pub fc: f64, // frequencies[carrier_index]
     pub bits_per_baud: usize,
-    pub modem_bps: f64,
+    pub modem_bps: usize,
     pub carriers: Vec<Vec<Complex64>>,
     pub symbols: Vec<Complex64>,
 }
@@ -58,7 +58,7 @@ impl Configuration {
         let bits_per_symbol = (npoints as f64).log2() as usize;
         assert_eq!(2_usize.pow(bits_per_symbol as u32), npoints);
         let bits_per_baud = bits_per_symbol * nfreq;
-        let modem_bps = baud as f64 * bits_per_baud as f64;
+        let modem_bps = baud * bits_per_baud;
 
         // Generate carriers
         let carriers: Vec<Vec<Complex64>> = frequencies

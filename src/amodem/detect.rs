@@ -1,7 +1,7 @@
 use crate::amodem::{common, config::Configuration, equalizer};
 use num_complex::Complex64;
 use std::collections::VecDeque;
-use tracing::debug;
+use tracing::{debug, info};
 
 pub struct Detector {
     freq: f64,
@@ -52,17 +52,17 @@ impl Detector {
         }
     }
 
-    pub fn run(
-        &self,
-        mut samples: impl Iterator<Item = f64>,
-    ) -> Result<(Vec<f64>, f64, f64), String> {
+    pub fn run<'a>(
+        &'a self,
+        mut samples: impl Iterator<Item = f64> + 'a,
+    ) -> Result<(Box<dyn Iterator<Item = f64> + 'a>, f64, f64), String> {
         // 1) 等待载波：按符号切块、计算相干度、累计达到阈值
         let (offset_samples, mut bufs) = self.wait_for_carrier(&mut samples)?;
 
         // 2) 计算开始时间日志（近似显示）
         let start_time_ms =
             (offset_samples as f64 / self.nsym as f64) * self.tsym * 1e3;
-        eprintln!(
+        info!(
             "Carrier detected at ~{:.1} ms @ {:.1} kHz",
             start_time_ms,
             self.freq / 1e3
@@ -106,7 +106,7 @@ impl Detector {
                 - self.search_window as f64))
             * self.tsym
             * 1e3;
-        eprintln!("Carrier starts at {:.3} ms", start_time_ms);
+        info!("Carrier starts at {:.3} ms", start_time_ms);
 
         // 5) 估计幅度与频偏（在前导长度范围内）
         let prefix_len = carrier_duration * self.nsym;
@@ -127,30 +127,33 @@ impl Detector {
         debug!("Estimated frequency error: {:.3} ppm", freq_err * 1e6);
 
         // 6) 返回：从精确起点后的 buf + 尚未消耗的 samples 组成的完整后续信号
-        let mut final_signal = buf[offset_in_buf..].to_vec();
-        final_signal.extend(samples);
+        // 使用惰性迭代器链：buf[offset_in_buf..] 的迭代器 + samples 的链接
+        let buf_iter = buf[offset_in_buf..]
+            .to_vec()
+            .into_iter();
+        let chained = buf_iter.chain(samples);
+        let final_signal: Box<dyn Iterator<Item = f64> + 'a> = Box::new(chained);
 
         Ok((final_signal, amplitude, freq_err))
     }
 
     fn wait_for_carrier(
         &self,
-        samples: impl Iterator<Item = f64>,
-    ) -> Result<(usize, Vec<Vec<f64>>), String> {
+        samples: &mut impl Iterator<Item = f64>,
+    ) -> Result<(usize, VecDeque<Vec<f64>>), String> {
         let mut counter = 0;
         let mut bufs = VecDeque::with_capacity(self.maxlen);
 
-        for (offset, buf) in common::iterate(samples, self.nsym).enumerate() {
-            if offset * self.nsym > self.max_offset {
+        for (offset, buf) in
+            common::iterate_index(samples, self.nsym, Some(false))
+        {
+            if offset > self.max_offset {
                 return Err("Timeout waiting for carrier".to_string());
             }
 
-            if bufs.len() >= self.maxlen {
-                bufs.pop_front();
-            }
-            bufs.push_back(buf);
+            bufs.push_back(buf.clone());
 
-            let coeff = self.coherence(&bufs.back().unwrap());
+            let coeff = self.coherence(&buf);
             if coeff.norm() > self.coherence_threshold {
                 counter += 1;
             } else {
@@ -158,7 +161,7 @@ impl Detector {
             }
 
             if counter == self.carrier_threshold {
-                return Ok((offset * self.nsym, bufs.into_iter().collect()));
+                return Ok((offset, bufs));
             }
         }
 
