@@ -72,33 +72,28 @@ pub fn default_interpolator() -> Interpolator {
     Interpolator::new(1024, 128)
 }
 
-pub struct Sampler {
+pub struct Sampler<I: Iterator<Item = f64>> {
     equalizer: Box<dyn Fn(Vec<f64>) -> Vec<f64>>,
     interp: Interpolator,
     resolution: usize,
     filt: Vec<Vec<f64>>,
     width: usize,
     freq: f64,
-    src: Box<dyn Iterator<Item = f64>>,
+    src: std::iter::Chain<std::iter::Take<std::iter::Repeat<f64>>, I>,
     offset: f64,
     buff: Vec<f64>,
     index: usize,
 }
 
-impl Sampler {
-    pub fn new(
-        signal: Box<dyn Iterator<Item = f64>>,
-        interp: Option<Interpolator>,
-        freq: f64,
-    ) -> Self {
+impl<I: Iterator<Item = f64>> Sampler<I> {
+    pub fn new(signal: I, interp: Option<Interpolator>, freq: f64) -> Self {
         let interp = interp.unwrap_or_else(default_interpolator);
         let resolution = interp.resolution;
         let width = interp.width;
         let filt = interp.filt.clone();
         let equalizer = Box::new(|x: Vec<f64>| x);
-        let padding: Box<dyn Iterator<Item = f64>> =
-            Box::new(std::iter::repeat(0.0).take(width));
-        let src: Box<dyn Iterator<Item = f64>> = Box::new(padding.chain(signal));
+        let padding = std::iter::repeat(0.0).take(width);
+        let src = padding.chain(signal);
         let offset = (width + 1) as f64;
         let buff = vec![0.0; interp.coeff_len];
         let index = 0;

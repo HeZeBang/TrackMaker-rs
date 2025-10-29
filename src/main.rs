@@ -598,9 +598,7 @@ fn decode_amodem_signal_with_reed_solomon(
     // config.skip_start
 
     info!("Waiting for carrier tone: {:.1} kHz", config.fc / 1e3);
-    let (signal, amplitude, freq_error) = detector
-        .run(cons.pop_iter())
-        .unwrap();
+    let (signal, amplitude, freq_error) = detector.run(cons.pop_iter())?;
 
     let freq = 1.0 / (1.0 + freq_error);
     debug!("Frequency correction: {:.3} ppm", (freq - 1.0) * 1e6);
@@ -608,18 +606,11 @@ fn decode_amodem_signal_with_reed_solomon(
     let gain = 1.0 / amplitude;
     debug!("Gain correction: {:.3}", gain);
 
-    // Convert signal iterator to a 'static boxed iterator
-    // by collecting it into a Vec then converting back to iterator
-    let signal_vec: Vec<f64> = signal.collect();
-    let signal_static: Box<dyn Iterator<Item = f64>> =
-        Box::new(signal_vec.into_iter());
-
-    let _sampler = Sampler::new(signal_static, None, config.fs as f64 * freq);
+    // Stream directly without collecting to Vec
+    let mut _sampler = Sampler::new(signal, None, freq);
 
     let output = Vec::new();
-    _receiver
-        .run(_sampler, gain, Vec::new())
-        .unwrap();
+    _receiver.run(_sampler, gain, Vec::new())?;
 
     Ok(output)
 }

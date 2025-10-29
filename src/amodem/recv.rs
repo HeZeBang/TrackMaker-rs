@@ -78,12 +78,16 @@ impl Receiver {
         &self.modem
     }
 
-    pub fn run<W: Write>(
+    pub fn run<I, W>(
         &mut self,
-        sampler: Sampler,
+        sampler: Sampler<I>,
         gain: f64,
         mut output: W,
-    ) -> Result<(), String> {
+    ) -> Result<(), String>
+    where
+        I: Iterator<Item = f64>,
+        W: Write,
+    {
         debug!("Receiving");
         let mut symbols = Demux::new(sampler, &self.omegas, self.nsym, gain);
         // self._prefix(symbols, gain);

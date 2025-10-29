@@ -44,16 +44,16 @@ impl Fir {
     }
 }
 
-pub struct Demux {
-    sampler: Sampler,
+pub struct Demux<I: Iterator<Item = f64>> {
+    sampler: Sampler<I>,
     filters: Vec<Vec<Complex64>>,
     nsym: usize,
     gain: f64,
 }
 
-impl Demux {
+impl<I: Iterator<Item = f64>> Demux<I> {
     pub fn new(
-        sampler: Sampler,
+        sampler: Sampler<I>,
         omegas: &[f64],
         nsym: usize,
         gain: f64,
@@ -83,7 +83,7 @@ impl Demux {
     }
 }
 
-impl Iterator for Demux {
+impl<I: Iterator<Item = f64>> Iterator for Demux<I> {
     type Item = Vec<Complex64>;
 
     fn next(&mut self) -> Option<Self::Item> {
