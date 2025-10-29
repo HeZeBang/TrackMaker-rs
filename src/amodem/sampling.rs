@@ -73,7 +73,7 @@ pub fn default_interpolator() -> Interpolator {
 }
 
 pub struct Sampler<I: Iterator<Item = f64>> {
-    equalizer: Box<dyn Fn(Vec<f64>) -> Vec<f64>>,
+    equalizer: Box<dyn FnMut(Vec<f64>) -> Vec<f64>>,
     interp: Interpolator,
     resolution: usize,
     filt: Vec<Vec<f64>>,
@@ -157,7 +157,25 @@ impl<I: Iterator<Item = f64>> Sampler<I> {
         Some(result)
     }
 
-    pub fn has_data(&self) -> bool {
-        self.index > 0
+    pub fn set_equalizer<F>(&mut self, equalizer: F)
+    where
+        F: 'static + FnMut(Vec<f64>) -> Vec<f64>,
+    {
+        self.equalizer = Box::new(equalizer);
+    }
+
+    /// Adjust the resampling frequency
+    pub fn adjust_frequency(&mut self, delta: f64) {
+        self.freq += delta;
+    }
+
+    /// Adjust the phase offset
+    pub fn adjust_offset(&mut self, delta: f64) {
+        self.offset += delta;
+    }
+
+    /// Get the current resampling frequency
+    pub fn get_frequency(&self) -> f64 {
+        self.freq
     }
 }

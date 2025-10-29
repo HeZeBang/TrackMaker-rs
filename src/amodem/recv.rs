@@ -7,6 +7,7 @@ use crate::amodem::{
     sampling::Sampler,
 };
 use num_complex::Complex64;
+use std::collections::HashMap;
 use std::io::Write;
 use tracing::{debug, info, warn};
 
@@ -288,7 +289,6 @@ impl Receiver {
             ));
         }
 
-        warn!("Training error rate: {:.2}%", error_rate * 100.0);
         debug!("Training verified");
         Ok(())
     }
@@ -311,6 +311,221 @@ impl Receiver {
 
         plot.write_html("/tmp/coeffs.html");
         info!("Coefficients plot saved to /tmp/coeffs.html");
+    }
+
+    fn bitstream<F>(
+        &self,
+        symbols: Vec<Vec<Complex64>>,
+        mut error_handler: F,
+    ) -> (Vec<Vec<Vec<bool>>>, Vec<Vec<Complex64>>)
+    where
+        F: FnMut(Complex64, Complex64, usize),
+    {
+        let mut streams = Vec::new();
+        let mut symbol_list = Vec::new();
+        let num_freqs = self.frequencies.len();
+
+        // Split symbols into streams, one per frequency
+        // symbols is a Vec of rows, each row has num_freqs symbols
+        for freq_idx in 0..num_freqs {
+            let mut equalized = Vec::new();
+
+            // Extract symbols for this frequency
+            for row in &symbols {
+                if let Some(&sym) = row.get(freq_idx) {
+                    equalized.push(sym);
+                }
+            }
+
+            let freq_equalized = equalized.clone();
+
+            // Decode bits for this frequency using modem decoder with error tracking
+            let bits = self
+                .modem
+                .decode_with_error_handler(equalized, |received, decoded| {
+                    error_handler(received, decoded, freq_idx);
+                });
+
+            symbol_list.push(freq_equalized);
+            streams.push(bits);
+        }
+
+        // Transpose streams: from [freq][symbol_idx] to [symbol_idx][freq]
+        // Each element in streams[freq] is a Vec<bool> (bits for one symbol)
+        let max_symbols = streams
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(0);
+        let mut transposed: Vec<Vec<Vec<bool>>> = vec![Vec::new(); max_symbols];
+
+        for symbol_idx in 0..max_symbols {
+            for freq_idx in 0..num_freqs {
+                if let Some(bits_per_freq) = streams.get(freq_idx) {
+                    if let Some(bits) = bits_per_freq.get(symbol_idx) {
+                        transposed[symbol_idx].push(bits.clone());
+                    }
+                }
+            }
+        }
+
+        (transposed, symbol_list)
+    }
+
+    fn demodulate<I, S>(
+        &self,
+        sampler: &mut Sampler<I>,
+        symbols: &mut Demux<S>,
+    ) -> Result<Vec<Vec<bool>>, String>
+    where
+        I: Iterator<Item = f64>,
+        S: FnMut(usize) -> Option<Vec<f64>>,
+    {
+        let mut errors: HashMap<usize, Vec<f64>> = HashMap::new();
+        let mut noise: HashMap<usize, Vec<f64>> = HashMap::new();
+
+        // Collect all symbol rows
+        let mut symbol_rows = Vec::new();
+        while let Some(row) = symbols.next() {
+            symbol_rows.push(row);
+        }
+
+        if symbol_rows.is_empty() {
+            return Err("No symbols received for demodulation".to_string());
+        }
+
+        // Define error handler
+        let error_handler =
+            |received: Complex64, decoded: Complex64, freq: usize| {
+                let ratio = if decoded.norm() > 1e-10 {
+                    received.norm() / decoded.norm()
+                } else {
+                    0.0
+                };
+                errors
+                    .entry(freq)
+                    .or_insert_with(Vec::new)
+                    .push(ratio);
+
+                let noise_val = (received - decoded).norm();
+                noise
+                    .entry(freq)
+                    .or_insert_with(Vec::new)
+                    .push(noise_val);
+            };
+
+        // Demodulate using bitstream
+        let (bitstream, _symbol_list) =
+            self.bitstream(symbol_rows, error_handler);
+
+        info!("Starting demodulation");
+        let mut rx_bits = 0usize;
+        let mut result_bits = Vec::new();
+
+        for (i, block_of_bits) in bitstream
+            .into_iter()
+            .enumerate()
+        {
+            // Flatten the block_of_bits (Vec<Vec<bool>>) into a single Vec<bool>
+            let mut flattened_block = Vec::new();
+            for bits_tuple in block_of_bits {
+                rx_bits += bits_tuple.len();
+                flattened_block.extend(bits_tuple);
+            }
+            result_bits.push(flattened_block);
+
+            let i_one_based = i + 1;
+
+            // Update sampler periodically
+            if i_one_based % self.iters_per_update == 0 {
+                self.update_sampler(&errors, sampler);
+            }
+
+            // Report progress periodically
+            if i_one_based % self.iters_per_report == 0 {
+                self.report_progress(&noise, sampler, rx_bits);
+            }
+        }
+
+        Ok(result_bits)
+    }
+
+    fn update_sampler<I>(
+        &self,
+        errors: &HashMap<usize, Vec<f64>>,
+        sampler: &mut Sampler<I>,
+    ) where
+        I: Iterator<Item = f64>,
+    {
+        if errors.is_empty() {
+            return;
+        }
+
+        let mut all_angles = Vec::new();
+        for vals in errors.values() {
+            for &v in vals {
+                if v > 1e-10 {
+                    let angle = v.atan2(0.0); // Extract phase
+                    all_angles.push(angle);
+                }
+            }
+        }
+
+        if !all_angles.is_empty() {
+            let mean_angle =
+                all_angles.iter().sum::<f64>() / all_angles.len() as f64;
+            let err = mean_angle / (2.0 * std::f64::consts::PI);
+
+            debug!(
+                "Sampler update: frequency offset = {:.6}, phase offset = {:.6}",
+                err, err
+            );
+
+            sampler.adjust_frequency(-self.freq_err_gain * err);
+            sampler.adjust_offset(-err);
+        }
+    }
+
+    fn report_progress<I>(
+        &self,
+        noise: &HashMap<usize, Vec<f64>>,
+        sampler: &Sampler<I>,
+        rx_bits: usize,
+    ) where
+        I: Iterator<Item = f64>,
+    {
+        if noise.is_empty() {
+            return;
+        }
+
+        let mut all_noise = Vec::new();
+        for vals in noise.values() {
+            for &v in vals {
+                all_noise.push(v);
+            }
+        }
+
+        if !all_noise.is_empty() {
+            let mean_noise_power = all_noise
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                / all_noise.len() as f64;
+            let snr_db = if mean_noise_power > 1e-10 {
+                -10.0 * mean_noise_power.log10()
+            } else {
+                f64::INFINITY
+            };
+
+            let freq_drift_ppm = (1.0 - sampler.get_frequency()) * 1e6;
+
+            debug!(
+                "Got {:10.3} kB, SNR: {:5.2} dB, drift: {:+5.2} ppm",
+                rx_bits as f64 / 8e3,
+                snr_db,
+                freq_drift_ppm
+            );
+        }
     }
 
     pub fn run<I, W>(
@@ -338,7 +553,8 @@ impl Receiver {
         // symbols is dropped here, releasing the borrow
 
         // Step 2: Train equalization filter
-        let _fir = self.train(sampler, 10, 10)?;
+        let mut fir = self.train(sampler, 10, 10)?;
+        sampler.set_equalizer(move |input| fir.process(input));
         info!("Equalization filter trained");
 
         // TODO: Apply FIR filter to equalize the signal

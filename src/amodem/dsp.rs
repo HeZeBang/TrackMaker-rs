@@ -18,10 +18,7 @@ impl Fir {
         }
     }
 
-    pub fn process<I>(&mut self, input: I) -> Vec<f64>
-    where
-        I: IntoIterator<Item = f64>,
-    {
+    pub fn process(&mut self, input: Vec<f64>) -> Vec<f64> {
         let mut output = Vec::new();
         for v in input {
             for idx in (1..self.state.len()).rev() {
@@ -261,12 +258,15 @@ impl Modem {
         &self.symbols
     }
 
+    /// Maximum-likelihood decoding using nearest-neighbor
+    /// Returns decoded bits for each symbol
     pub fn decode(&self, symbols: Vec<Complex64>) -> Vec<Vec<bool>> {
         symbols
             .into_iter()
             .map(|received| {
                 let mut min_error = f64::INFINITY;
                 let mut best_bits = Vec::new();
+
                 for (symbol, bits) in &self.decode_list {
                     let error = (received - *symbol).norm();
                     if error < min_error {
@@ -274,6 +274,39 @@ impl Modem {
                         best_bits = bits.clone();
                     }
                 }
+                best_bits
+            })
+            .collect()
+    }
+
+    /// Maximum-likelihood decoding with error handler
+    /// Calls error_handler for each symbol with (received, decoded)
+    pub fn decode_with_error_handler<F>(
+        &self,
+        symbols: Vec<Complex64>,
+        mut error_handler: F,
+    ) -> Vec<Vec<bool>>
+    where
+        F: FnMut(Complex64, Complex64),
+    {
+        symbols
+            .into_iter()
+            .map(|received| {
+                let mut min_error = f64::INFINITY;
+                let mut best_bits = Vec::new();
+                let mut decoded_symbol = Complex64::new(0.0, 0.0);
+
+                for (symbol, bits) in &self.decode_list {
+                    let error = (received - *symbol).norm();
+                    if error < min_error {
+                        min_error = error;
+                        best_bits = bits.clone();
+                        decoded_symbol = *symbol;
+                    }
+                }
+
+                // Call error handler with received and decoded symbols
+                error_handler(received, decoded_symbol);
                 best_bits
             })
             .collect()
