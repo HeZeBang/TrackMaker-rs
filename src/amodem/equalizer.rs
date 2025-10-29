@@ -89,3 +89,69 @@ impl Equalizer {
         result
     }
 }
+
+/// Levinson-Durbin solver for computing FIR filter coefficients
+pub fn train(
+    signal: &[f64],
+    expected: &[f64],
+    order: usize,
+    lookahead: usize,
+) -> Vec<f64> {
+    let n = order + lookahead;
+
+    // Compute autocorrelation of signal
+    let mut rxx = vec![0.0; n];
+    for i in 0..n {
+        for j in 0..(signal.len().saturating_sub(i)) {
+            rxx[i] += signal[j] * signal[j + i];
+        }
+    }
+
+    // Compute cross-correlation between signal and expected
+    let mut rxy = vec![0.0; n];
+    for i in 0..n {
+        for j in 0..expected
+            .len()
+            .min(signal.len().saturating_sub(i))
+        {
+            if j + i < signal.len() {
+                rxy[i] += expected[j] * signal[j + i];
+            }
+        }
+    }
+
+    // Levinson-Durbin algorithm
+    let mut coeffs = vec![0.0; n];
+
+    if rxx[0] == 0.0 {
+        return coeffs;
+    }
+
+    coeffs[0] = rxy[0] / rxx[0];
+    let mut e = rxx[0];
+
+    for m in 1..n {
+        // Compute reflection coefficient
+        let mut k = rxy[m];
+        for j in 0..m {
+            k -= coeffs[j] * rxx[m - j];
+        }
+        k /= e;
+
+        // Update coefficients
+        let mut new_coeffs = coeffs.clone();
+        new_coeffs[m] = k;
+        for j in 0..m {
+            new_coeffs[j] = coeffs[j] - k * coeffs[m - 1 - j];
+        }
+        coeffs = new_coeffs;
+
+        // Update error
+        e *= 1.0 - k * k;
+        if e <= 0.0 {
+            break;
+        }
+    }
+
+    coeffs
+}
