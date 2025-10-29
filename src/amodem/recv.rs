@@ -4,6 +4,7 @@ use crate::amodem::{
     equalizer::{
         EQUALIZER_LENGTH, Equalizer, SILENCE_LENGTH, get_prefix, train,
     },
+    framing,
     sampling::Sampler,
 };
 use num_complex::Complex64;
@@ -372,13 +373,18 @@ impl Receiver {
         (transposed, symbol_list)
     }
 
-    fn demodulate<I, S>(
+    fn demodulate<S>(
         &self,
-        sampler: &mut Sampler<I>,
         symbols: &mut Demux<S>,
-    ) -> Result<Vec<Vec<bool>>, String>
+    ) -> Result<
+        (
+            Vec<bool>,
+            HashMap<usize, Vec<f64>>,
+            HashMap<usize, Vec<f64>>,
+        ),
+        String,
+    >
     where
-        I: Iterator<Item = f64>,
         S: FnMut(usize) -> Option<Vec<f64>>,
     {
         let mut errors: HashMap<usize, Vec<f64>> = HashMap::new();
@@ -419,40 +425,21 @@ impl Receiver {
             self.bitstream(symbol_rows, error_handler);
 
         info!("Starting demodulation");
-        let mut rx_bits = 0usize;
         let mut result_bits = Vec::new();
 
-        for (i, block_of_bits) in bitstream
-            .into_iter()
-            .enumerate()
-        {
+        for block_of_bits in bitstream.into_iter() {
             // Flatten the block_of_bits (Vec<Vec<bool>>) into a single Vec<bool>
-            let mut flattened_block = Vec::new();
             for bits_tuple in block_of_bits {
-                rx_bits += bits_tuple.len();
-                flattened_block.extend(bits_tuple);
-            }
-            result_bits.push(flattened_block);
-
-            let i_one_based = i + 1;
-
-            // Update sampler periodically
-            if i_one_based % self.iters_per_update == 0 {
-                self.update_sampler(&errors, sampler);
-            }
-
-            // Report progress periodically
-            if i_one_based % self.iters_per_report == 0 {
-                self.report_progress(&noise, sampler, rx_bits);
+                result_bits.extend(bits_tuple);
             }
         }
 
-        Ok(result_bits)
+        Ok((result_bits, errors, noise))
     }
 
     fn update_sampler<I>(
         &self,
-        errors: &HashMap<usize, Vec<f64>>,
+        errors: &mut HashMap<usize, Vec<f64>>,
         sampler: &mut Sampler<I>,
     ) where
         I: Iterator<Item = f64>,
@@ -484,11 +471,16 @@ impl Receiver {
             sampler.adjust_frequency(-self.freq_err_gain * err);
             sampler.adjust_offset(-err);
         }
+
+        // Clear for next batch
+        for v in errors.values_mut() {
+            v.clear();
+        }
     }
 
     fn report_progress<I>(
         &self,
-        noise: &HashMap<usize, Vec<f64>>,
+        noise: &mut HashMap<usize, Vec<f64>>,
         sampler: &Sampler<I>,
         rx_bits: usize,
     ) where
@@ -526,6 +518,11 @@ impl Receiver {
                 freq_drift_ppm
             );
         }
+
+        // Clear for next batch
+        for v in noise.values_mut() {
+            v.clear();
+        }
     }
 
     pub fn run<I, W>(
@@ -557,71 +554,36 @@ impl Receiver {
         sampler.set_equalizer(move |input| fir.process(input));
         info!("Equalization filter trained");
 
-        // TODO: Apply FIR filter to equalize the signal
-        // For now, we'll skip the equalization and proceed directly to demodulation
-
-        // Step 3: Collect remaining data symbols - create a new Demux for data collection
+        // Step 3: Demodulate - create a new Demux after training is complete
         let mut symbols =
             Demux::new(|nsym| sampler.take(nsym), &self.omegas, self.nsym, gain);
-        let mut data_symbols: Vec<Complex64> = Vec::new();
-        while let Some(row) = symbols.next() {
-            let carrier_symbol = row
-                .get(self.carrier_index)
-                .copied()
-                .or_else(|| row.first().copied())
-                .unwrap_or(Complex64::new(0.0, 0.0));
-            data_symbols.push(carrier_symbol);
-        }
+        let (all_bits, mut errors, mut noise) = self.demodulate(&mut symbols)?;
 
-        if !data_symbols.is_empty() {
-            eprintln!("🔍 First 5 data symbols:");
-            for (i, sym) in data_symbols
-                .iter()
-                .take(5)
-                .enumerate()
-            {
-                eprintln!(
-                    "  Data[{}]: {:.3} + {:.3}i (mag: {:.3})",
-                    i,
-                    sym.re,
-                    sym.im,
-                    sym.norm()
-                );
+        // Step 4: Stream decode and process frames with sampler updates
+        let mut rx_bits = 0usize;
+        let mut block_count = 0usize;
+
+        let frames = framing::decode_frames_from_bits(all_bits.into_iter());
+        for frame in frames {
+            block_count += 1;
+            rx_bits += frame.len() * 8; // frame is bytes, convert to bits
+
+            output
+                .write_all(&frame)
+                .map_err(|e| format!("Output write error: {}", e))?;
+            self.output_size += frame.len();
+
+            // Update sampler periodically (errors accumulate during demodulation)
+            if block_count % self.iters_per_update == 0 {
+                self.update_sampler(&mut errors, sampler);
+            }
+
+            // Report progress periodically (noise accumulates during demodulation)
+            if block_count % self.iters_per_report == 0 {
+                self.report_progress(&mut noise, sampler, rx_bits);
             }
         }
 
-        // Decode symbols to bits
-        let bit_tuples = self
-            .modem
-            .decode(data_symbols);
-        let bits_iter = bit_tuples
-            .into_iter()
-            .flat_map(|tuple| tuple.into_iter());
-
-        // Decode frames from bitstream
-        eprintln!("Starting demodulation");
-        if self.use_reed_solomon {
-            let frames_iter = crate::amodem::framing::decode_frames_from_bits_with_reed_solomon(bits_iter, self.ecc_len);
-            for frame in frames_iter {
-                output
-                    .write_all(&frame)
-                    .map_err(|e| e.to_string())?;
-                self.output_size += frame.len();
-            }
-        } else {
-            let frames_iter =
-                crate::amodem::framing::decode_frames_from_bits(bits_iter);
-            for frame in frames_iter {
-                output
-                    .write_all(&frame)
-                    .map_err(|e| e.to_string())?;
-                self.output_size += frame.len();
-            }
-        }
-
-        // Summary statistics
-        let received_kb = self.output_size as f64 / 1e3;
-        eprintln!("Received {:.3} kB", received_kb);
         Ok(())
     }
 }
