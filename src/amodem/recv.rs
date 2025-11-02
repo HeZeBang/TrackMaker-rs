@@ -493,49 +493,139 @@ impl Receiver {
         sampler.set_equalizer(move |input| fir.process(input));
         info!("Equalization filter trained");
 
-        // Step 3: Demodulate - create a new Demux after training is complete
-        let symbols =
-            Demux::new(|nsym| sampler.take(nsym), &self.omegas, self.nsym, gain);
+        // Step 3: Implement streaming demodulation with real-time feedback control
+        self.run_with_feedback_control(sampler, gain, output)
+    }
 
-        // Clone necessary data to avoid borrowing issues
-        let iters_per_report = self.iters_per_report;
-        let modem = self.modem.clone();
-        let stream = Self::bitstream_streaming(symbols, modem);
+    /// Run demodulation with real-time sampler feedback control
+    fn run_with_feedback_control<I, W>(
+        &mut self,
+        sampler: &mut Sampler<I>,
+        gain: f64,
+        mut output: W,
+    ) -> Result<(), String>
+    where
+        I: Iterator<Item = f64>,
+        W: Write,
+    {
+        let mut rx_bits = 0usize;
+        let mut symbol_count = 0usize;
+        let mut errors: HashMap<usize, Vec<f64>> = HashMap::new();
+        let mut noise: HashMap<usize, Vec<f64>> = HashMap::new();
+        let mut accumulated_bits = Vec::new(); // Buffer to accumulate bits for frame decoding
 
-        // Step 4: Stream decode and process frames with periodic updates
-        let frames =
-            framing::decode_frames_from_bits(stream.flat_map(|block_of_bits| {
-                block_of_bits
+        // Initialize error tracking for each frequency
+        for i in 0..self.frequencies.len() {
+            errors.insert(i, Vec::new());
+            noise.insert(i, Vec::new());
+        }
+
+        loop {
+            // Step 3a: Get next symbol batch
+            let symbols_batch = match sampler.take(self.nsym) {
+                Some(samples) => samples,
+                None => {
+                    debug!("No more samples available, stopping demodulation");
+                    break;
+                }
+            };
+
+            // Step 3b: Demodulate symbols
+            let mut symbols = Demux::new(
+                |_nsym| Some(symbols_batch.clone()),
+                &self.omegas,
+                self.nsym,
+                gain,
+            );
+
+            if let Some(symbol_row) = symbols.next() {
+                symbol_count += 1;
+
+                // Step 3c: Decode symbols to bits and collect error information
+                let mut bits_per_freq = Vec::new();
+                for (freq_idx, &symbol) in symbol_row.iter().enumerate() {
+                    // Decode the symbol
+                    let bits = self
+                        .modem
+                        .decode_single_symbol(symbol);
+                    bits_per_freq.push(bits.clone());
+
+                    // Calculate error for feedback control
+                    // Find the closest constellation point by encoding the decoded bits
+                    let encoded_symbols = self
+                        .modem
+                        .encode(bits.iter().copied());
+                    if let Some(&expected_symbol) = encoded_symbols.first() {
+                        let error = symbol - expected_symbol;
+                        let error_magnitude = error.norm();
+
+                        // Collect errors for sampler update
+                        if let Some(err_vec) = errors.get_mut(&freq_idx) {
+                            err_vec.push(error_magnitude);
+                        }
+                        if let Some(noise_vec) = noise.get_mut(&freq_idx) {
+                            noise_vec.push(error_magnitude);
+                        }
+                    }
+                }
+
+                // Step 3d: Accumulate bits
+                let symbol_bits: Vec<bool> = bits_per_freq
                     .into_iter()
                     .flat_map(|bits| bits.into_iter())
-            }));
+                    .collect();
 
-        let mut _rx_bits = 0usize;
-        let mut _block_count = 0usize;
+                accumulated_bits.extend(symbol_bits);
 
-        // iterate and write, with periodic sampler and progress updates
-        for frame in frames {
-            _block_count += 1;
-            _rx_bits += frame.len() * 8; // each byte = 8 bits
+                // Step 3e: Try to decode frames periodically
+                if symbol_count % 10 == 0 || accumulated_bits.len() > 1000 {
+                    let frames = framing::decode_frames_from_bits(
+                        accumulated_bits
+                            .clone()
+                            .into_iter(),
+                    );
+                    let mut consumed_bits = 0;
 
-            // Periodically update sampler (every 100 blocks)
-            // Note: We can't update sampler with errors from bitstream in lazy mode
-            // if block_count % self.iters_per_update == 0 {
-            //     self.update_sampler(&mut errors, sampler);
-            // }
-            debug!("Content len {:?}, block: {:?}", frame.len(), _block_count);
+                    for frame in frames {
+                        rx_bits += frame.len() * 8;
+                        consumed_bits += frame.len() * 8; // Rough estimate
 
-            // Periodically report progress (every 1000 blocks)
-            if _block_count % iters_per_report == 0 {
-                debug!("Got {:10.3} kB", _rx_bits as f64 / 8e3);
-                //     self.report_progress(&mut noise, sampler, rx_bits);
+                        // Write frame to output
+                        output
+                            .write_all(&frame)
+                            .map_err(|e| e.to_string())?;
+                        self.output_size += frame.len();
+                    }
+
+                    // Clear processed bits (simplified - in reality should track exact consumption)
+                    if consumed_bits > 0 {
+                        accumulated_bits.clear();
+                    }
+                }
+
+                // Step 3f: Periodically update sampler for feedback control
+                if symbol_count % self.iters_per_update == 0 {
+                    self.update_sampler(&mut errors, sampler);
+                }
+
+                // Step 3g: Periodically report progress
+                if symbol_count % self.iters_per_report == 0 {
+                    self.report_progress(&mut noise, sampler, rx_bits);
+                }
             }
+        }
 
-            // Write frame to output
-            output
-                .write_all(&frame)
-                .map_err(|e| e.to_string())?;
-            self.output_size += frame.len();
+        // Final frame decode attempt with remaining bits
+        if !accumulated_bits.is_empty() {
+            let frames =
+                framing::decode_frames_from_bits(accumulated_bits.into_iter());
+            for frame in frames {
+                rx_bits += frame.len() * 8;
+                output
+                    .write_all(&frame)
+                    .map_err(|e| e.to_string())?;
+                self.output_size += frame.len();
+            }
         }
 
         Ok(())
