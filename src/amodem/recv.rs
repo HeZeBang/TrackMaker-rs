@@ -347,46 +347,33 @@ impl Receiver {
         info!("Coefficients plot saved to /tmp/coeffs.html");
     }
 
-    fn bitstream<S>(
-        &self,
-        symbols: &mut Demux<S>,
-    ) -> (
-        Box<dyn Iterator<Item = Vec<Vec<bool>>>>,
-        Vec<Vec<Complex64>>,
-    )
+    fn bitstream_streaming<S>(
+        mut symbols: Demux<S>,
+        modem: Modem,
+    ) -> impl Iterator<Item = Vec<Vec<bool>>>
     where
         S: FnMut(usize) -> Option<Vec<f64>>,
     {
-        let num_freqs = self.frequencies.len();
-        let mut symbol_list: Vec<Vec<Complex64>> = vec![Vec::new(); num_freqs];
+        // Create a streaming bitstream iterator
+        std::iter::from_fn(move || {
+            // Get next symbol row from Demux
+            if let Some(row) = symbols.next() {
+                let mut bits_per_freq = Vec::new();
 
-        // Collect all symbol rows first (similar to Python's generators)
-        while let Some(row) = symbols.next() {
-            for (freq_idx, &sym) in row.iter().enumerate() {
-                if freq_idx < symbol_list.len() {
-                    symbol_list[freq_idx].push(sym);
+                // For each frequency, decode the symbol to bits
+                for freq_idx in 0..row.len() {
+                    if let Some(&symbol) = row.get(freq_idx) {
+                        // Decode the symbol using the modem
+                        let bits = modem.decode_single_symbol(symbol);
+                        bits_per_freq.push(bits);
+                    }
                 }
+
+                Some(bits_per_freq)
+            } else {
+                None
             }
-        }
-
-        // Create iterators for each frequency
-        let mut streams: Vec<Box<dyn Iterator<Item = Vec<bool>>>> = Vec::new();
-
-        for freq_idx in 0..num_freqs {
-            let freq_symbols = symbol_list[freq_idx].clone();
-
-            // Decode bits for this frequency (without error handler for now)
-            let bits_iter = self
-                .modem
-                .decode(freq_symbols);
-
-            streams.push(Box::new(bits_iter.into_iter()));
-        }
-
-        // Create transposed iterator (zip streams)
-        let transposed_iter = BitstreamTransposer::new(streams);
-
-        (Box::new(transposed_iter), symbol_list)
+        })
     }
 
     fn update_sampler<I>(
@@ -507,9 +494,13 @@ impl Receiver {
         info!("Equalization filter trained");
 
         // Step 3: Demodulate - create a new Demux after training is complete
-        let mut symbols =
+        let symbols =
             Demux::new(|nsym| sampler.take(nsym), &self.omegas, self.nsym, gain);
-        let (stream, _symbol_list) = self.bitstream(&mut symbols);
+
+        // Clone necessary data to avoid borrowing issues
+        let iters_per_report = self.iters_per_report;
+        let modem = self.modem.clone();
+        let stream = Self::bitstream_streaming(symbols, modem);
 
         // Step 4: Stream decode and process frames with periodic updates
         let frames =
@@ -535,7 +526,7 @@ impl Receiver {
             debug!("Content len {:?}, block: {:?}", frame.len(), _block_count);
 
             // Periodically report progress (every 1000 blocks)
-            if _block_count % self.iters_per_report == 0 {
+            if _block_count % iters_per_report == 0 {
                 debug!("Got {:10.3} kB", _rx_bits as f64 / 8e3);
                 //     self.report_progress(&mut noise, sampler, rx_bits);
             }

@@ -200,6 +200,7 @@ pub fn linear_regression(x: &[f64], y: &[f64]) -> Option<(f64, f64)> {
     Some((a, b))
 }
 
+#[derive(Clone)]
 pub struct Modem {
     encode_map: HashMap<Vec<bool>, Complex64>,
     decode_list: Vec<(Complex64, Vec<bool>)>,
@@ -253,24 +254,27 @@ impl Modem {
         &self.symbols
     }
 
+    /// Decode a single symbol using maximum-likelihood nearest-neighbor
+    pub fn decode_single_symbol(&self, received: Complex64) -> Vec<bool> {
+        let mut min_error = f64::INFINITY;
+        let mut best_bits = Vec::new();
+
+        for (symbol, bits) in &self.decode_list {
+            let error = (received - *symbol).norm();
+            if error < min_error {
+                min_error = error;
+                best_bits = bits.clone();
+            }
+        }
+        best_bits
+    }
+
     /// Maximum-likelihood decoding using nearest-neighbor
     /// Returns decoded bits for each symbol
     pub fn decode(&self, symbols: Vec<Complex64>) -> Vec<Vec<bool>> {
         symbols
             .into_iter()
-            .map(|received| {
-                let mut min_error = f64::INFINITY;
-                let mut best_bits = Vec::new();
-
-                for (symbol, bits) in &self.decode_list {
-                    let error = (received - *symbol).norm();
-                    if error < min_error {
-                        min_error = error;
-                        best_bits = bits.clone();
-                    }
-                }
-                best_bits
-            })
+            .map(|received| self.decode_single_symbol(received))
             .collect()
     }
 

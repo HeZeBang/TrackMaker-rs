@@ -587,32 +587,128 @@ fn decode_amodem_signal_with_reed_solomon(
     let mut _receiver =
         Receiver::with_reed_solomon(config, use_reed_solomon, ecc_len);
 
-    // TODO: use real ring buffer
-    let rb = HeapRb::<f64>::new(samples.len());
-    let (mut prod, mut cons) = rb.split();
-    for &s in samples {
-        prod.try_push(s).unwrap();
-    }
+    // Create a ring buffer with enough capacity
+    let buffer_size = samples.len().max(8192); // At least 8KB buffer
+    let rb = HeapRb::<f64>::new(buffer_size);
+    let (prod, cons) = rb.split();
 
-    // TODO: skip start
-    // config.skip_start
+    // Shared result storage
+    let result = Arc::new(Mutex::new(None::<Result<Vec<u8>, String>>));
+    let result_clone = result.clone();
 
-    info!("Waiting for carrier tone: {:.1} kHz", config.fc / 1e3);
-    let (signal, amplitude, freq_error) = detector.run(cons.pop_iter())?;
+    // Thread 1: Producer - push samples to ring buffer
+    let samples_vec = samples.to_vec();
+    let producer_handle = thread::spawn(move || {
+        let mut producer = prod;
+        info!(
+            "Producer thread: Starting to push {} samples",
+            samples_vec.len()
+        );
 
-    let freq = 1.0 / (1.0 + freq_error);
-    debug!("Frequency correction: {:.3} ppm", (freq - 1.0) * 1e6);
+        for (i, &sample) in samples_vec.iter().enumerate() {
+            // Push sample to ring buffer, with some backpressure handling
+            while producer
+                .try_push(sample)
+                .is_err()
+            {
+                // Buffer is full, wait a bit
+                thread::sleep(Duration::from_micros(10));
+            }
 
-    let gain = 1.0 / amplitude;
-    debug!("Gain correction: {:.3}", gain);
+            // Log progress every 10000 samples
+            if i % 1000 == 0 {
+                info!("Producer: pushed {}/{} samples", i, samples_vec.len());
+            }
+            thread::sleep(Duration::from_micros(100));
+        }
 
-    // Stream directly without collecting to Vec
-    let mut _sampler = Sampler::new(signal, None, freq);
+        info!("Producer thread: Finished pushing all samples");
+    });
 
-    let mut output = Vec::new();
-    _receiver.run(&mut _sampler, gain, &mut output)?;
+    // Thread 2: Consumer - decode from ring buffer
+    let detector_clone = detector;
+    let mut receiver_clone = _receiver;
+    let config_clone = config.clone();
 
-    Ok(output)
+    let consumer_handle = thread::spawn(move || {
+        info!("Consumer thread: Starting decoding process");
+
+        // TODO: skip start
+        // config_clone.skip_start
+
+        info!("Waiting for carrier tone: {:.1} kHz", config_clone.fc / 1e3);
+
+        // Create an iterator from the ring buffer consumer
+        let signal_iter = std::iter::from_fn({
+            let mut consumer = cons;
+            move || {
+                // Try to pop from ring buffer, with timeout
+                let mut attempts = 0;
+                loop {
+                    if let Some(sample) = consumer.try_pop() {
+                        return Some(sample);
+                    }
+
+                    attempts += 1;
+                    if attempts > 1000 {
+                        // Timeout after many failed attempts
+                        debug!("Consumer: timeout waiting for samples");
+                        return None;
+                    }
+
+                    // Wait a bit before retrying
+                    thread::sleep(Duration::from_micros(100));
+                }
+            }
+        });
+
+        // Run detector
+        let decode_result = (|| -> Result<Vec<u8>, String> {
+            let (signal, amplitude, freq_error) =
+                detector_clone.run(signal_iter)?;
+
+            let freq = 1.0 / (1.0 + freq_error);
+            debug!("Frequency correction: {:.3} ppm", (freq - 1.0) * 1e6);
+
+            let gain = 1.0 / amplitude;
+            debug!("Gain correction: {:.3}", gain);
+
+            // Stream directly without collecting to Vec
+            let mut sampler = Sampler::new(signal, None, freq);
+
+            let mut output = Vec::new();
+            receiver_clone.run(&mut sampler, gain, &mut output)?;
+
+            Ok(output)
+        })();
+
+        info!("Consumer thread: Decoding completed");
+
+        // Store result
+        let mut result_guard = result_clone.lock().unwrap();
+        *result_guard = Some(decode_result);
+    });
+
+    // Wait for producer to finish
+    producer_handle
+        .join()
+        .map_err(|_| "Producer thread panicked".to_string())?;
+    info!("Producer thread joined successfully");
+
+    // Wait for consumer to finish
+    consumer_handle
+        .join()
+        .map_err(|_| "Consumer thread panicked".to_string())?;
+    info!("Consumer thread joined successfully");
+
+    // Get the result
+    let final_result = result
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or("No result from consumer thread".to_string())?;
+
+    final_result
 }
 
 fn generate_amodem_audio_with_reed_solomon(
