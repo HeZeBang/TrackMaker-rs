@@ -387,26 +387,30 @@ impl Receiver {
             return;
         }
 
-        let mut all_angles = Vec::new();
+        // Collect all phase errors (errors now contains phase angles directly)
+        let mut all_phase_errors = Vec::new();
         for vals in errors.values() {
-            for &v in vals {
-                if v > 1e-10 {
-                    let angle = v.atan2(0.0); // Extract phase
-                    all_angles.push(angle);
-                }
+            for &phase_error in vals {
+                all_phase_errors.push(phase_error);
             }
         }
 
-        if !all_angles.is_empty() {
-            let mean_angle =
-                all_angles.iter().sum::<f64>() / all_angles.len() as f64;
-            let err = mean_angle / (2.0 * std::f64::consts::PI);
+        if !all_phase_errors.is_empty() {
+            // Calculate mean phase error (like Python's np.mean(np.angle(err)))
+            let mean_phase_error = all_phase_errors
+                .iter()
+                .sum::<f64>()
+                / all_phase_errors.len() as f64;
+
+            // Convert to normalized error (like Python's err/(2*pi))
+            let err = mean_phase_error / (2.0 * std::f64::consts::PI);
 
             debug!(
-                "Sampler update: frequency offset = {:.6}, phase offset = {:.6}",
-                err, err
+                "Sampler update: mean_phase_error = {:.6} rad, normalized_err = {:.6}",
+                mean_phase_error, err
             );
 
+            // Apply corrections (same as Python: sampler.freq -= gain * err, sampler.offset -= err)
             sampler.adjust_frequency(-self.freq_err_gain * err);
             sampler.adjust_offset(-err);
         }
@@ -556,15 +560,24 @@ impl Receiver {
                         .modem
                         .encode(bits.iter().copied());
                     if let Some(&expected_symbol) = encoded_symbols.first() {
-                        let error = symbol - expected_symbol;
-                        let error_magnitude = error.norm();
+                        // Python uses: errors.append(received / decoded)
+                        // This preserves phase information for frequency/phase error calculation
+                        let error_ratio = if expected_symbol.norm() > 1e-10 {
+                            symbol / expected_symbol // Complex division preserves phase
+                        } else {
+                            Complex64::new(1.0, 0.0) // Default to no error
+                        };
 
-                        // Collect errors for sampler update
+                        let error_diff = symbol - expected_symbol; // For noise estimation
+
+                        // Collect errors for sampler update (store complex ratio)
                         if let Some(err_vec) = errors.get_mut(&freq_idx) {
-                            err_vec.push(error_magnitude);
+                            // Store the argument (phase) of the complex ratio
+                            err_vec.push(error_ratio.arg());
                         }
                         if let Some(noise_vec) = noise.get_mut(&freq_idx) {
-                            noise_vec.push(error_magnitude);
+                            // Store magnitude of difference for noise estimation
+                            noise_vec.push(error_diff.norm());
                         }
                     }
                 }
