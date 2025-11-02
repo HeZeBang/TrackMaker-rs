@@ -12,6 +12,39 @@ use std::collections::HashMap;
 use std::io::Write;
 use tracing::{debug, info, warn};
 
+/// Iterator that transposes multiple bit streams (similar to Python's zip(*streams))
+struct BitstreamTransposer {
+    streams: Vec<Box<dyn Iterator<Item = Vec<bool>>>>,
+}
+
+impl BitstreamTransposer {
+    fn new(streams: Vec<Box<dyn Iterator<Item = Vec<bool>>>>) -> Self {
+        Self { streams }
+    }
+}
+
+impl Iterator for BitstreamTransposer {
+    type Item = Vec<Vec<bool>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut result = Vec::new();
+        let mut any_has_data = false;
+
+        for stream in &mut self.streams {
+            if let Some(bits) = stream.next() {
+                result.push(bits);
+                any_has_data = true;
+            } else {
+                // If one stream is exhausted, we could either stop or pad with empty
+                // For now, let's stop when any stream is exhausted
+                return None;
+            }
+        }
+
+        if any_has_data { Some(result) } else { None }
+    }
+}
+
 pub struct Receiver {
     modem: Modem,
     frequencies: Vec<f64>,
@@ -314,127 +347,46 @@ impl Receiver {
         info!("Coefficients plot saved to /tmp/coeffs.html");
     }
 
-    fn bitstream<F>(
-        &self,
-        symbols: Vec<Vec<Complex64>>,
-        mut error_handler: F,
-    ) -> (Vec<Vec<Vec<bool>>>, Vec<Vec<Complex64>>)
-    where
-        F: FnMut(Complex64, Complex64, usize),
-    {
-        let mut streams = Vec::new();
-        let mut symbol_list = Vec::new();
-        let num_freqs = self.frequencies.len();
-
-        // Split symbols into streams, one per frequency
-        // symbols is a Vec of rows, each row has num_freqs symbols
-        for freq_idx in 0..num_freqs {
-            let mut equalized = Vec::new();
-
-            // Extract symbols for this frequency
-            for row in &symbols {
-                if let Some(&sym) = row.get(freq_idx) {
-                    equalized.push(sym);
-                }
-            }
-
-            let freq_equalized = equalized.clone();
-
-            // Decode bits for this frequency using modem decoder with error tracking
-            let bits = self
-                .modem
-                .decode_with_error_handler(equalized, |received, decoded| {
-                    error_handler(received, decoded, freq_idx);
-                });
-
-            symbol_list.push(freq_equalized);
-            streams.push(bits);
-        }
-
-        // Transpose streams: from [freq][symbol_idx] to [symbol_idx][freq]
-        // Each element in streams[freq] is a Vec<bool> (bits for one symbol)
-        let max_symbols = streams
-            .iter()
-            .map(|s| s.len())
-            .max()
-            .unwrap_or(0);
-        let mut transposed: Vec<Vec<Vec<bool>>> = vec![Vec::new(); max_symbols];
-
-        for symbol_idx in 0..max_symbols {
-            for freq_idx in 0..num_freqs {
-                if let Some(bits_per_freq) = streams.get(freq_idx) {
-                    if let Some(bits) = bits_per_freq.get(symbol_idx) {
-                        transposed[symbol_idx].push(bits.clone());
-                    }
-                }
-            }
-        }
-
-        (transposed, symbol_list)
-    }
-
-    fn demodulate<S>(
+    fn bitstream<S>(
         &self,
         symbols: &mut Demux<S>,
-    ) -> Result<
-        (
-            Vec<bool>,
-            HashMap<usize, Vec<f64>>,
-            HashMap<usize, Vec<f64>>,
-        ),
-        String,
-    >
+    ) -> (
+        Box<dyn Iterator<Item = Vec<Vec<bool>>>>,
+        Vec<Vec<Complex64>>,
+    )
     where
         S: FnMut(usize) -> Option<Vec<f64>>,
     {
-        let mut errors: HashMap<usize, Vec<f64>> = HashMap::new();
-        let mut noise: HashMap<usize, Vec<f64>> = HashMap::new();
+        let num_freqs = self.frequencies.len();
+        let mut symbol_list: Vec<Vec<Complex64>> = vec![Vec::new(); num_freqs];
 
-        // Collect all symbol rows
-        let mut symbol_rows = Vec::new();
+        // Collect all symbol rows first (similar to Python's generators)
         while let Some(row) = symbols.next() {
-            symbol_rows.push(row);
-        }
-
-        if symbol_rows.is_empty() {
-            return Err("No symbols received for demodulation".to_string());
-        }
-
-        // Define error handler
-        let error_handler =
-            |received: Complex64, decoded: Complex64, freq: usize| {
-                let ratio = if decoded.norm() > 1e-10 {
-                    received.norm() / decoded.norm()
-                } else {
-                    0.0
-                };
-                errors
-                    .entry(freq)
-                    .or_insert_with(Vec::new)
-                    .push(ratio);
-
-                let noise_val = (received - decoded).norm();
-                noise
-                    .entry(freq)
-                    .or_insert_with(Vec::new)
-                    .push(noise_val);
-            };
-
-        // Demodulate using bitstream
-        let (bitstream, _symbol_list) =
-            self.bitstream(symbol_rows, error_handler);
-
-        info!("Starting demodulation");
-        let mut result_bits = Vec::new();
-
-        for block_of_bits in bitstream.into_iter() {
-            // Flatten the block_of_bits (Vec<Vec<bool>>) into a single Vec<bool>
-            for bits_tuple in block_of_bits {
-                result_bits.extend(bits_tuple);
+            for (freq_idx, &sym) in row.iter().enumerate() {
+                if freq_idx < symbol_list.len() {
+                    symbol_list[freq_idx].push(sym);
+                }
             }
         }
 
-        Ok((result_bits, errors, noise))
+        // Create iterators for each frequency
+        let mut streams: Vec<Box<dyn Iterator<Item = Vec<bool>>>> = Vec::new();
+
+        for freq_idx in 0..num_freqs {
+            let freq_symbols = symbol_list[freq_idx].clone();
+
+            // Decode bits for this frequency (without error handler for now)
+            let bits_iter = self
+                .modem
+                .decode(freq_symbols);
+
+            streams.push(Box::new(bits_iter.into_iter()));
+        }
+
+        // Create transposed iterator (zip streams)
+        let transposed_iter = BitstreamTransposer::new(streams);
+
+        (Box::new(transposed_iter), symbol_list)
     }
 
     fn update_sampler<I>(
@@ -557,31 +509,42 @@ impl Receiver {
         // Step 3: Demodulate - create a new Demux after training is complete
         let mut symbols =
             Demux::new(|nsym| sampler.take(nsym), &self.omegas, self.nsym, gain);
-        let (all_bits, mut errors, mut noise) = self.demodulate(&mut symbols)?;
+        let (stream, _symbol_list) = self.bitstream(&mut symbols);
 
-        // Step 4: Stream decode and process frames with sampler updates
-        let mut rx_bits = 0usize;
-        let mut block_count = 0usize;
+        // Step 4: Stream decode and process frames with periodic updates
+        let frames =
+            framing::decode_frames_from_bits(stream.flat_map(|block_of_bits| {
+                block_of_bits
+                    .into_iter()
+                    .flat_map(|bits| bits.into_iter())
+            }));
 
-        let frames = framing::decode_frames_from_bits(all_bits.into_iter());
+        let mut _rx_bits = 0usize;
+        let mut _block_count = 0usize;
+
+        // iterate and write, with periodic sampler and progress updates
         for frame in frames {
-            block_count += 1;
-            rx_bits += frame.len() * 8; // frame is bytes, convert to bits
+            _block_count += 1;
+            _rx_bits += frame.len() * 8; // each byte = 8 bits
 
+            // Periodically update sampler (every 100 blocks)
+            // Note: We can't update sampler with errors from bitstream in lazy mode
+            // if block_count % self.iters_per_update == 0 {
+            //     self.update_sampler(&mut errors, sampler);
+            // }
+            debug!("Content len {:?}, block: {:?}", frame.len(), _block_count);
+
+            // Periodically report progress (every 1000 blocks)
+            if _block_count % self.iters_per_report == 0 {
+                debug!("Got {:10.3} kB", _rx_bits as f64 / 8e3);
+                //     self.report_progress(&mut noise, sampler, rx_bits);
+            }
+
+            // Write frame to output
             output
                 .write_all(&frame)
-                .map_err(|e| format!("Output write error: {}", e))?;
+                .map_err(|e| e.to_string())?;
             self.output_size += frame.len();
-
-            // Update sampler periodically (errors accumulate during demodulation)
-            if block_count % self.iters_per_update == 0 {
-                self.update_sampler(&mut errors, sampler);
-            }
-
-            // Report progress periodically (noise accumulates during demodulation)
-            if block_count % self.iters_per_report == 0 {
-                self.report_progress(&mut noise, sampler, rx_bits);
-            }
         }
 
         Ok(())

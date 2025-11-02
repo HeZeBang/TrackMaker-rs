@@ -67,7 +67,6 @@ impl<S: FnMut(usize) -> Option<Vec<f64>>> Demux<S> {
         }
     }
 
-    #[allow(dead_code)]
     pub fn filters(&self) -> &[Vec<Complex64>] {
         &self.filters
     }
@@ -108,7 +107,6 @@ pub fn exp_iwt(omega: f64, n: usize) -> Vec<Complex64> {
         .collect()
 }
 
-#[allow(dead_code)]
 pub fn norm(x: &[Complex64]) -> f64 {
     x.iter()
         .map(|v| v.norm_sqr())
@@ -159,7 +157,6 @@ pub fn rms_2d(x: &[Vec<Complex64>]) -> Vec<f64> {
     result
 }
 
-#[allow(dead_code)]
 pub fn coherence(x: &[f64], omega: f64) -> Complex64 {
     let n = x.len();
     if n == 0 {
@@ -181,7 +178,6 @@ pub fn coherence(x: &[f64], omega: f64) -> Complex64 {
         / norm_x
 }
 
-#[allow(dead_code)]
 pub fn linear_regression(x: &[f64], y: &[f64]) -> Option<(f64, f64)> {
     if x.len() != y.len() || x.is_empty() {
         return None;
@@ -207,7 +203,7 @@ pub fn linear_regression(x: &[f64], y: &[f64]) -> Option<(f64, f64)> {
 pub struct Modem {
     encode_map: HashMap<Vec<bool>, Complex64>,
     decode_list: Vec<(Complex64, Vec<bool>)>,
-    #[allow(dead_code)]
+
     symbols: Vec<Complex64>,
     bits_per_symbol: usize,
 }
@@ -253,7 +249,6 @@ impl Modem {
         self.bits_per_symbol
     }
 
-    #[allow(dead_code)]
     pub fn symbols(&self) -> &[Complex64] {
         &self.symbols
     }
@@ -352,7 +347,6 @@ impl Iterator for Prbs {
     }
 }
 
-#[allow(dead_code)]
 pub fn prbs(reg: u32, poly: u32, bits: usize) -> Prbs {
     Prbs::new(reg, poly, bits)
 }

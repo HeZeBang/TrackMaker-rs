@@ -609,8 +609,8 @@ fn decode_amodem_signal_with_reed_solomon(
     // Stream directly without collecting to Vec
     let mut _sampler = Sampler::new(signal, None, freq);
 
-    let output = Vec::new();
-    _receiver.run(&mut _sampler, gain, Vec::new())?;
+    let mut output = Vec::new();
+    _receiver.run(&mut _sampler, gain, &mut output)?;
 
     Ok(output)
 }

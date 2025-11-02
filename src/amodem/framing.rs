@@ -177,17 +177,7 @@ fn decode_frames_from_bits_with_params<I: Iterator<Item = bool>>(
     use_reed_solomon: bool,
     ecc_len: usize,
 ) -> impl Iterator<Item = Vec<u8>> {
-    let bytes_vec: Vec<u8> = bits_to_bytes(bits).collect();
-    debug!(
-        "Frame Preview Hex: {}",
-        bytes_vec
-            .iter()
-            .take(16)
-            .map(|b| format!("{:b}", b))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    let mut bytes = bytes_vec.into_iter();
+    let mut bytes = bits_to_bytes(bits);
     std::iter::from_fn(move || {
         // 读取长度
         let len = bytes.next()? as usize;
