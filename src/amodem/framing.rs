@@ -1,7 +1,15 @@
 use crc32fast::Hasher;
 use reed_solomon::Encoder;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, warn};
-use tracing_subscriber::field::debug;
+
+// Global EOF detection flag to prevent repeated warnings
+static EOF_DETECTED: AtomicBool = AtomicBool::new(false);
+
+/// Reset EOF detection state (call at start of each decoding session)
+pub fn reset_eof_detection() {
+    EOF_DETECTED.store(false, Ordering::Relaxed);
+}
 
 pub struct Checksum;
 
@@ -234,7 +242,11 @@ fn decode_frames_from_bits_with_params<I: Iterator<Item = bool>>(
 
         // EOF After ECC
         if payload.is_empty() {
-            warn!("Detected EOF : no payload");
+            // Only warn once about EOF detection
+            if !EOF_DETECTED.load(Ordering::Relaxed) {
+                warn!("Detected EOF : no payload");
+                EOF_DETECTED.store(true, Ordering::Relaxed);
+            }
             return None;
         }
 

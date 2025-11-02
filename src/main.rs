@@ -616,8 +616,8 @@ fn decode_amodem_signal_with_reed_solomon(
             }
 
             // Log progress every 10000 samples
-            if i % 1000 == 0 {
-                info!("Producer: pushed {}/{} samples", i, samples_vec.len());
+            if i % 10000 == 0 {
+                debug!("Producer: pushed {}/{} samples", i, samples_vec.len());
             }
             thread::sleep(Duration::from_micros(100));
         }
@@ -721,7 +721,7 @@ fn generate_amodem_audio_with_reed_solomon(
 
     send::send_with_reed_solomon(
         config,
-        &data[..],
+        std::io::Cursor::new(data),
         &mut output,
         1.0,
         0.0,

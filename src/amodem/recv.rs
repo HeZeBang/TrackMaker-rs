@@ -454,7 +454,7 @@ impl Receiver {
 
             let freq_drift_ppm = (1.0 - sampler.get_frequency()) * 1e6;
 
-            debug!(
+            info!(
                 "Got {:10.3} kB, SNR: {:5.2} dB, drift: {:+5.2} ppm",
                 rx_bits as f64 / 8e3,
                 snr_db,
@@ -512,11 +512,15 @@ impl Receiver {
         I: Iterator<Item = f64>,
         W: Write,
     {
+        // Reset EOF detection state for this session
+        crate::amodem::framing::reset_eof_detection();
+
         let mut rx_bits = 0usize;
         let mut symbol_count = 0usize;
         let mut errors: HashMap<usize, Vec<f64>> = HashMap::new();
         let mut noise: HashMap<usize, Vec<f64>> = HashMap::new();
         let mut accumulated_bits = Vec::new(); // Buffer to accumulate bits for frame decoding
+        let mut eof_detected = false; // Flag to track if EOF has been detected
 
         // Initialize error tracking for each frequency
         for i in 0..self.frequencies.len() {
@@ -590,16 +594,20 @@ impl Receiver {
 
                 accumulated_bits.extend(symbol_bits);
 
-                // Step 3e: Try to decode frames periodically
-                if symbol_count % 10 == 0 || accumulated_bits.len() > 1000 {
+                // Step 3e: Try to decode frames periodically, but stop if EOF is detected
+                if !eof_detected
+                    && (symbol_count % 10 == 0 || accumulated_bits.len() > 1000)
+                {
                     let frames = framing::decode_frames_from_bits(
                         accumulated_bits
                             .clone()
                             .into_iter(),
                     );
                     let mut consumed_bits = 0;
+                    let mut frame_count = 0;
 
                     for frame in frames {
+                        frame_count += 1;
                         rx_bits += frame.len() * 8;
                         consumed_bits += frame.len() * 8; // Rough estimate
 
@@ -613,6 +621,15 @@ impl Receiver {
                     // Clear processed bits (simplified - in reality should track exact consumption)
                     if consumed_bits > 0 {
                         accumulated_bits.clear();
+                    }
+
+                    // If we got some frames but they stopped, it might indicate EOF
+                    if frame_count > 0 && consumed_bits == 0 {
+                        eof_detected = true;
+                        debug!(
+                            "EOF detected during frame decoding, stopping further attempts"
+                        );
+                        break;
                     }
                 }
 
