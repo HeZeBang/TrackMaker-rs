@@ -30,14 +30,14 @@ pub const BIT_RATE: u32 = 12000;
 pub const SAMPLES_PER_BIT: usize = 4;  // 48000 / 12000 = 4
 
 /// Samples per Manchester level (half of samples per bit)
-pub const SAMPLES_PER_LEVEL: usize = 2;  // Manchester: 2 levels per bit
+pub const SAMPLES_PER_LEVEL: usize = 4;  // Manchester: 4 levels per bit
 
 // Frame Parameters
 /// Number of 0xAA pattern bytes in preamble
 pub const PREAMBLE_PATTERN_BYTES: usize = 4;
 
 /// Maximum data payload per frame (bytes)
-pub const MAX_FRAME_DATA_SIZE: usize = 1024;
+pub const MAX_FRAME_DATA_SIZE: usize = 64;
 
 /// Milliseconds between frames
 pub const INTER_FRAME_GAP_MS: u32 = 5;

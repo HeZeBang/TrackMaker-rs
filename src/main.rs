@@ -130,7 +130,8 @@ fn run_sender(
     // Split data into frames
     let mut frames = Vec::new();
     let mut seq = 0u8;
-    
+
+    info!("Splitting data into frames (max {} bytes each)", MAX_FRAME_DATA_SIZE);
     for chunk in file_data.chunks(MAX_FRAME_DATA_SIZE) {
         let frame = Frame::new_data(seq, chunk.to_vec());
         frames.push(frame);
@@ -146,6 +147,18 @@ fn run_sender(
     info!("Encoded to {} samples ({:.2} seconds)", 
           output_track_len, 
           output_track_len as f32 / sample_rate as f32);
+
+    // Save encoded signal to WAV
+    if let Err(e) = utils::dump::dump_to_wav("./tmp/sender_output.wav", &utils::dump::AudioData {
+        sample_rate,
+        audio_data: output_track.clone(),
+        duration: output_track_len as f32 / sample_rate as f32,
+        channels: 1,
+    }) {
+        tracing::warn!("Failed to save sender WAV: {}", e);
+    } else {
+        info!("Saved sender signal to ./tmp/sender_output.wav");
+    }
 
     // Calculate theoretical transmission time
     let total_bits = file_data.len() * 8;
@@ -233,6 +246,19 @@ fn run_receiver(
     };
 
     info!("Recorded {} samples", rx_samples.len());
+
+    // Save recorded signal to WAV
+    let sample_rate = SAMPLE_RATE; // Use constant from consts
+    if let Err(e) = utils::dump::dump_to_wav("./tmp/receiver_input.wav", &utils::dump::AudioData {
+        sample_rate,
+        audio_data: rx_samples.clone(),
+        duration: rx_samples.len() as f32 / sample_rate as f32,
+        channels: 1,
+    }) {
+        tracing::warn!("Failed to save receiver WAV: {}", e);
+    } else {
+        info!("Saved received signal to ./tmp/receiver_input.wav");
+    }
 
     // Create decoder and process
     let mut decoder = PhyDecoder::new(SAMPLES_PER_LEVEL, PREAMBLE_PATTERN_BYTES);
