@@ -89,7 +89,7 @@ pub fn generate_preamble(samples_per_level: usize, pattern_bytes: usize) -> Vec<
     // Use alternating pattern: 0xAA = 10101010
     let mut bits = Vec::new();
     for _ in 0..pattern_bytes {
-        bits.extend_from_slice(&[1, 0, 1, 0, 1, 0, 1, 0]);
+        bits.extend_from_slice(&[1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1]);
     }
     
     encoder.encode(&bits)
