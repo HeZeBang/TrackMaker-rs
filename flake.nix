@@ -29,6 +29,7 @@
           buildInputs = [
             openssl
             pkg-config
+            jack2
             (rust-bin.beta.latest.default.override { extensions = [ "rust-src" ]; })
           ];
 
