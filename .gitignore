@@ -176,3 +176,5 @@ vite.config.ts.timestamp-*
 
 # Temp data
 tmp
+
+.direnv
