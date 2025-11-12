@@ -1,22 +1,22 @@
-use dialoguer::{theme::ColorfulTheme, Select};
+use dialoguer::{Select, theme::ColorfulTheme};
 use jack;
 use std::fs;
 use tracing::info;
 
 mod audio;
 mod device;
+mod phy;
 mod ui;
 mod utils;
-mod phy;
 
 use audio::recorder;
-use device::jack::{print_jack_info, connect_system_ports};
+use device::jack::{connect_system_ports, print_jack_info};
 use ui::print_banner;
 use ui::progress::{ProgressManager, templates};
 use utils::consts::*;
 use utils::logging::init_logging;
 
-use phy::{PhyEncoder, PhyDecoder, Frame};
+use phy::{Frame, PhyDecoder, PhyEncoder};
 
 fn main() {
     init_logging();
@@ -29,13 +29,17 @@ fn main() {
     .unwrap();
     tracing::info!("JACK client status: {:?}", status);
     let (sample_rate, _buffer_size) = print_jack_info(&client);
-    
+
     if sample_rate as u32 != SAMPLE_RATE {
-        tracing::warn!("Sample rate mismatch! Expected {}, got {}", SAMPLE_RATE, sample_rate);
+        tracing::warn!(
+            "Sample rate mismatch! Expected {}, got {}",
+            SAMPLE_RATE,
+            sample_rate
+        );
         tracing::warn!("Physical layer is designed for {} Hz", SAMPLE_RATE);
     }
 
-    let max_duration_samples = sample_rate * 30;  // 30 seconds max
+    let max_duration_samples = sample_rate * 30; // 30 seconds max
 
     // Shared State
     let shared = recorder::AppShared::new(max_duration_samples);
@@ -60,7 +64,9 @@ fn main() {
     );
     let process = jack::contrib::ClosureProcessHandler::new(process_cb);
 
-    let active_client = client.activate_async((), process).unwrap();
+    let active_client = client
+        .activate_async((), process)
+        .unwrap();
 
     let progress_manager = ProgressManager::new();
 
@@ -70,11 +76,7 @@ fn main() {
         out_port_name.as_str(),
     );
 
-    let selections = &[
-        "Send File", 
-        "Receive File", 
-        "Test (No JACK - Loopback)"
-    ];
+    let selections = &["Send File", "Receive File", "Test (No JACK - Loopback)"];
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Select mode")
         .default(0)
@@ -83,7 +85,11 @@ fn main() {
         .unwrap();
 
     {
-        shared.record_buffer.lock().unwrap().clear();
+        shared
+            .record_buffer
+            .lock()
+            .unwrap()
+            .clear();
     }
 
     if selection == 0 {
@@ -110,7 +116,7 @@ fn run_sender(
     sample_rate: u32,
 ) {
     info!("=== Sender Mode ===");
-    
+
     // Read input file
     let input_path = "INPUT.bin";
     let file_data = match fs::read(input_path) {
@@ -131,30 +137,42 @@ fn run_sender(
     let mut frames = Vec::new();
     let mut seq = 0u8;
 
-    info!("Splitting data into frames (max {} bytes each)", MAX_FRAME_DATA_SIZE);
+    info!(
+        "Splitting data into frames (max {} bytes each)",
+        MAX_FRAME_DATA_SIZE
+    );
     for chunk in file_data.chunks(MAX_FRAME_DATA_SIZE) {
         let frame = Frame::new_data(seq, chunk.to_vec());
         frames.push(frame);
         seq = seq.wrapping_add(1);
     }
 
-    info!("Created {} frames from {} bytes", frames.len(), file_data.len());
+    info!(
+        "Created {} frames from {} bytes",
+        frames.len(),
+        file_data.len()
+    );
 
     // Encode frames to audio samples
     let output_track = encoder.encode_frames(&frames, INTER_FRAME_GAP_SAMPLES);
     let output_track_len = output_track.len();
 
-    info!("Encoded to {} samples ({:.2} seconds)", 
-          output_track_len, 
-          output_track_len as f32 / sample_rate as f32);
+    info!(
+        "Encoded to {} samples ({:.2} seconds)",
+        output_track_len,
+        output_track_len as f32 / sample_rate as f32
+    );
 
     // Save encoded signal to WAV
-    if let Err(e) = utils::dump::dump_to_wav("./tmp/sender_output.wav", &utils::dump::AudioData {
-        sample_rate,
-        audio_data: output_track.clone(),
-        duration: output_track_len as f32 / sample_rate as f32,
-        channels: 1,
-    }) {
+    if let Err(e) = utils::dump::dump_to_wav(
+        "./tmp/sender_output.wav",
+        &utils::dump::AudioData {
+            sample_rate,
+            audio_data: output_track.clone(),
+            duration: output_track_len as f32 / sample_rate as f32,
+            channels: 1,
+        },
+    ) {
         tracing::warn!("Failed to save sender WAV: {}", e);
     } else {
         info!("Saved sender signal to ./tmp/sender_output.wav");
@@ -163,11 +181,16 @@ fn run_sender(
     // Calculate theoretical transmission time
     let total_bits = file_data.len() * 8;
     let theoretical_time = total_bits as f32 / BIT_RATE as f32;
-    info!("Theoretical transmission time: {:.2} seconds (at {} bps)", 
-          theoretical_time, BIT_RATE);
+    info!(
+        "Theoretical transmission time: {:.2} seconds (at {} bps)",
+        theoretical_time, BIT_RATE
+    );
 
     {
-        let mut playback = shared.playback_buffer.lock().unwrap();
+        let mut playback = shared
+            .playback_buffer
+            .lock()
+            .unwrap();
         playback.extend(output_track);
     }
 
@@ -180,7 +203,10 @@ fn run_sender(
         )
         .unwrap();
 
-    *shared.app_state.lock().unwrap() = recorder::AppState::Playing;
+    *shared
+        .app_state
+        .lock()
+        .unwrap() = recorder::AppState::Playing;
 
     let start_time = std::time::Instant::now();
 
@@ -189,14 +215,22 @@ fn run_sender(
 
         ui::update_progress(&shared, output_track_len, &progress_manager);
 
-        let state = { shared.app_state.lock().unwrap().clone() };
+        let state = {
+            shared
+                .app_state
+                .lock()
+                .unwrap()
+                .clone()
+        };
         if let recorder::AppState::Idle = state {
             progress_manager.finish_all();
             break;
         }
     }
 
-    let elapsed = start_time.elapsed().as_secs_f32();
+    let elapsed = start_time
+        .elapsed()
+        .as_secs_f32();
     info!("Transmission completed in {:.2} seconds", elapsed);
 }
 
@@ -216,7 +250,10 @@ fn run_receiver(
         )
         .unwrap();
 
-    *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
+    *shared
+        .app_state
+        .lock()
+        .unwrap() = recorder::AppState::Recording;
 
     let start_time = std::time::Instant::now();
 
@@ -229,32 +266,49 @@ fn run_receiver(
             &progress_manager,
         );
 
-        let state = { shared.app_state.lock().unwrap().clone() };
+        let state = {
+            shared
+                .app_state
+                .lock()
+                .unwrap()
+                .clone()
+        };
         if let recorder::AppState::Idle = state {
             progress_manager.finish_all();
             break;
         }
     }
 
-    let elapsed = start_time.elapsed().as_secs_f32();
+    let elapsed = start_time
+        .elapsed()
+        .as_secs_f32();
     info!("Recording completed in {:.2} seconds", elapsed);
 
     // Get recorded samples
     let rx_samples: Vec<f32> = {
-        let record = shared.record_buffer.lock().unwrap();
-        record.iter().copied().collect()
+        let record = shared
+            .record_buffer
+            .lock()
+            .unwrap();
+        record
+            .iter()
+            .copied()
+            .collect()
     };
 
     info!("Recorded {} samples", rx_samples.len());
 
     // Save recorded signal to WAV
     let sample_rate = SAMPLE_RATE; // Use constant from consts
-    if let Err(e) = utils::dump::dump_to_wav("./tmp/receiver_input.wav", &utils::dump::AudioData {
-        sample_rate,
-        audio_data: rx_samples.clone(),
-        duration: rx_samples.len() as f32 / sample_rate as f32,
-        channels: 1,
-    }) {
+    if let Err(e) = utils::dump::dump_to_wav(
+        "./tmp/receiver_input.wav",
+        &utils::dump::AudioData {
+            sample_rate,
+            audio_data: rx_samples.clone(),
+            duration: rx_samples.len() as f32 / sample_rate as f32,
+            channels: 1,
+        },
+    ) {
         tracing::warn!("Failed to save receiver WAV: {}", e);
     } else {
         info!("Saved received signal to ./tmp/receiver_input.wav");
@@ -273,8 +327,11 @@ fn run_receiver(
 
     for frame in frames {
         if frame.sequence != expected_seq {
-            tracing::warn!("Frame sequence mismatch: expected {}, got {}", 
-                          expected_seq, frame.sequence);
+            tracing::warn!(
+                "Frame sequence mismatch: expected {}, got {}",
+                expected_seq,
+                frame.sequence
+            );
             frame_errors += 1;
         }
         output_data.extend_from_slice(&frame.data);
@@ -282,7 +339,7 @@ fn run_receiver(
     }
 
     info!("Reconstructed {} bytes", output_data.len());
-    
+
     if frame_errors > 0 {
         tracing::warn!("⚠️  {} frame sequence errors detected", frame_errors);
     }
@@ -310,7 +367,7 @@ fn test_transmission() {
     // Create frames
     let mut frames = Vec::new();
     let mut seq = 0u8;
-    
+
     for chunk in test_data.chunks(MAX_FRAME_DATA_SIZE) {
         let frame = Frame::new_data(seq, chunk.to_vec());
         frames.push(frame);
@@ -321,18 +378,23 @@ fn test_transmission() {
 
     // Encode
     let samples = encoder.encode_frames(&frames, INTER_FRAME_GAP_SAMPLES);
-    info!("Encoded to {} samples ({:.2} seconds at {} Hz)", 
-          samples.len(), 
-          samples.len() as f32 / SAMPLE_RATE as f32,
-          SAMPLE_RATE);
+    info!(
+        "Encoded to {} samples ({:.2} seconds at {} Hz)",
+        samples.len(),
+        samples.len() as f32 / SAMPLE_RATE as f32,
+        SAMPLE_RATE
+    );
 
     // Save to WAV for inspection
-    if let Err(e) = utils::dump::dump_to_wav("./tmp/project2_test.wav", &utils::dump::AudioData {
-        sample_rate: SAMPLE_RATE,
-        audio_data: samples.clone(),
-        duration: samples.len() as f32 / SAMPLE_RATE as f32,
-        channels: 1,
-    }) {
+    if let Err(e) = utils::dump::dump_to_wav(
+        "./tmp/project2_test.wav",
+        &utils::dump::AudioData {
+            sample_rate: SAMPLE_RATE,
+            audio_data: samples.clone(),
+            duration: samples.len() as f32 / SAMPLE_RATE as f32,
+            channels: 1,
+        },
+    ) {
         tracing::warn!("Failed to save WAV: {}", e);
     } else {
         info!("Saved test signal to ./tmp/project2_test.wav");
@@ -355,12 +417,21 @@ fn test_transmission() {
         tracing::error!("❌ Test FAILED - Data mismatch");
         info!("Original: {} bytes", test_data.len());
         info!("Decoded:  {} bytes", decoded_data.len());
-        
+
         // Find first difference
-        for i in 0..test_data.len().min(decoded_data.len()) {
+        for i in 0..test_data
+            .len()
+            .min(decoded_data.len())
+        {
             if test_data[i] != decoded_data[i] {
-                info!("First difference at byte {}: expected {:#04x}, got {:#04x}", 
-                      i, test_data[i], decoded_data.get(i).unwrap_or(&0));
+                info!(
+                    "First difference at byte {}: expected {:#04x}, got {:#04x}",
+                    i,
+                    test_data[i],
+                    decoded_data
+                        .get(i)
+                        .unwrap_or(&0)
+                );
                 break;
             }
         }
@@ -370,11 +441,13 @@ fn test_transmission() {
     let total_bits = test_data.len() * 8;
     let duration_s = samples.len() as f32 / SAMPLE_RATE as f32;
     let effective_bitrate = total_bits as f32 / duration_s;
-    
+
     info!("Performance:");
     info!("  - Total bits: {}", total_bits);
     info!("  - Duration: {:.3} seconds", duration_s);
     info!("  - Effective bit rate: {:.0} bps", effective_bitrate);
-    info!("  - Overhead: {:.1}%", 
-          (1.0 - effective_bitrate / BIT_RATE as f32) * 100.0);
+    info!(
+        "  - Overhead: {:.1}%",
+        (1.0 - effective_bitrate / BIT_RATE as f32) * 100.0
+    );
 }

@@ -1,6 +1,6 @@
 // Manchester encoding: 0 -> [1, -1], 1 -> [-1, 1]
 pub struct ManchesterEncoder {
-    samples_per_level: usize,  // Samples per level (not per bit)
+    samples_per_level: usize, // Samples per level (not per bit)
 }
 
 impl ManchesterEncoder {
@@ -10,8 +10,9 @@ impl ManchesterEncoder {
 
     /// slice of bits -> Manchester-encoded audio samples
     pub fn encode(&self, bits: &[u8]) -> Vec<f32> {
-        let mut samples = Vec::with_capacity(bits.len() * 2 * self.samples_per_level);
-        
+        let mut samples =
+            Vec::with_capacity(bits.len() * 2 * self.samples_per_level);
+
         for &bit in bits {
             if bit == 0 {
                 // 0 -> high then low
@@ -23,7 +24,7 @@ impl ManchesterEncoder {
                 samples.extend(vec![1.0; self.samples_per_level]);
             }
         }
-        
+
         samples
     }
 
@@ -60,8 +61,14 @@ impl ManchesterDecoder {
             let end = start + samples_per_bit;
 
             // Calculate average of first half and second half
-            let first_half: f32 = samples[start..mid].iter().sum::<f32>() / self.samples_per_level as f32;
-            let second_half: f32 = samples[mid..end].iter().sum::<f32>() / self.samples_per_level as f32;
+            let first_half: f32 = samples[start..mid]
+                .iter()
+                .sum::<f32>()
+                / self.samples_per_level as f32;
+            let second_half: f32 = samples[mid..end]
+                .iter()
+                .sum::<f32>()
+                / self.samples_per_level as f32;
 
             // if first_half > second_half, 0, else 1
             if first_half > second_half {
@@ -83,15 +90,20 @@ impl ManchesterDecoder {
 
 /// Generate preamble for synchronization
 /// Using alternating pattern for easy detection: 10101010... (0xAA pattern)
-pub fn generate_preamble(samples_per_level: usize, pattern_bytes: usize) -> Vec<f32> {
+pub fn generate_preamble(
+    samples_per_level: usize,
+    pattern_bytes: usize,
+) -> Vec<f32> {
     let encoder = ManchesterEncoder::new(samples_per_level);
-    
+
     // Use alternating pattern: 0xAA = 10101010
     let mut bits = Vec::new();
     for _ in 0..pattern_bytes {
-        bits.extend_from_slice(&[1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1]);
+        bits.extend_from_slice(&[
+            1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1,
+        ]);
     }
-    
+
     encoder.encode(&bits)
 }
 

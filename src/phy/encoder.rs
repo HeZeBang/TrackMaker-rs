@@ -11,7 +11,7 @@ pub struct PhyEncoder {
 
 impl PhyEncoder {
     /// Create a new physical layer encoder
-    /// 
+    ///
     /// # Arguments
     /// * `samples_per_level` - Number of samples per Manchester level (not per bit)
     ///   For example, with 48000 Hz sample rate and 12000 bps bit rate:
@@ -20,12 +20,15 @@ impl PhyEncoder {
     pub fn new(samples_per_level: usize, preamble_bytes: usize) -> Self {
         let manchester = ManchesterEncoder::new(samples_per_level);
         let preamble = generate_preamble(samples_per_level, preamble_bytes);
-        
+
         info!("PhyEncoder initialized:");
         info!("  - samples_per_level: {}", samples_per_level);
-        info!("  - preamble length: {} samples ({} bytes pattern)", 
-              preamble.len(), preamble_bytes);
-        
+        info!(
+            "  - preamble length: {} samples ({} bytes pattern)",
+            preamble.len(),
+            preamble_bytes
+        );
+
         Self {
             manchester,
             samples_per_level,
@@ -37,37 +40,52 @@ impl PhyEncoder {
     /// Returns: [Preamble] [Frame Data]
     pub fn encode_frame(&self, frame: &Frame) -> Vec<f32> {
         let frame_bits = frame.to_bits();
-        let frame_samples = self.manchester.encode(&frame_bits);
-        
-        debug!("Encoding frame: seq={}, data_len={}, total_bits={}, total_samples={}", 
-               frame.sequence, frame.data.len(), frame_bits.len(), 
-               self.preamble.len() + frame_samples.len());
-        
-        let mut output = Vec::with_capacity(self.preamble.len() + frame_samples.len());
+        let frame_samples = self
+            .manchester
+            .encode(&frame_bits);
+
+        debug!(
+            "Encoding frame: seq={}, data_len={}, total_bits={}, total_samples={}",
+            frame.sequence,
+            frame.data.len(),
+            frame_bits.len(),
+            self.preamble.len() + frame_samples.len()
+        );
+
+        let mut output =
+            Vec::with_capacity(self.preamble.len() + frame_samples.len());
         output.extend_from_slice(&self.preamble);
         output.extend(frame_samples);
-        
+
         output
     }
 
     /// Encode multiple frames with inter-frame gaps
-    /// 
+    ///
     /// # Arguments
     /// * `frames` - Frames to encode
     /// * `inter_frame_gap_samples` - Number of silence samples between frames
-    pub fn encode_frames(&self, frames: &[Frame], inter_frame_gap_samples: usize) -> Vec<f32> {
+    pub fn encode_frames(
+        &self,
+        frames: &[Frame],
+        inter_frame_gap_samples: usize,
+    ) -> Vec<f32> {
         let mut output = Vec::new();
-        
+
         for (i, frame) in frames.iter().enumerate() {
             output.extend(self.encode_frame(frame));
-            
+
             // Add inter-frame gap (except after last frame)
             if i < frames.len() - 1 {
                 output.extend(vec![0.0; inter_frame_gap_samples]);
             }
         }
-        
-        info!("Encoded {} frames, total samples: {}", frames.len(), output.len());
+
+        info!(
+            "Encoded {} frames, total samples: {}",
+            frames.len(),
+            output.len()
+        );
         output
     }
 
@@ -92,7 +110,7 @@ mod tests {
         let encoder = PhyEncoder::new(2, 2);
         let frame = Frame::new_data(1, vec![0x12, 0x34, 0x56]);
         let samples = encoder.encode_frame(&frame);
-        
+
         // Should have preamble + frame data
         assert!(samples.len() > encoder.preamble_len());
     }
@@ -104,9 +122,9 @@ mod tests {
             Frame::new_data(0, vec![0x01, 0x02]),
             Frame::new_data(1, vec![0x03, 0x04]),
         ];
-        
+
         let samples = encoder.encode_frames(&frames, 100);
-        
+
         // Should have content
         assert!(samples.len() > 0);
     }

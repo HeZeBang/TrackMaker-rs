@@ -1,2 +1,2 @@
-pub mod recorder;
 pub mod decoder;
+pub mod recorder;

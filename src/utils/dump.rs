@@ -9,8 +9,10 @@ pub struct AudioData {
     pub channels: u32,
 }
 
-pub fn dump_to_json(file_path: &str, audio_data: &AudioData) -> Result<(), Box<dyn std::error::Error>> {
-
+pub fn dump_to_json(
+    file_path: &str,
+    audio_data: &AudioData,
+) -> Result<(), Box<dyn std::error::Error>> {
     let json = serde_json::to_string_pretty(audio_data)?;
 
     std::fs::write(file_path, json)?;
@@ -18,7 +20,10 @@ pub fn dump_to_json(file_path: &str, audio_data: &AudioData) -> Result<(), Box<d
     Ok(())
 }
 
-pub fn dump_to_wav(file_path: &str, audio_data: &AudioData) -> Result<(), Box<dyn std::error::Error>> {
+pub fn dump_to_wav(
+    file_path: &str,
+    audio_data: &AudioData,
+) -> Result<(), Box<dyn std::error::Error>> {
     use hound;
 
     let spec = hound::WavSpec {

@@ -1,6 +1,6 @@
 // Frame format: [Preamble] [Frame Type] [Sequence] [Length] [Data] [CRC8]
 
-use super::crc::{calculate_crc8, verify_crc8, bytes_to_bits, bits_to_bytes};
+use super::crc::{bits_to_bytes, bytes_to_bits, calculate_crc8, verify_crc8};
 use tracing::debug;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -28,8 +28,8 @@ impl FrameType {
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub frame_type: FrameType,
-    pub sequence: u8,        // Sequence number for ordering and ACK
-    pub data: Vec<u8>,       // Payload data
+    pub sequence: u8,  // Sequence number for ordering and ACK
+    pub data: Vec<u8>, // Payload data
 }
 
 impl Frame {
@@ -53,25 +53,25 @@ impl Frame {
     /// Format: [Type:1] [Seq:1] [Len:2] [Data:N] [CRC:1]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        
+
         // Frame type (1 byte)
         bytes.push(self.frame_type.to_u8());
-        
+
         // Sequence number (1 byte)
         bytes.push(self.sequence);
-        
+
         // Data length (2 bytes, big-endian)
         let len = self.data.len() as u16;
         bytes.push((len >> 8) as u8);
         bytes.push((len & 0xFF) as u8);
-        
+
         // Data
         bytes.extend_from_slice(&self.data);
-        
+
         // CRC8 (calculated over type + seq + len + data)
         let crc = calculate_crc8(&bytes);
         bytes.push(crc);
-        
+
         bytes
     }
 
@@ -83,7 +83,8 @@ impl Frame {
     /// Deserialize frame from bytes (without preamble)
     /// Returns None if CRC check fails or format is invalid
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 5 {  // Minimum: type(1) + seq(1) + len(2) + crc(1)
+        if bytes.len() < 5 {
+            // Minimum: type(1) + seq(1) + len(2) + crc(1)
             debug!("Frame too short: {} bytes", bytes.len());
             return None;
         }
@@ -131,7 +132,7 @@ impl Frame {
 
     /// Get the total size in bytes (including CRC)
     pub fn size_bytes(&self) -> usize {
-        4 + self.data.len() + 1  // type + seq + len(2) + data + crc
+        4 + self.data.len() + 1 // type + seq + len(2) + data + crc
     }
 
     /// Get the total size in bits
@@ -148,10 +149,10 @@ mod tests {
     fn test_data_frame_serialization() {
         let data = vec![0x01, 0x02, 0x03, 0x04];
         let frame = Frame::new_data(42, data.clone());
-        
+
         let bytes = frame.to_bytes();
         let recovered = Frame::from_bytes(&bytes).unwrap();
-        
+
         assert_eq!(recovered.frame_type, FrameType::Data);
         assert_eq!(recovered.sequence, 42);
         assert_eq!(recovered.data, data);
@@ -160,10 +161,10 @@ mod tests {
     #[test]
     fn test_ack_frame_serialization() {
         let frame = Frame::new_ack(99);
-        
+
         let bytes = frame.to_bytes();
         let recovered = Frame::from_bytes(&bytes).unwrap();
-        
+
         assert_eq!(recovered.frame_type, FrameType::Ack);
         assert_eq!(recovered.sequence, 99);
         assert_eq!(recovered.data.len(), 0);
@@ -173,10 +174,10 @@ mod tests {
     fn test_crc_verification() {
         let frame = Frame::new_data(1, vec![0xAA, 0xBB, 0xCC]);
         let mut bytes = frame.to_bytes();
-        
+
         // Corrupt data
         bytes[4] ^= 0xFF;
-        
+
         // Should fail CRC check
         assert!(Frame::from_bytes(&bytes).is_none());
     }
@@ -186,7 +187,7 @@ mod tests {
         let frame = Frame::new_data(5, vec![0x12, 0x34]);
         let bits = frame.to_bits();
         let recovered = Frame::from_bits(&bits).unwrap();
-        
+
         assert_eq!(recovered.sequence, 5);
         assert_eq!(recovered.data, vec![0x12, 0x34]);
     }

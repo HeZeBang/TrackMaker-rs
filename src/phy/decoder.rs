@@ -1,33 +1,37 @@
 use super::frame::Frame;
 use super::line_coding::{ManchesterDecoder, generate_preamble};
 use crate::utils::consts::MAX_FRAME_DATA_SIZE;
-use tracing::{debug, warn, trace};
+use tracing::{debug, trace, warn};
 
 pub struct PhyDecoder {
     manchester: ManchesterDecoder,
     samples_per_level: usize,
     preamble: Vec<f32>,
-    
+
     // Correlation-based sync
     correlation_threshold: f32,
     preamble_energy: f32,
-    
+
     // Sample buffer for processing
     sample_buffer: Vec<f32>,
-    buffer_offset: usize,  // Current processing position in buffer
-    
+    buffer_offset: usize, // Current processing position in buffer
+
     max_frame_bytes: usize,
-    
+
     decoded_frames: Vec<Frame>,
 }
 
 impl PhyDecoder {
     pub fn new(samples_per_level: usize, preamble_bytes: usize) -> Self {
         let preamble = generate_preamble(samples_per_level, preamble_bytes);
-        
+
         // for correlation normalization, this is pre-computed
-        let preamble_energy: f32 = preamble.iter().map(|x| x * x).sum::<f32>().sqrt();
-        
+        let preamble_energy: f32 = preamble
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt();
+
         Self {
             manchester: ManchesterDecoder::new(samples_per_level),
             samples_per_level,
@@ -37,7 +41,7 @@ impl PhyDecoder {
             preamble_energy,
             sample_buffer: Vec::new(),
             buffer_offset: 0,
-            max_frame_bytes: MAX_FRAME_DATA_SIZE * 2,  // 1x for encoder raw data + header + CRC...
+            max_frame_bytes: MAX_FRAME_DATA_SIZE * 2, // 1x for encoder raw data + header + CRC...
             decoded_frames: Vec::new(),
         }
     }
@@ -45,8 +49,9 @@ impl PhyDecoder {
     // entry point for processing incoming samples
     pub fn process_samples(&mut self, samples: &[f32]) -> Vec<Frame> {
         self.decoded_frames.clear();
-        
-        self.sample_buffer.extend_from_slice(samples);        
+
+        self.sample_buffer
+            .extend_from_slice(samples);
         // simple sliding window processing
         while self.buffer_offset < self.sample_buffer.len() {
             if let Some(frame_len) = self.try_decode_frame_at_offset() {
@@ -58,15 +63,16 @@ impl PhyDecoder {
                 self.buffer_offset += 1;
             }
         }
-        
+
         // Clean up processed samples (keep some overlap for preamble detection)
         let keep_samples = self.preamble.len() * 2;
         if self.buffer_offset > keep_samples {
             let drain_amount = self.buffer_offset - keep_samples;
-            self.sample_buffer.drain(..drain_amount);
+            self.sample_buffer
+                .drain(..drain_amount);
             self.buffer_offset = keep_samples;
         }
-        
+
         self.decoded_frames.clone()
     }
 
@@ -80,85 +86,101 @@ impl PhyDecoder {
     /// Returns Some(frame_length_in_samples) if successful, None otherwise
     fn try_decode_frame_at_offset(&mut self) -> Option<usize> {
         let remaining = &self.sample_buffer[self.buffer_offset..];
-        
+
         // premature return if not enough samples for preamble
         if remaining.len() < self.preamble.len() {
             return None;
         }
-        
+
         // Check for preamble using normalized cross-correlation
         let window = &remaining[..self.preamble.len()];
         let correlation = self.compute_normalized_correlation(window);
         if correlation < self.correlation_threshold {
-            return None;  // No preamble here
+            return None; // No preamble here
         }
 
         // Preamble detected /////////////////
-        
-        debug!("Preamble detected at offset {} (corr={:.3})", 
-               self.buffer_offset, correlation);
-        
+
+        debug!(
+            "Preamble detected at offset {} (corr={:.3})",
+            self.buffer_offset, correlation
+        );
+
         let frame_start = self.buffer_offset + self.preamble.len();
-        
+
         // no data
         if frame_start >= self.sample_buffer.len() {
             return None;
         }
-        
+
         let frame_samples = &self.sample_buffer[frame_start..];
-        
+
         // Decode header to get frame length
-        let header_bits = 32;  // type(8) + seq(8) + len(16)
+        let header_bits = 32; // type(8) + seq(8) + len(16)
         let header_samples = header_bits * 2 * self.samples_per_level;
-        
+
         // premature return if not enough samples for header
         if frame_samples.len() < header_samples {
             return None;
         }
-        
-        let header_decoded = self.manchester.decode(&frame_samples[..header_samples]);
-        
+
+        let header_decoded = self
+            .manchester
+            .decode(&frame_samples[..header_samples]);
+
         if header_decoded.len() < header_bits {
             warn!("Failed to decode header at offset {}", self.buffer_offset);
             return None;
         }
-        
+
         // Extract data length from header
         let len_high = Self::bits_to_byte(&header_decoded[16..24]);
         let len_low = Self::bits_to_byte(&header_decoded[24..32]);
         let data_len = ((len_high as usize) << 8) | (len_low as usize);
-        
+
         // Validate data length
         if data_len == 0 || data_len > self.max_frame_bytes {
-            warn!("Invalid data_len={} at offset {}, skipping", 
-                  data_len, self.buffer_offset);
+            warn!(
+                "Invalid data_len={} at offset {}, skipping",
+                data_len, self.buffer_offset
+            );
             return None;
         }
-        
+
         // Calculate total frame size
-        let total_bytes = 4 + data_len + 1;  // header + data + crc
+        let total_bytes = 4 + data_len + 1; // header + data + crc
         let total_bits = total_bytes * 8;
         let total_samples = total_bits * 2 * self.samples_per_level;
-        
+
         if frame_samples.len() < total_samples {
             return None;
         }
-        
+
         // Decode complete frame
-        let frame_bits = self.manchester.decode(&frame_samples[..total_samples]);
-        
+        let frame_bits = self
+            .manchester
+            .decode(&frame_samples[..total_samples]);
+
         if frame_bits.len() < total_bits {
-            warn!("Manchester decode failed for frame at offset {}", self.buffer_offset);
+            warn!(
+                "Manchester decode failed for frame at offset {}",
+                self.buffer_offset
+            );
             return None;
         }
-        
+
         // Parse and validate frame
         match Frame::from_bits(&frame_bits) {
             Some(frame) => {
-                debug!("✓ Frame decoded: seq={}, type={:?}, len={}", 
-                       frame.sequence, frame.frame_type, frame.data.len());
-                self.decoded_frames.push(frame);
-                
+                debug!(
+                    "✓ Frame decoded: seq={}, type={:?}, len={}",
+                    frame.sequence,
+                    frame.frame_type,
+                    frame.data.len()
+                );
+                self.decoded_frames
+                    .push(frame);
+
                 // Return total length, including preamble
                 Some(self.preamble.len() + total_samples)
             }
@@ -175,27 +197,33 @@ impl PhyDecoder {
         if window.len() != self.preamble.len() {
             return 0.0;
         }
-        
-        let dot_product: f32 = window.iter()
+
+        let dot_product: f32 = window
+            .iter()
             .zip(self.preamble.iter())
             .map(|(a, b)| a * b)
             .sum();
-        
-        let window_energy: f32 = window.iter()
+
+        let window_energy: f32 = window
+            .iter()
             .map(|x| x * x)
             .sum::<f32>()
             .sqrt();
-        
+
         if window_energy < 1e-6 || self.preamble_energy < 1e-6 {
             return 0.0;
         }
-        
+
         dot_product / (window_energy * self.preamble_energy)
     }
 
     fn bits_to_byte(bits: &[u8]) -> u8 {
         let mut byte = 0u8;
-        for (i, &bit) in bits.iter().enumerate().take(8) {
+        for (i, &bit) in bits
+            .iter()
+            .enumerate()
+            .take(8)
+        {
             if bit != 0 {
                 byte |= 1 << (7 - i);
             }
@@ -213,12 +241,12 @@ mod tests {
     fn test_decoder() {
         let encoder = PhyEncoder::new(2, 2);
         let mut decoder = PhyDecoder::new(2, 2);
-        
+
         let frame = Frame::new_data(1, vec![0x12, 0x34, 0x56, 0x78]);
         let samples = encoder.encode_frame(&frame);
-        
+
         let decoded = decoder.process_samples(&samples);
-        
+
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].sequence, 1);
         assert_eq!(decoded[0].data, vec![0x12, 0x34, 0x56, 0x78]);
@@ -228,16 +256,16 @@ mod tests {
     fn test_multiple_frames() {
         let encoder = PhyEncoder::new(2, 2);
         let mut decoder = PhyDecoder::new(2, 2);
-        
+
         let frames = vec![
             Frame::new_data(0, vec![0x01, 0x02]),
             Frame::new_data(1, vec![0x03, 0x04]),
             Frame::new_data(2, vec![0x05, 0x06]),
         ];
-        
+
         let samples = encoder.encode_frames(&frames, 100);
         let decoded = decoder.process_samples(&samples);
-        
+
         assert_eq!(decoded.len(), 3);
         for (i, frame) in decoded.iter().enumerate() {
             assert_eq!(frame.sequence, i as u8);
@@ -248,17 +276,17 @@ mod tests {
     fn test_noisy_channel() {
         let encoder = PhyEncoder::new(2, 2);
         let mut decoder = PhyDecoder::new(2, 2);
-        
+
         let frame = Frame::new_data(0, vec![0xAA, 0xBB]);
         let mut samples = encoder.encode_frame(&frame);
-        
+
         // NOISEEEEEEEEEEEEE
         for sample in samples.iter_mut() {
             *sample += (rand::random::<f32>() - 0.5) * 0.1;
         }
-        
+
         let decoded = decoder.process_samples(&samples);
-        
+
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].data, vec![0xAA, 0xBB]);
     }

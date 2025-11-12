@@ -6,7 +6,7 @@ const CRC8_POLYNOMIAL: u8 = 0x07;
 /// Calculate CRC8 checksum for given data
 pub fn calculate_crc8(data: &[u8]) -> u8 {
     let mut crc: u8 = 0x00;
-    
+
     for &byte in data {
         crc ^= byte;
         for _ in 0..8 {
@@ -17,7 +17,7 @@ pub fn calculate_crc8(data: &[u8]) -> u8 {
             }
         }
     }
-    
+
     crc
 }
 
@@ -38,7 +38,11 @@ pub fn byte_to_bits(byte: u8) -> [u8; 8] {
 /// Convert bit array to byte (MSB first)
 pub fn bits_to_byte(bits: &[u8]) -> u8 {
     let mut byte = 0u8;
-    for (i, &bit) in bits.iter().enumerate().take(8) {
+    for (i, &bit) in bits
+        .iter()
+        .enumerate()
+        .take(8)
+    {
         if bit != 0 {
             byte |= 1 << (7 - i);
         }
@@ -59,14 +63,14 @@ pub fn bytes_to_bits(bytes: &[u8]) -> Vec<u8> {
 pub fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
     let num_bytes = (bits.len() + 7) / 8;
     let mut bytes = Vec::with_capacity(num_bytes);
-    
+
     for i in 0..num_bytes {
         let start = i * 8;
         let end = (start + 8).min(bits.len());
         let bit_slice = &bits[start..end];
         bytes.push(bits_to_byte(bit_slice));
     }
-    
+
     bytes
 }
 
@@ -79,7 +83,7 @@ mod tests {
         let data = b"Hello, World!";
         let crc = calculate_crc8(data);
         assert!(verify_crc8(data, crc));
-        
+
         // Verify that modified data fails
         let mut modified = data.to_vec();
         modified[0] = b'h';
