@@ -21,6 +21,16 @@ pub struct PhyDecoder {
     decoded_frames: Vec<Frame>,
 }
 
+enum DecodeFrameStatus {
+    Success = 0,
+    PreambleNotFound,
+    CorrelationTooLow,
+    NoEnoughSamples,
+    HeaderDecodeFailed,
+    InvalidDataLength,
+    CRCFailed,
+}
+
 impl PhyDecoder {
     pub fn new(samples_per_level: usize, preamble_bytes: usize) -> Self {
         let preamble = generate_preamble(samples_per_level, preamble_bytes);
@@ -37,7 +47,7 @@ impl PhyDecoder {
             samples_per_level,
             preamble,
             // TODO: adjust threshold
-            correlation_threshold: 0.85,
+            correlation_threshold: 0.9,
             preamble_energy,
             sample_buffer: Vec::new(),
             buffer_offset: 0,
@@ -53,14 +63,18 @@ impl PhyDecoder {
         self.sample_buffer
             .extend_from_slice(samples);
         // simple sliding window processing
-        while self.buffer_offset < self.sample_buffer.len() {
-            if let Some(frame_len) = self.try_decode_frame_at_offset() {
+        while self.sample_buffer.len() > self.buffer_offset {
+            // TODO: avoid splitted stream, make this dynamic
+            let (status, frame_len) = self.try_decode_frame_at_offset();
+            if let DecodeFrameStatus::Success = status {
                 // Successfully decoded a frame
-                self.buffer_offset += frame_len;
+                self.buffer_offset += frame_len.unwrap();
                 trace!("Advanced offset to {}", self.buffer_offset);
-            } else {
+            } else if let DecodeFrameStatus::CorrelationTooLow = status {
                 // No frame found
                 self.buffer_offset += 1;
+            } else {
+                break; // Wait for more samples
             }
         }
 
@@ -76,6 +90,10 @@ impl PhyDecoder {
         self.decoded_frames.clone()
     }
 
+    pub fn get_decoded_frames(&self) -> &Vec<Frame> {
+        &self.decoded_frames
+    }
+
     pub fn reset(&mut self) {
         self.sample_buffer.clear();
         self.buffer_offset = 0;
@@ -84,19 +102,21 @@ impl PhyDecoder {
 
     /// Try to decode a frame starting at current buffer_offset
     /// Returns Some(frame_length_in_samples) if successful, None otherwise
-    fn try_decode_frame_at_offset(&mut self) -> Option<usize> {
+    fn try_decode_frame_at_offset(
+        &mut self,
+    ) -> (DecodeFrameStatus, Option<usize>) {
         let remaining = &self.sample_buffer[self.buffer_offset..];
 
         // premature return if not enough samples for preamble
         if remaining.len() < self.preamble.len() {
-            return None;
+            return (DecodeFrameStatus::NoEnoughSamples, None);
         }
 
         // Check for preamble using normalized cross-correlation
         let window = &remaining[..self.preamble.len()];
         let correlation = self.compute_normalized_correlation(window);
         if correlation < self.correlation_threshold {
-            return None; // No preamble here
+            return (DecodeFrameStatus::CorrelationTooLow, None); // No preamble here
         }
 
         // Preamble detected /////////////////
@@ -110,7 +130,7 @@ impl PhyDecoder {
 
         // no data
         if frame_start >= self.sample_buffer.len() {
-            return None;
+            return (DecodeFrameStatus::NoEnoughSamples, None);
         }
 
         let frame_samples = &self.sample_buffer[frame_start..];
@@ -121,7 +141,7 @@ impl PhyDecoder {
 
         // premature return if not enough samples for header
         if frame_samples.len() < header_samples {
-            return None;
+            return (DecodeFrameStatus::NoEnoughSamples, None);
         }
 
         let header_decoded = self
@@ -130,7 +150,7 @@ impl PhyDecoder {
 
         if header_decoded.len() < header_bits {
             warn!("Failed to decode header at offset {}", self.buffer_offset);
-            return None;
+            return (DecodeFrameStatus::HeaderDecodeFailed, None);
         }
 
         // Extract data length from header
@@ -144,7 +164,7 @@ impl PhyDecoder {
                 "Invalid data_len={} at offset {}, skipping",
                 data_len, self.buffer_offset
             );
-            return None;
+            return (DecodeFrameStatus::InvalidDataLength, None);
         }
 
         // Calculate total frame size
@@ -153,7 +173,7 @@ impl PhyDecoder {
         let total_samples = total_bits * 2 * self.samples_per_level;
 
         if frame_samples.len() < total_samples {
-            return None;
+            return (DecodeFrameStatus::NoEnoughSamples, None);
         }
 
         // Decode complete frame
@@ -166,7 +186,7 @@ impl PhyDecoder {
                 "Manchester decode failed for frame at offset {}",
                 self.buffer_offset
             );
-            return None;
+            return (DecodeFrameStatus::HeaderDecodeFailed, None);
         }
 
         // Parse and validate frame
@@ -182,11 +202,14 @@ impl PhyDecoder {
                     .push(frame);
 
                 // Return total length, including preamble
-                Some(self.preamble.len() + total_samples)
+                (
+                    DecodeFrameStatus::Success,
+                    Some(self.preamble.len() + total_samples),
+                )
             }
             None => {
                 warn!("Frame CRC failed at offset {}", self.buffer_offset);
-                None
+                (DecodeFrameStatus::CRCFailed, None)
             }
         }
     }
