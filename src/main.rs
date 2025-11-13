@@ -16,7 +16,7 @@ use ui::progress::{ProgressManager, templates};
 use utils::consts::*;
 use utils::logging::init_logging;
 
-use phy::{Frame, PhyDecoder, PhyEncoder};
+use phy::{Frame, LineCodingKind, PhyDecoder, PhyEncoder};
 
 fn main() {
     init_logging();
@@ -84,6 +84,20 @@ fn main() {
         .interact()
         .unwrap();
 
+    let line_coding_options = [
+        LineCodingKind::Manchester,
+        LineCodingKind::FourBFiveB,
+    ];
+    let line_coding_labels = ["Manchester (Bi-phase)", "4B5B (NRZ)"];
+    let line_coding_idx = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select line coding scheme")
+        .default(0)
+        .items(&line_coding_labels)
+        .interact()
+        .unwrap();
+    let line_coding = line_coding_options[line_coding_idx];
+    info!("Selected line coding: {}", line_coding.name());
+
     {
         shared
             .record_buffer
@@ -94,13 +108,18 @@ fn main() {
 
     if selection == 0 {
         // Sender
-        run_sender(shared, progress_manager, sample_rate as u32);
+        run_sender(shared, progress_manager, sample_rate as u32, line_coding);
     } else if selection == 1 {
         // Receiver
-        run_receiver(shared, progress_manager, max_duration_samples as u32);
+        run_receiver(
+            shared,
+            progress_manager,
+            max_duration_samples as u32,
+            line_coding,
+        );
     } else {
         // Test mode (no JACK)
-        test_transmission();
+        test_transmission(line_coding);
         return;
     }
 
@@ -114,8 +133,10 @@ fn run_sender(
     shared: recorder::AppShared,
     progress_manager: ProgressManager,
     sample_rate: u32,
+    line_coding: LineCodingKind,
 ) {
     info!("=== Sender Mode ===");
+    info!("Using line coding: {}", line_coding.name());
 
     // Read input file
     let input_path = "INPUT.bin";
@@ -131,7 +152,11 @@ fn run_sender(
     };
 
     // Create PHY encoder
-    let encoder = PhyEncoder::new(SAMPLES_PER_LEVEL, PREAMBLE_PATTERN_BYTES);
+    let encoder = PhyEncoder::new(
+        SAMPLES_PER_LEVEL,
+        PREAMBLE_PATTERN_BYTES,
+        line_coding,
+    );
 
     // Split data into frames
     let mut frames = Vec::new();
@@ -238,8 +263,10 @@ fn run_receiver(
     shared: recorder::AppShared,
     progress_manager: ProgressManager,
     max_recording_duration_samples: u32,
+    line_coding: LineCodingKind,
 ) {
     info!("=== Receiver Mode ===");
+    info!("Using line coding: {}", line_coding.name());
 
     progress_manager
         .create_bar(
@@ -269,7 +296,11 @@ fn run_receiver(
     })
     .expect("Error setting Ctrl+C handler");
 
-    let mut decoder = PhyDecoder::new(SAMPLES_PER_LEVEL, PREAMBLE_PATTERN_BYTES);
+    let mut decoder = PhyDecoder::new(
+        SAMPLES_PER_LEVEL,
+        PREAMBLE_PATTERN_BYTES,
+        line_coding,
+    );
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -403,17 +434,30 @@ fn run_receiver(
     }
 }
 
-fn test_transmission() {
+fn test_transmission(line_coding: LineCodingKind) {
     info!("=== Test Mode (Loopback without JACK) ===");
+    info!("Using line coding: {}", line_coding.name());
 
     // Create test data
-    let test_data = b"114514Hello, Project 2! This is a test of cable-based transmission using Manchester encoding.";
+    let test_text = format!(
+        "114514Hello, Project 2! This is a test of cable-based transmission using {} line coding.",
+        line_coding.name()
+    );
+    let test_data = test_text.into_bytes();
     info!("Test data: {} bytes", test_data.len());
-    info!("Content: {}", String::from_utf8_lossy(test_data));
+    info!("Content: {}", String::from_utf8_lossy(&test_data));
 
     // Create encoder and decoder
-    let encoder = PhyEncoder::new(SAMPLES_PER_LEVEL, PREAMBLE_PATTERN_BYTES);
-    let mut decoder = PhyDecoder::new(SAMPLES_PER_LEVEL, PREAMBLE_PATTERN_BYTES);
+    let encoder = PhyEncoder::new(
+        SAMPLES_PER_LEVEL,
+        PREAMBLE_PATTERN_BYTES,
+        line_coding,
+    );
+    let mut decoder = PhyDecoder::new(
+        SAMPLES_PER_LEVEL,
+        PREAMBLE_PATTERN_BYTES,
+        line_coding,
+    );
 
     // Create frames
     let mut frames = Vec::new();
@@ -462,7 +506,7 @@ fn test_transmission() {
     }
 
     // Compare
-    if &decoded_data == test_data {
+    if decoded_data == test_data {
         info!("✅ Test PASSED - Data matches perfectly!");
     } else {
         tracing::error!("❌ Test FAILED - Data mismatch");

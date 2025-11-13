@@ -10,3 +10,4 @@ pub mod line_coding;
 pub use decoder::PhyDecoder;
 pub use encoder::PhyEncoder;
 pub use frame::{Frame, FrameType};
+pub use line_coding::LineCodingKind;

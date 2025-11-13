@@ -1,11 +1,10 @@
 use super::frame::Frame;
-use super::line_coding::{ManchesterDecoder, generate_preamble};
+use super::line_coding::{LineCode, LineCodingKind};
 use crate::utils::consts::MAX_FRAME_DATA_SIZE;
 use tracing::{debug, trace, warn};
 
 pub struct PhyDecoder {
-    manchester: ManchesterDecoder,
-    samples_per_level: usize,
+    line_code: Box<dyn LineCode>,
     preamble: Vec<f32>,
 
     // Correlation-based sync
@@ -32,8 +31,13 @@ enum DecodeFrameStatus {
 }
 
 impl PhyDecoder {
-    pub fn new(samples_per_level: usize, preamble_bytes: usize) -> Self {
-        let preamble = generate_preamble(samples_per_level, preamble_bytes);
+    pub fn new(
+        samples_per_level: usize,
+        preamble_bytes: usize,
+        line_coding_kind: LineCodingKind,
+    ) -> Self {
+        let line_code = line_coding_kind.create(samples_per_level);
+        let preamble = line_code.generate_preamble(preamble_bytes);
 
         // for correlation normalization, this is pre-computed
         let preamble_energy: f32 = preamble
@@ -43,8 +47,7 @@ impl PhyDecoder {
             .sqrt();
 
         Self {
-            manchester: ManchesterDecoder::new(samples_per_level),
-            samples_per_level,
+            line_code,
             preamble,
             // TODO: adjust threshold
             correlation_threshold: 0.9,
@@ -97,7 +100,7 @@ impl PhyDecoder {
     pub fn reset(&mut self) {
         self.sample_buffer.clear();
         self.buffer_offset = 0;
-        self.manchester.reset();
+        self.line_code.reset();
     }
 
     /// Try to decode a frame starting at current buffer_offset
@@ -137,7 +140,7 @@ impl PhyDecoder {
 
         // Decode header to get frame length
         let header_bits = 32; // type(8) + seq(8) + len(16)
-        let header_samples = header_bits * 2 * self.samples_per_level;
+        let header_samples = self.line_code.samples_for_bits(header_bits);
 
         // premature return if not enough samples for header
         if frame_samples.len() < header_samples {
@@ -145,7 +148,7 @@ impl PhyDecoder {
         }
 
         let header_decoded = self
-            .manchester
+            .line_code
             .decode(&frame_samples[..header_samples]);
 
         if header_decoded.len() < header_bits {
@@ -170,7 +173,7 @@ impl PhyDecoder {
         // Calculate total frame size
         let total_bytes = 4 + data_len + 1; // header + data + crc
         let total_bits = total_bytes * 8;
-        let total_samples = total_bits * 2 * self.samples_per_level;
+        let total_samples = self.line_code.samples_for_bits(total_bits);
 
         if frame_samples.len() < total_samples {
             return (DecodeFrameStatus::NoEnoughSamples, None);
@@ -178,12 +181,12 @@ impl PhyDecoder {
 
         // Decode complete frame
         let frame_bits = self
-            .manchester
+            .line_code
             .decode(&frame_samples[..total_samples]);
 
         if frame_bits.len() < total_bits {
             warn!(
-                "Manchester decode failed for frame at offset {}",
+                "Line decode failed for frame at offset {}",
                 self.buffer_offset
             );
             return (DecodeFrameStatus::HeaderDecodeFailed, None);
@@ -259,11 +262,12 @@ impl PhyDecoder {
 mod tests {
     use super::*;
     use crate::phy::encoder::PhyEncoder;
+    use crate::phy::line_coding::LineCodingKind;
 
     #[test]
     fn test_decoder() {
-        let encoder = PhyEncoder::new(2, 2);
-        let mut decoder = PhyDecoder::new(2, 2);
+        let encoder = PhyEncoder::new(2, 2, LineCodingKind::FourBFiveB);
+        let mut decoder = PhyDecoder::new(2, 2, LineCodingKind::FourBFiveB);
 
         let frame = Frame::new_data(1, vec![0x12, 0x34, 0x56, 0x78]);
         let samples = encoder.encode_frame(&frame);
@@ -277,8 +281,8 @@ mod tests {
 
     #[test]
     fn test_multiple_frames() {
-        let encoder = PhyEncoder::new(2, 2);
-        let mut decoder = PhyDecoder::new(2, 2);
+        let encoder = PhyEncoder::new(2, 2, LineCodingKind::FourBFiveB);
+        let mut decoder = PhyDecoder::new(2, 2, LineCodingKind::FourBFiveB);
 
         let frames = vec![
             Frame::new_data(0, vec![0x01, 0x02]),
@@ -297,8 +301,8 @@ mod tests {
 
     #[test]
     fn test_noisy_channel() {
-        let encoder = PhyEncoder::new(2, 2);
-        let mut decoder = PhyDecoder::new(2, 2);
+        let encoder = PhyEncoder::new(2, 2, LineCodingKind::FourBFiveB);
+        let mut decoder = PhyDecoder::new(2, 2, LineCodingKind::FourBFiveB);
 
         let frame = Frame::new_data(0, vec![0xAA, 0xBB]);
         let mut samples = encoder.encode_frame(&frame);

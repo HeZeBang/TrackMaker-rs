@@ -26,11 +26,8 @@ pub const SAMPLE_RATE: u32 = 48000;
 /// Target bit rate (bps) - Project 2 requires >= 12 Kbps
 pub const BIT_RATE: u32 = 12000;
 
-/// Samples per bit (SAMPLE_RATE / BIT_RATE)
-pub const SAMPLES_PER_BIT: usize = 4; // 48000 / 12000 = 4
-
-/// Samples per Manchester level (half of samples per bit)
-pub const SAMPLES_PER_LEVEL: usize = 4; // Manchester: 4 levels per bit
+/// Samples per level (Manchester level or 4B5B bit)
+pub const SAMPLES_PER_LEVEL: usize = 2;
 
 // Frame Parameters
 /// Number of 0xAA pattern bytes in preamble

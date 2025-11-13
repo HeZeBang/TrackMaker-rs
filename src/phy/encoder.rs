@@ -1,11 +1,9 @@
-use super::crc::bytes_to_bits;
 use super::frame::Frame;
-use super::line_coding::{ManchesterEncoder, generate_preamble};
+use super::line_coding::{LineCode, LineCodingKind};
 use tracing::{debug, info};
 
 pub struct PhyEncoder {
-    manchester: ManchesterEncoder,
-    samples_per_level: usize,
+    line_code: Box<dyn LineCode>,
     preamble: Vec<f32>,
 }
 
@@ -15,13 +13,18 @@ impl PhyEncoder {
     /// # Arguments
     /// * `samples_per_level` - Number of samples per Manchester level (not per bit)
     ///   For example, with 48000 Hz sample rate and 12000 bps bit rate:
-    ///   - samples_per_bit = 48000 / 12000 = 4
-    ///   - samples_per_level = 4 / 2 = 2 (Manchester has 2 levels per bit)
-    pub fn new(samples_per_level: usize, preamble_bytes: usize) -> Self {
-        let manchester = ManchesterEncoder::new(samples_per_level);
-        let preamble = generate_preamble(samples_per_level, preamble_bytes);
+    ///   - 对于曼彻斯特编码：samples_per_level = samples_per_level
+    ///   - 对于 4B5B 编码：samples_per_level = 每个编码比特的采样数
+    pub fn new(
+        samples_per_level: usize,
+        preamble_bytes: usize,
+        line_coding_kind: LineCodingKind,
+    ) -> Self {
+        let line_code = line_coding_kind.create(samples_per_level);
+        let preamble = line_code.generate_preamble(preamble_bytes);
 
         info!("PhyEncoder initialized:");
+        info!("  - line coding: {}", line_coding_kind.name());
         info!("  - samples_per_level: {}", samples_per_level);
         info!(
             "  - preamble length: {} samples ({} bytes pattern)",
@@ -30,8 +33,7 @@ impl PhyEncoder {
         );
 
         Self {
-            manchester,
-            samples_per_level,
+            line_code,
             preamble,
         }
     }
@@ -41,7 +43,7 @@ impl PhyEncoder {
     pub fn encode_frame(&self, frame: &Frame) -> Vec<f32> {
         let frame_bits = frame.to_bits();
         let frame_samples = self
-            .manchester
+            .line_code
             .encode(&frame_bits);
 
         debug!(
@@ -93,21 +95,16 @@ impl PhyEncoder {
     pub fn preamble_len(&self) -> usize {
         self.preamble.len()
     }
-
-    /// Get samples per level
-    pub fn samples_per_level(&self) -> usize {
-        self.samples_per_level
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::phy::frame::FrameType;
+    use crate::phy::line_coding::LineCodingKind;
 
     #[test]
     fn test_encoder() {
-        let encoder = PhyEncoder::new(2, 2);
+        let encoder = PhyEncoder::new(2, 2, LineCodingKind::FourBFiveB);
         let frame = Frame::new_data(1, vec![0x12, 0x34, 0x56]);
         let samples = encoder.encode_frame(&frame);
 
@@ -117,7 +114,7 @@ mod tests {
 
     #[test]
     fn test_multiple_frames() {
-        let encoder = PhyEncoder::new(2, 2);
+        let encoder = PhyEncoder::new(2, 2, LineCodingKind::FourBFiveB);
         let frames = vec![
             Frame::new_data(0, vec![0x01, 0x02]),
             Frame::new_data(1, vec![0x03, 0x04]),
