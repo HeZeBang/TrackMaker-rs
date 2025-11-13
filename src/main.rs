@@ -1,7 +1,7 @@
 use dialoguer::{Select, theme::ColorfulTheme};
 use jack;
 use std::fs;
-use tracing::{debug, info};
+use tracing::info;
 
 mod audio;
 mod device;
@@ -39,7 +39,7 @@ fn main() {
         tracing::warn!("Physical layer is designed for {} Hz", SAMPLE_RATE);
     }
 
-    let max_duration_samples = sample_rate * 30; // 30 seconds max
+    let max_duration_samples = sample_rate * 10; // 30 seconds max
 
     // Shared State
     let shared = recorder::AppShared::new(max_duration_samples);
@@ -268,6 +268,15 @@ fn run_receiver(
     info!("=== Receiver Mode ===");
     info!("Using line coding: {}", line_coding.name());
 
+    // Create decoder
+    let mut decoder = PhyDecoder::new(
+        SAMPLES_PER_LEVEL,
+        PREAMBLE_PATTERN_BYTES,
+        line_coding,
+    );
+    let mut all_frames: Vec<Frame> = Vec::new();
+    let mut processed_samples_len = 0;
+
     progress_manager
         .create_bar(
             "recording",
@@ -277,43 +286,26 @@ fn run_receiver(
         )
         .unwrap();
 
-    *shared
-        .app_state
-        .lock()
-        .unwrap() = recorder::AppState::Recording;
+    *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
 
     let start_time = std::time::Instant::now();
 
-    let mut frames: Vec<Frame> = Vec::new();
-
-    // Set up Ctrl+C handler
-    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let r = running.clone();
-
-    ctrlc::set_handler(move || {
-        info!("Ctrl+C received, stopping receiver...");
-        r.store(false, std::sync::atomic::Ordering::SeqCst);
-    })
-    .expect("Error setting Ctrl+C handler");
-
-    let mut decoder = PhyDecoder::new(
-        SAMPLES_PER_LEVEL,
-        PREAMBLE_PATTERN_BYTES,
-        line_coding,
-    );
-
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
-        // Check for Ctrl+C
-        if !running.load(std::sync::atomic::Ordering::SeqCst) {
-            info!("Interrupted by user, stopping recording...");
-            *shared
-                .app_state
-                .lock()
-                .unwrap() = recorder::AppState::Idle;
-            progress_manager.finish_all();
-            break;
+        let current_samples = {
+            let buffer = shared.record_buffer.lock().unwrap();
+            buffer.clone()
+        };
+
+        if current_samples.len() > processed_samples_len {
+            let new_samples = &current_samples[processed_samples_len..];
+            let decoded_frames = decoder.process_samples(new_samples);
+            if !decoded_frames.is_empty() {
+                info!("Decoded {} new frames", decoded_frames.len());
+                all_frames.extend(decoded_frames);
+            }
+            processed_samples_len = current_samples.len();
         }
 
         ui::update_progress(
@@ -322,92 +314,58 @@ fn run_receiver(
             &progress_manager,
         );
 
-        let state = {
-            shared
-                .app_state
-                .lock()
-                .unwrap()
-                .clone()
-        };
-
+        let state = { shared.app_state.lock().unwrap().clone() };
         if let recorder::AppState::Idle = state {
             progress_manager.finish_all();
             break;
         }
+    }
 
-        if shared
-            .record_buffer
-            .lock()
-            .unwrap()
-            .len()
-            > 5000
-        {
-            // TODO: make configurable
+    let elapsed = start_time.elapsed().as_secs_f32();
+    info!("Recording completed in {:.2} seconds", elapsed);
 
-            let rx_samples: Vec<f32> = {
-                shared
-                    .record_buffer
-                    .lock()
-                    .unwrap()
-                    .drain(..)
-                    .collect()
-            };
-
-            let decoded_frames = decoder.process_samples(&rx_samples);
-            if decoded_frames.len() > 0 {
-                debug!("Decoded {} frames so far", decoded_frames.len());
-                frames.append(&mut decoded_frames.clone());
-            }
+    // Final processing for any remaining samples
+    let final_samples = {
+        let buffer = shared.record_buffer.lock().unwrap();
+        buffer.clone()
+    };
+    if final_samples.len() > processed_samples_len {
+        let remaining_samples = &final_samples[processed_samples_len..];
+        let decoded_frames = decoder.process_samples(remaining_samples);
+        if !decoded_frames.is_empty() {
+            info!("Decoded {} final frames", decoded_frames.len());
+            all_frames.extend(decoded_frames);
         }
     }
 
-    let elapsed = start_time
-        .elapsed()
-        .as_secs_f32();
-    info!("Recording completed in {:.2} seconds", elapsed);
+    info!("Total decoded frames: {}", all_frames.len());
 
-    // Get recorded samples
-    // let rx_samples: Vec<f32> = {
-    //     let record = shared
-    //         .record_buffer
-    //         .lock()
-    //         .unwrap();
-    //     record
-    //         .iter()
-    //         .copied()
-    //         .collect()
-    // };
-
-    // info!("Recorded {} samples", rx_samples.len());
-
-    // // Save recorded signal to WAV
-    // let sample_rate = SAMPLE_RATE; // Use constant from consts
-    // if let Err(e) = utils::dump::dump_to_wav(
-    //     "./tmp/receiver_input.wav",
-    //     &utils::dump::AudioData {
-    //         sample_rate,
-    //         audio_data: rx_samples.clone(),
-    //         duration: rx_samples.len() as f32 / sample_rate as f32,
-    //         channels: 1,
-    //     },
-    // ) {
-    //     tracing::warn!("Failed to save receiver WAV: {}", e);
-    // } else {
-    //     info!("Saved received signal to ./tmp/receiver_input.wav");
-    // }
-
-    // // Create decoder and process
-    // let mut decoder = PhyDecoder::new(SAMPLES_PER_LEVEL, PREAMBLE_PATTERN_BYTES);
-    // let frames = decoder.process_samples(&rx_samples);
-
-    info!("Decoded {} frames", frames.len());
+    // Save recorded signal to WAV
+    let sample_rate = SAMPLE_RATE;
+    if let Err(e) = utils::dump::dump_to_wav(
+        "./tmp/receiver_input.wav",
+        &utils::dump::AudioData {
+            sample_rate,
+            audio_data: final_samples.clone(),
+            duration: final_samples.len() as f32 / sample_rate as f32,
+            channels: 1,
+        },
+    ) {
+        tracing::warn!("Failed to save receiver WAV: {}", e);
+    } else {
+        info!("Saved received signal to ./tmp/receiver_input.wav");
+    }
 
     // Reconstruct file data
     let mut output_data = Vec::new();
     let mut expected_seq = 0u8;
     let mut frame_errors = 0;
 
-    for frame in frames {
+    // Sort frames by sequence number to handle out-of-order decoding
+    all_frames.sort_by_key(|f| f.sequence);
+    all_frames.dedup_by_key(|f| f.sequence);
+
+    for frame in all_frames {
         if frame.sequence != expected_seq {
             tracing::warn!(
                 "Frame sequence mismatch: expected {}, got {}",

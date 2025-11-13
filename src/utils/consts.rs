@@ -27,7 +27,7 @@ pub const SAMPLE_RATE: u32 = 48000;
 pub const BIT_RATE: u32 = 12000;
 
 /// Samples per level (Manchester level or 4B5B bit)
-pub const SAMPLES_PER_LEVEL: usize = 2;
+pub const SAMPLES_PER_LEVEL: usize = 3;
 
 // Frame Parameters
 /// Number of 0xAA pattern bytes in preamble
