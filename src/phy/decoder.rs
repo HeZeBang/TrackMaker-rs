@@ -1,5 +1,6 @@
 use super::frame::Frame;
 use super::line_coding::{LineCode, LineCodingKind};
+use crate::phy::FrameType;
 use crate::utils::consts::MAX_FRAME_DATA_SIZE;
 use tracing::{debug, trace, warn};
 
@@ -163,8 +164,9 @@ impl PhyDecoder {
         let len_high = Self::bits_to_byte(&header_decoded[16..24]);
         let len_low = Self::bits_to_byte(&header_decoded[24..32]);
         let data_len = ((len_high as usize) << 8) | (len_low as usize);
+        let data_type: FrameType = FrameType::from_u8(Self::bits_to_byte(&header_decoded[0..8])).unwrap_or(FrameType::Ack);
 
-        if data_len == 0 || data_len > self.max_frame_bytes {
+        if data_type == FrameType::Data && data_len == 0 || data_len > self.max_frame_bytes {
             warn!(
                 "Invalid data_len={} at offset {}. Returning to search.",
                 data_len, preamble_start_offset

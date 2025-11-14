@@ -65,6 +65,20 @@ impl ProgressManager {
         }
     }
 
+    /// 增加进度条位置
+    pub fn inc(&self, id: &str, value: u64) -> Result<(), String> {
+        let bars = self
+            .bars
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if let Some(pb) = bars.get(id) {
+            pb.inc(value);
+            Ok(())
+        } else {
+            Err(format!("Progress bar '{}' not found", id))
+        }
+    }
+
     /// 更新进度条消息
     pub fn set_message(&self, id: &str, message: &str) -> Result<(), String> {
         let bars = self
@@ -159,6 +173,8 @@ pub mod templates {
         "RECORDING:   [{bar:30.red}] {percent}% ({pos}/{len} samples) {msg}";
     pub const PLAYBACK: &str =
         "PLAYBACK:    [{bar:30.green}] {percent}% ({pos}/{len} samples) {msg}";
+    pub const SENDER: &str =
+        "SENDER:      [{bar:30.cyan}] {percent}% ({pos}/{len} frames) {msg}";
     pub const PROCESSING: &str =
         "PROCESSING:  [{bar:30.blue}] {percent}% ({pos}/{len}) {msg}";
     pub const PLAYREC: &str =

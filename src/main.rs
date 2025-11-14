@@ -16,7 +16,7 @@ use ui::progress::{ProgressManager, templates};
 use utils::consts::*;
 use utils::logging::init_logging;
 
-use phy::{Frame, LineCodingKind, PhyDecoder, PhyEncoder};
+use phy::{Frame, FrameType, LineCodingKind, PhyDecoder, PhyEncoder};
 
 fn main() {
     init_logging();
@@ -39,7 +39,7 @@ fn main() {
         tracing::warn!("Physical layer is designed for {} Hz", SAMPLE_RATE);
     }
 
-    let max_duration_samples = sample_rate * 10; // 30 seconds max
+    let max_duration_samples = sample_rate * DEFAULT_RECORD_SECONDS;
 
     // Shared State
     let shared = recorder::AppShared::new(max_duration_samples);
@@ -135,7 +135,7 @@ fn run_sender(
     sample_rate: u32,
     line_coding: LineCodingKind,
 ) {
-    info!("=== Sender Mode ===");
+    info!("=== Sender Mode (with Stop-and-Wait) ===");
     info!("Using line coding: {}", line_coding.name());
 
     // Read input file
@@ -151,8 +151,13 @@ fn run_sender(
         }
     };
 
-    // Create PHY encoder
+    // Create PHY encoder and decoder (for ACKs)
     let encoder = PhyEncoder::new(
+        SAMPLES_PER_LEVEL,
+        PREAMBLE_PATTERN_BYTES,
+        line_coding,
+    );
+    let mut decoder = PhyDecoder::new(
         SAMPLES_PER_LEVEL,
         PREAMBLE_PATTERN_BYTES,
         line_coding,
@@ -161,102 +166,129 @@ fn run_sender(
     // Split data into frames
     let mut frames = Vec::new();
     let mut seq = 0u8;
-
-    info!(
-        "Splitting data into frames (max {} bytes each)",
-        MAX_FRAME_DATA_SIZE
-    );
     for chunk in file_data.chunks(MAX_FRAME_DATA_SIZE) {
         let frame = Frame::new_data(seq, chunk.to_vec());
         frames.push(frame);
         seq = seq.wrapping_add(1);
     }
+    info!("Created {} frames to send.", frames.len());
 
-    info!(
-        "Created {} frames from {} bytes",
-        frames.len(),
-        file_data.len()
-    );
+    let total_frames = frames.len();
+    let mut frames_sent = 0;
 
-    // Encode frames to audio samples
-    let output_track = encoder.encode_frames(&frames, INTER_FRAME_GAP_SAMPLES);
-    let output_track_len = output_track.len();
-
-    info!(
-        "Encoded to {} samples ({:.2} seconds)",
-        output_track_len,
-        output_track_len as f32 / sample_rate as f32
-    );
-
-    // Save encoded signal to WAV
-    if let Err(e) = utils::dump::dump_to_wav(
-        "./tmp/sender_output.wav",
-        &utils::dump::AudioData {
-            sample_rate,
-            audio_data: output_track.clone(),
-            duration: output_track_len as f32 / sample_rate as f32,
-            channels: 1,
-        },
-    ) {
-        tracing::warn!("Failed to save sender WAV: {}", e);
-    } else {
-        info!("Saved sender signal to ./tmp/sender_output.wav");
-    }
-
-    // Calculate theoretical transmission time
-    let total_bits = file_data.len() * 8;
-    let theoretical_time = total_bits as f32 / BIT_RATE as f32;
-    info!(
-        "Theoretical transmission time: {:.2} seconds (at {} bps)",
-        theoretical_time, BIT_RATE
-    );
-
-    {
-        let mut playback = shared
-            .playback_buffer
-            .lock()
-            .unwrap();
-        playback.extend(output_track);
-    }
-
-    progress_manager
+    let sender_progress = progress_manager
         .create_bar(
-            "playback",
-            output_track_len as u64,
-            templates::PLAYBACK,
+            "sender",
+            total_frames as u64,
+            templates::SENDER,
             "sender",
         )
         .unwrap();
 
-    *shared
-        .app_state
-        .lock()
-        .unwrap() = recorder::AppState::Playing;
+    let overall_start_time = std::time::Instant::now();
 
-    let start_time = std::time::Instant::now();
+    for frame_to_send in &frames {
+        let mut attempts = 0;
+        'retransmit_loop: loop {
+            attempts += 1;
+            if attempts > 1 {
+                info!(
+                    "Retransmitting frame {} (seq: {}), attempt #{}",
+                    frames_sent + 1,
+                    frame_to_send.sequence,
+                    attempts
+                );
+            } else {
+                info!(
+                    "Sending frame {}/{} (seq: {})",
+                    frames_sent + 1,
+                    total_frames,
+                    frame_to_send.sequence
+                );
+            }
 
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+            // 1. Encode and send the frame
+            let output_track = encoder.encode_frames(&[frame_to_send.clone()], INTER_FRAME_GAP_SAMPLES);
+            {
+                let mut playback = shared.playback_buffer.lock().unwrap();
+                playback.clear();
+                playback.extend(output_track);
+            }
+            *shared.app_state.lock().unwrap() = recorder::AppState::Playing;
 
-        ui::update_progress(&shared, output_track_len, &progress_manager);
+            // Wait for playback to finish
+            while let recorder::AppState::Playing = { shared.app_state.lock().unwrap().clone() } {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            info!("Frame {} sent, waiting for ACK...", frame_to_send.sequence);
 
-        let state = {
-            shared
-                .app_state
-                .lock()
-                .unwrap()
-                .clone()
-        };
-        if let recorder::AppState::Idle = state {
-            progress_manager.finish_all();
-            break;
-        }
+            // 2. Switch to recording to wait for ACK
+            {
+                // Clear previous recordings before listening for ACK
+                let mut rec_buf = shared.record_buffer.lock().unwrap();
+                rec_buf.clear();
+            }
+            *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
+            let mut processed_samples_len = 0;
+            let ack_wait_start = std::time::Instant::now();
+            // Timeout for ACK
+            let ack_timeout = std::time::Duration::from_millis(500);
+
+            // 3. ACK waiting loop
+            'ack_wait_loop: loop {
+                if ack_wait_start.elapsed() > ack_timeout {
+                    tracing::warn!("ACK timeout for seq: {}", frame_to_send.sequence);
+                    continue 'retransmit_loop; // Timed out, retransmit
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(50));
+
+                let current_samples = { shared.record_buffer.lock().unwrap().clone() };
+
+                if current_samples.len() > processed_samples_len {
+                    let new_samples = &current_samples[processed_samples_len..];
+                    let decoded_frames = decoder.process_samples(new_samples);
+                    processed_samples_len = current_samples.len();
+
+                    for ack_frame in decoded_frames {
+                        if ack_frame.frame_type == FrameType::Ack && ack_frame.sequence == frame_to_send.sequence {
+                            info!("✅ ACK received for seq: {}", frame_to_send.sequence);
+                            frames_sent += 1;
+                            progress_manager.inc("sender", 1).unwrap();
+                            break 'retransmit_loop; // ACK OK, send next frame
+                        } else {
+                            tracing::warn!(
+                                "Received unexpected frame while waiting for ACK {}: type={:?}, seq={}",
+                                frame_to_send.sequence,
+                                ack_frame.frame_type,
+                                ack_frame.sequence
+                            );
+                        }
+                    }
+                }
+            } // end ack_wait_loop
+        } // end retransmit_loop
     }
 
-    let elapsed = start_time
-        .elapsed()
-        .as_secs_f32();
-    info!("Transmission completed in {:.2} seconds", elapsed);
+    progress_manager.finish("sender", "All frames acknowledged").unwrap();
+    let total_duration = overall_start_time.elapsed().as_secs_f32();
+    info!(
+        "🎉 All {} frames transmitted and acknowledged in {:.2} seconds.",
+        total_frames, total_duration
+    );
+
+    // Save final received signal for debugging
+    if let Err(e) = utils::dump::dump_to_wav(
+        "./tmp/sender_final_ack_recording.wav",
+        &utils::dump::AudioData {
+            sample_rate,
+            audio_data: shared.record_buffer.lock().unwrap().clone(),
+            duration: shared.record_buffer.lock().unwrap().len() as f32 / sample_rate as f32,
+            channels: 1,
+        },
+    ) {
+        tracing::warn!("Failed to save sender's final recording: {}", e);
+    }
 }
 
 fn run_receiver(
@@ -268,16 +300,23 @@ fn run_receiver(
     info!("=== Receiver Mode ===");
     info!("Using line coding: {}", line_coding.name());
 
-    // Create decoder
+    // Create decoder and encoder for ACKs
     let mut decoder = PhyDecoder::new(
         SAMPLES_PER_LEVEL,
         PREAMBLE_PATTERN_BYTES,
         line_coding,
     );
-    let mut all_frames: Vec<Frame> = Vec::new();
+    let encoder = PhyEncoder::new(
+        SAMPLES_PER_LEVEL,
+        PREAMBLE_PATTERN_BYTES,
+        line_coding,
+    );
+
+    let mut all_data = Vec::new();
+    let mut received_sequences = std::collections::HashSet::new();
     let mut processed_samples_len = 0;
 
-    progress_manager
+    let progress_bar = progress_manager
         .create_bar(
             "recording",
             max_recording_duration_samples as u64,
@@ -289,9 +328,17 @@ fn run_receiver(
     *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
 
     let start_time = std::time::Instant::now();
+    let recording_timeout = std::time::Duration::from_secs(60); // Increased timeout
 
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    'main_loop: loop {
+        // Check for overall timeout
+        if start_time.elapsed() > recording_timeout {
+            info!("Receiver timeout reached. Exiting.");
+            break 'main_loop;
+        }
+
+        // Wait for some audio to be recorded
+        std::thread::sleep(std::time::Duration::from_millis(50));
 
         let current_samples = {
             let buffer = shared.record_buffer.lock().unwrap();
@@ -301,28 +348,61 @@ fn run_receiver(
         if current_samples.len() > processed_samples_len {
             let new_samples = &current_samples[processed_samples_len..];
             let decoded_frames = decoder.process_samples(new_samples);
-            if !decoded_frames.is_empty() {
-                info!("Decoded {} new frames", decoded_frames.len());
-                all_frames.extend(decoded_frames);
-            }
             processed_samples_len = current_samples.len();
+
+            for frame in decoded_frames {
+                if frame.frame_type == FrameType::Data {
+                    if !received_sequences.contains(&frame.sequence) {
+                        info!("Received new DATA frame with seq: {}", frame.sequence);
+                        // Store data and mark sequence as received
+                        all_data.push((frame.sequence, frame.data.clone()));
+                        received_sequences.insert(frame.sequence);
+                    } else {
+                        info!("Received duplicate DATA frame with seq: {}, re-sending ACK.", frame.sequence);
+                    }
+
+                    // Always send an ACK for a data frame, even if it's a duplicate.
+                    // This handles the case where our ACK was lost and the sender retransmitted.
+                    info!("Sending ACK for seq: {}", frame.sequence);
+                    let ack_frame = Frame::new_ack(frame.sequence);
+                    let ack_track = encoder.encode_frames(&[ack_frame], 0);
+
+                    // Put ACK in playback buffer
+                    {
+                        let mut playback = shared.playback_buffer.lock().unwrap();
+                        playback.clear();
+                        playback.extend(ack_track);
+                    }
+
+                    // Switch to playing state
+                    *shared.app_state.lock().unwrap() = recorder::AppState::Playing;
+
+                    // Wait for ACK playback to complete
+                    while let recorder::AppState::Playing = { shared.app_state.lock().unwrap().clone() } {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    info!("ACK sent for seq: {}", frame.sequence);
+
+                    // After sending ACK, switch back to recording for the next frame
+                    *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
+                    info!("Switched back to recording mode.");
+                }
+            }
         }
 
-        ui::update_progress(
-            &shared,
-            max_recording_duration_samples as usize,
-            &progress_manager,
-        );
+        progress_manager.set_position("recording", processed_samples_len as u64).unwrap();
 
+        // Check if user manually stopped (e.g., by letting recording finish)
         let state = { shared.app_state.lock().unwrap().clone() };
         if let recorder::AppState::Idle = state {
-            progress_manager.finish_all();
-            break;
+            info!("Recording finished by user or duration limit.");
+            break 'main_loop;
         }
     }
 
     let elapsed = start_time.elapsed().as_secs_f32();
-    info!("Recording completed in {:.2} seconds", elapsed);
+    info!("Receiver loop finished in {:.2} seconds", elapsed);
+    progress_manager.finish("recording", "Finished").unwrap();
 
     // Final processing for any remaining samples
     let final_samples = {
@@ -332,13 +412,16 @@ fn run_receiver(
     if final_samples.len() > processed_samples_len {
         let remaining_samples = &final_samples[processed_samples_len..];
         let decoded_frames = decoder.process_samples(remaining_samples);
-        if !decoded_frames.is_empty() {
-            info!("Decoded {} final frames", decoded_frames.len());
-            all_frames.extend(decoded_frames);
+        for frame in decoded_frames {
+             if frame.frame_type == FrameType::Data && !received_sequences.contains(&frame.sequence) {
+                info!("Decoded final DATA frame with seq: {}", frame.sequence);
+                all_data.push((frame.sequence, frame.data.clone()));
+                received_sequences.insert(frame.sequence);
+            }
         }
     }
 
-    info!("Total decoded frames: {}", all_frames.len());
+    info!("Total unique data frames received: {}", all_data.len());
 
     // Save recorded signal to WAV
     let sample_rate = SAMPLE_RATE;
@@ -357,32 +440,10 @@ fn run_receiver(
     }
 
     // Reconstruct file data
-    let mut output_data = Vec::new();
-    let mut expected_seq = 0u8;
-    let mut frame_errors = 0;
-
-    // Sort frames by sequence number to handle out-of-order decoding
-    all_frames.sort_by_key(|f| f.sequence);
-    all_frames.dedup_by_key(|f| f.sequence);
-
-    for frame in all_frames {
-        if frame.sequence != expected_seq {
-            tracing::warn!(
-                "Frame sequence mismatch: expected {}, got {}",
-                expected_seq,
-                frame.sequence
-            );
-            frame_errors += 1;
-        }
-        output_data.extend_from_slice(&frame.data);
-        expected_seq = frame.sequence.wrapping_add(1);
-    }
+    all_data.sort_by_key(|k| k.0);
+    let output_data: Vec<u8> = all_data.into_iter().flat_map(|(_, data)| data).collect();
 
     info!("Reconstructed {} bytes", output_data.len());
-
-    if frame_errors > 0 {
-        tracing::warn!("⚠️  {} frame sequence errors detected", frame_errors);
-    }
 
     // Write to output file
     let output_path = "OUTPUT.bin";
