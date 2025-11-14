@@ -45,6 +45,10 @@ pub const INTER_FRAME_GAP_SAMPLES: usize =
 
 pub const ACK_TIMEOUT_MS: u64 = 300;
 
+// CSMA
+pub const CARRIER_SENSE_SAMPLES: usize = 480; // 10ms at 48kHz
+pub const CARRIER_SENSE_THRESHOLD: f32 = 0.01; // RMS threshold
+
 // // Carrier Sensing (CSMA)
 // /// Power threshold for detecting busy channel
 // pub const CARRIER_SENSE_THRESHOLD: f32 = 0.01;

@@ -1,14 +1,17 @@
 use dialoguer::{Select, theme::ColorfulTheme};
 use jack;
+use rand::Rng;
 use std::fs;
 use tracing::info;
 
 mod audio;
 mod device;
+mod mac;
 mod phy;
 mod ui;
 mod utils;
 
+use mac::csma::is_channel_busy;
 use audio::recorder;
 use device::jack::{connect_system_ports, print_jack_info};
 use ui::print_banner;
@@ -76,7 +79,12 @@ fn main() {
         out_port_name.as_str(),
     );
 
-    let selections = &["Send File", "Receive File", "Test (No JACK - Loopback)"];
+    let selections = &[
+        "Send File",
+        "Receive File",
+        "CSMA Node",
+        "Test (No JACK - Loopback)",
+    ];
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Select mode")
         .default(0)
@@ -117,6 +125,9 @@ fn main() {
             max_duration_samples as u32,
             line_coding,
         );
+    } else if selection == 2 {
+        // CSMA Node
+        run_csma_node(shared, progress_manager, sample_rate as u32, line_coding);
     } else {
         // Test mode (no JACK)
         test_transmission(line_coding);
@@ -126,6 +137,214 @@ fn main() {
     info!("Exiting gracefully...");
     if let Err(err) = active_client.deactivate() {
         tracing::error!("Error deactivating client: {}", err);
+    }
+}
+
+fn run_csma_node(
+    shared: recorder::AppShared,
+    progress_manager: ProgressManager,
+    sample_rate: u32,
+    line_coding: LineCodingKind,
+) {
+    info!("=== CSMA Node Mode ===");
+    info!("Using line coding: {}", line_coding.name());
+
+    let node_id = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select Node ID")
+        .default(0)
+        .items(&["NODE 1", "NODE 2"])
+        .interact()
+        .unwrap();
+
+    let (input_path, output_path) = if node_id == 0 {
+        ("INPUT1to2.bin", "OUTPUT2to1.bin")
+    } else {
+        ("INPUT2to1.bin", "OUTPUT1to2.bin")
+    };
+
+    info!("Selected Node {}. Input: {}, Output: {}", node_id + 1, input_path, output_path);
+
+    // Read input file
+    let file_data = match fs::read(input_path) {
+        Ok(data) => {
+            info!("Read {} bytes from {}", data.len(), input_path);
+            data
+        }
+        Err(e) => {
+            tracing::error!("Failed to read {}: {}", input_path, e);
+            return;
+        }
+    };
+
+    // Create PHY encoder and decoder
+    let encoder = PhyEncoder::new(
+        SAMPLES_PER_LEVEL,
+        PREAMBLE_PATTERN_BYTES,
+        line_coding,
+    );
+    let mut decoder = PhyDecoder::new(
+        SAMPLES_PER_LEVEL,
+        PREAMBLE_PATTERN_BYTES,
+        line_coding,
+    );
+
+    // Split data into frames to be sent
+    let mut frames_to_send = Vec::new();
+    let mut seq = 0u8;
+    for chunk in file_data.chunks(MAX_FRAME_DATA_SIZE) {
+        let frame = Frame::new_data(seq, chunk.to_vec());
+        frames_to_send.push(frame);
+        seq = seq.wrapping_add(1);
+    }
+    info!("Created {} frames to send.", frames_to_send.len());
+
+    let mut next_frame_idx = 0;
+    let total_frames_to_send = frames_to_send.len();
+
+    // State for receiving data
+    let mut received_data: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut received_sequences = std::collections::HashSet::<u8>::new();
+    let mut processed_samples_len = 0;
+
+    // CSMA State
+    let mut backoff_timer = std::time::Instant::now();
+    let mut rng = rand::thread_rng();
+
+    // Start in recording mode
+    *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
+    let overall_start_time = std::time::Instant::now();
+
+    enum SenderState {
+        Idle,
+        Sensing,
+        Transmitting,
+        WaitingForAck {
+            seq: u8,
+            sent_time: std::time::Instant,
+            attempts: u32,
+        },
+    }
+
+    let mut sender_state = SenderState::Idle;
+    let mut frames_sent_count = 0;
+
+    'transceiver_loop: loop {
+        // --- RECEIVER LOGIC ---
+        let current_samples = shared.record_buffer.lock().unwrap().clone();
+        if current_samples.len() > processed_samples_len {
+            let new_samples = &current_samples[processed_samples_len..];
+            let decoded_frames = decoder.process_samples(new_samples);
+            processed_samples_len = current_samples.len();
+
+            for frame in decoded_frames {
+                match frame.frame_type {
+                    FrameType::Data => {
+                        if !received_sequences.contains(&frame.sequence) {
+                            info!("Received new DATA frame with seq: {}", frame.sequence);
+                            received_data.push((frame.sequence, frame.data.clone()));
+                            received_sequences.insert(frame.sequence);
+                        } else {
+                            info!("Received duplicate DATA frame seq: {}, re-sending ACK.", frame.sequence);
+                        }
+                        let ack_frame = Frame::new_ack(frame.sequence);
+                        let ack_track = encoder.encode_frames(&[ack_frame], 0);
+                        {
+                            let mut playback = shared.playback_buffer.lock().unwrap();
+                            playback.clear();
+                            playback.extend(ack_track);
+                        }
+                        *shared.app_state.lock().unwrap() = recorder::AppState::Playing;
+                        while let recorder::AppState::Playing = *shared.app_state.lock().unwrap() {}
+                        *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
+                    }
+                    FrameType::Ack => {
+                        if let SenderState::WaitingForAck { seq, .. } = sender_state {
+                            if frame.sequence == seq {
+                                info!("✅ ACK received for seq: {}", seq);
+                                frames_sent_count += 1;
+                                next_frame_idx += 1;
+                                sender_state = SenderState::Idle;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- SENDER LOGIC (State Machine) ---
+        match sender_state {
+            SenderState::Idle => {
+                if next_frame_idx < total_frames_to_send {
+                    sender_state = SenderState::Sensing;
+                }
+            }
+            SenderState::Sensing => {
+                if backoff_timer.elapsed().as_millis() > 0 {
+                    let samples = shared.record_buffer.lock().unwrap();
+                    if !is_channel_busy(&samples) {
+                        info!("Channel is idle, proceeding to transmit.");
+                        sender_state = SenderState::Transmitting;
+                    } else {
+                        let backoff_ms = rng.gen_range(50..150);
+                        info!("Channel is busy, backing off for {} ms.", backoff_ms);
+                        backoff_timer = std::time::Instant::now() + std::time::Duration::from_millis(backoff_ms);
+                        sender_state = SenderState::Sensing; // Remain in sensing state
+                    }
+                }
+            }
+            SenderState::Transmitting => {
+                let frame_to_send = &frames_to_send[next_frame_idx];
+                info!("Sending frame {}/{} (seq: {})", next_frame_idx + 1, total_frames_to_send, frame_to_send.sequence);
+                let output_track = encoder.encode_frames(&[frame_to_send.clone()], INTER_FRAME_GAP_SAMPLES);
+                {
+                    let mut playback = shared.playback_buffer.lock().unwrap();
+                    playback.clear();
+                    playback.extend(output_track);
+                }
+                *shared.app_state.lock().unwrap() = recorder::AppState::Playing;
+                while let recorder::AppState::Playing = *shared.app_state.lock().unwrap() {}
+                *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
+
+                sender_state = SenderState::WaitingForAck {
+                    seq: frame_to_send.sequence,
+                    sent_time: std::time::Instant::now(),
+                    attempts: 1,
+                };
+            }
+            SenderState::WaitingForAck { seq, sent_time, attempts } => {
+                if sent_time.elapsed() > std::time::Duration::from_millis(ACK_TIMEOUT_MS) {
+                    tracing::warn!("ACK timeout for seq: {}", seq);
+                    let backoff_ms = rng.gen_range(100..300);
+                    info!("Setting backoff for {} ms before retransmitting.", backoff_ms);
+                    backoff_timer = std::time::Instant::now() + std::time::Duration::from_millis(backoff_ms);
+                    sender_state = SenderState::Sensing;
+                }
+            }
+        }
+
+        // --- EXIT CONDITION ---
+        if next_frame_idx >= total_frames_to_send {
+             info!("All frames sent and acknowledged.");
+             break 'transceiver_loop;
+        }
+        if overall_start_time.elapsed() > std::time::Duration::from_secs(80) {
+            tracing::error!("Transmission timed out after 80 seconds.");
+            break 'transceiver_loop;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let total_duration = overall_start_time.elapsed();
+    info!("Transmission finished in {:.2}s.", total_duration.as_secs_f32());
+
+    // Reconstruct and write received file
+    received_data.sort_by_key(|k| k.0);
+    let output_data: Vec<u8> = received_data.into_iter().flat_map(|(_, data)| data).collect();
+    info!("Reconstructed {} bytes", output_data.len());
+    match fs::write(output_path, &output_data) {
+        Ok(_) => info!("✅ Written received data to {}", output_path),
+        Err(e) => tracing::error!("Failed to write {}: {}", output_path, e),
     }
 }
 
