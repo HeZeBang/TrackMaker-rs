@@ -1,7 +1,7 @@
 use dialoguer::{Select, theme::ColorfulTheme};
 use jack;
 use std::fs;
-use tracing::info;
+use tracing::{debug, error, info, warn};
 
 mod audio;
 mod device;
@@ -15,6 +15,13 @@ use ui::print_banner;
 use ui::progress::{ProgressManager, templates};
 use utils::consts::*;
 use utils::logging::init_logging;
+use rand::Rng;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use phy::{Frame, FrameType, LineCodingKind, PhyDecoder, PhyEncoder};
 
@@ -23,7 +30,7 @@ fn main() {
     print_banner();
 
     let (client, status) = jack::Client::new(
-        JACK_CLIENT_NAME,
+        format!("{}_{:04}", JACK_CLIENT_NAME, rand::rng().random_range(0..10000)).as_str(),
         jack::ClientOptions::NO_START_SERVER,
     )
     .unwrap();
@@ -31,12 +38,12 @@ fn main() {
     let (sample_rate, _buffer_size) = print_jack_info(&client);
 
     if sample_rate as u32 != SAMPLE_RATE {
-        tracing::warn!(
+        warn!(
             "Sample rate mismatch! Expected {}, got {}",
             SAMPLE_RATE,
             sample_rate
         );
-        tracing::warn!("Physical layer is designed for {} Hz", SAMPLE_RATE);
+        warn!("Physical layer is designed for {} Hz", SAMPLE_RATE);
     }
 
     let max_duration_samples = sample_rate * DEFAULT_RECORD_SECONDS;
@@ -125,7 +132,7 @@ fn main() {
 
     info!("Exiting gracefully...");
     if let Err(err) = active_client.deactivate() {
-        tracing::error!("Error deactivating client: {}", err);
+        error!("Error deactivating client: {}", err);
     }
 }
 
@@ -146,7 +153,7 @@ fn run_sender(
             data
         }
         Err(e) => {
-            tracing::error!("Failed to read {}: {}", input_path, e);
+            error!("Failed to read {}: {}", input_path, e);
             return;
         }
     };
@@ -199,7 +206,7 @@ fn run_sender(
                     attempts
                 );
             } else {
-                info!(
+                debug!(
                     "Sending frame {}/{} (seq: {})",
                     frames_sent + 1,
                     total_frames,
@@ -220,7 +227,7 @@ fn run_sender(
             while let recorder::AppState::Playing = { shared.app_state.lock().unwrap().clone() } {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            info!("Frame {} sent, waiting for ACK...", frame_to_send.sequence);
+            debug!("Frame {} sent, waiting for ACK...", frame_to_send.sequence);
 
             // 2. Switch to recording to wait for ACK
             {
@@ -237,7 +244,7 @@ fn run_sender(
             // 3. ACK waiting loop
             'ack_wait_loop: loop {
                 if ack_wait_start.elapsed() > ack_timeout {
-                    tracing::warn!("ACK timeout for seq: {}", frame_to_send.sequence);
+                    warn!("ACK timeout for seq: {}", frame_to_send.sequence);
                     continue 'retransmit_loop; // Timed out, retransmit
                 }
 
@@ -252,12 +259,12 @@ fn run_sender(
 
                     for ack_frame in decoded_frames {
                         if ack_frame.frame_type == FrameType::Ack && ack_frame.sequence == frame_to_send.sequence {
-                            info!("✅ ACK received for seq: {}", frame_to_send.sequence);
+                            debug!("ACK received for seq: {}", frame_to_send.sequence);
                             frames_sent += 1;
                             progress_manager.inc("sender", 1).unwrap();
                             break 'retransmit_loop; // ACK OK, send next frame
                         } else {
-                            tracing::warn!(
+                            warn!(
                                 "Received unexpected frame while waiting for ACK {}: type={:?}, seq={}",
                                 frame_to_send.sequence,
                                 ack_frame.frame_type,
@@ -277,18 +284,18 @@ fn run_sender(
         total_frames, total_duration
     );
 
-    // Save final received signal for debugging
-    if let Err(e) = utils::dump::dump_to_wav(
-        "./tmp/sender_final_ack_recording.wav",
-        &utils::dump::AudioData {
-            sample_rate,
-            audio_data: shared.record_buffer.lock().unwrap().clone(),
-            duration: shared.record_buffer.lock().unwrap().len() as f32 / sample_rate as f32,
-            channels: 1,
-        },
-    ) {
-        tracing::warn!("Failed to save sender's final recording: {}", e);
-    }
+    // // Save final received signal for debugging
+    // if let Err(e) = utils::dump::dump_to_wav(
+    //     "./tmp/sender_final_ack_recording.wav",
+    //     &utils::dump::AudioData {
+    //         sample_rate,
+    //         audio_data: shared.record_buffer.lock().unwrap().clone(),
+    //         duration: shared.record_buffer.lock().unwrap().len() as f32 / sample_rate as f32,
+    //         channels: 1,
+    //     },
+    // ) {
+    //     warn!("Failed to save sender's final recording: {}", e);
+    // }
 }
 
 fn run_receiver(
@@ -330,7 +337,17 @@ fn run_receiver(
     let start_time = std::time::Instant::now();
     let recording_timeout = std::time::Duration::from_secs(60); // Increased timeout
 
+        let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    // Ctrl+C 设置标志
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    }).expect("Error setting Ctrl-C handler");
+
     'main_loop: loop {
+        if !running.load(Ordering::SeqCst) { break; }
+
         // Check for overall timeout
         if start_time.elapsed() > recording_timeout {
             info!("Receiver timeout reached. Exiting.");
@@ -353,7 +370,7 @@ fn run_receiver(
             for frame in decoded_frames {
                 if frame.frame_type == FrameType::Data {
                     if !received_sequences.contains(&frame.sequence) {
-                        info!("Received new DATA frame with seq: {}", frame.sequence);
+                        debug!("Received new DATA frame with seq: {}", frame.sequence);
                         // Store data and mark sequence as received
                         all_data.push((frame.sequence, frame.data.clone()));
                         received_sequences.insert(frame.sequence);
@@ -363,7 +380,7 @@ fn run_receiver(
 
                     // Always send an ACK for a data frame, even if it's a duplicate.
                     // This handles the case where our ACK was lost and the sender retransmitted.
-                    info!("Sending ACK for seq: {}", frame.sequence);
+                    debug!("Sending ACK for seq: {}", frame.sequence);
                     let ack_frame = Frame::new_ack(frame.sequence);
                     let ack_track = encoder.encode_frames(&[ack_frame], 0);
 
@@ -381,11 +398,11 @@ fn run_receiver(
                     while let recorder::AppState::Playing = { shared.app_state.lock().unwrap().clone() } {
                         std::thread::sleep(std::time::Duration::from_millis(20));
                     }
-                    info!("ACK sent for seq: {}", frame.sequence);
+                    debug!("ACK sent for seq: {}", frame.sequence);
 
                     // After sending ACK, switch back to recording for the next frame
                     *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
-                    info!("Switched back to recording mode.");
+                    debug!("Switched back to recording mode.");
                 }
             }
         }
@@ -434,7 +451,7 @@ fn run_receiver(
             channels: 1,
         },
     ) {
-        tracing::warn!("Failed to save receiver WAV: {}", e);
+        warn!("Failed to save receiver WAV: {}", e);
     } else {
         info!("Saved received signal to ./tmp/receiver_input.wav");
     }
@@ -443,13 +460,13 @@ fn run_receiver(
     all_data.sort_by_key(|k| k.0);
     let output_data: Vec<u8> = all_data.into_iter().flat_map(|(_, data)| data).collect();
 
-    info!("Reconstructed {} bytes", output_data.len());
+    debug!("Reconstructed {} bytes", output_data.len());
 
     // Write to output file
     let output_path = "OUTPUT.bin";
     match fs::write(output_path, &output_data) {
-        Ok(_) => info!("✅ Written to {}", output_path),
-        Err(e) => tracing::error!("Failed to write {}: {}", output_path, e),
+        Ok(_) => debug!("Written to {}", output_path),
+        Err(e) => error!("Failed to write {}: {}", output_path, e),
     }
 }
 
@@ -509,7 +526,7 @@ fn test_transmission(line_coding: LineCodingKind) {
             channels: 1,
         },
     ) {
-        tracing::warn!("Failed to save WAV: {}", e);
+        warn!("Failed to save WAV: {}", e);
     } else {
         info!("Saved test signal to ./tmp/project2_test.wav");
     }
@@ -528,7 +545,7 @@ fn test_transmission(line_coding: LineCodingKind) {
     if decoded_data == test_data {
         info!("✅ Test PASSED - Data matches perfectly!");
     } else {
-        tracing::error!("❌ Test FAILED - Data mismatch");
+        error!("❌ Test FAILED - Data mismatch");
         info!("Original: {} bytes", test_data.len());
         info!("Decoded:  {} bytes", decoded_data.len());
 
