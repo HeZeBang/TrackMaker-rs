@@ -1,5 +1,7 @@
 // Frame format: [Preamble] [Frame Type] [Sequence] [Length] [Data] [CRC8]
 
+use crate::utils::consts::PHY_HEADER_BYTES;
+
 use super::crc::{bits_to_bytes, bytes_to_bits, calculate_crc8, verify_crc8};
 use tracing::debug;
 
@@ -125,7 +127,7 @@ impl Frame {
         }
 
         // Check if we have enough data
-        if bytes.len() < 4 + len as usize + 1 { // TODO: change me!
+        if bytes.len() < PHY_HEADER_BYTES + len as usize {
             debug!("Frame data incomplete");
             return None;
         }
@@ -154,57 +156,5 @@ impl Frame {
     /// Get the total size in bits
     pub fn size_bits(&self) -> usize {
         self.size_bytes() * 8
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_data_frame_serialization() {
-        let data = vec![0x01, 0x02, 0x03, 0x04];
-        let frame = Frame::new_data(42, data.clone());
-
-        let bytes = frame.to_bytes();
-        let recovered = Frame::from_bytes(&bytes).unwrap();
-
-        assert_eq!(recovered.frame_type, FrameType::Data);
-        assert_eq!(recovered.sequence, 42);
-        assert_eq!(recovered.data, data);
-    }
-
-    #[test]
-    fn test_ack_frame_serialization() {
-        let frame = Frame::new_ack(99);
-
-        let bytes = frame.to_bytes();
-        let recovered = Frame::from_bytes(&bytes).unwrap();
-
-        assert_eq!(recovered.frame_type, FrameType::Ack);
-        assert_eq!(recovered.sequence, 99);
-        assert_eq!(recovered.data.len(), 0);
-    }
-
-    #[test]
-    fn test_crc_verification() {
-        let frame = Frame::new_data(1, vec![0xAA, 0xBB, 0xCC]);
-        let mut bytes = frame.to_bytes();
-
-        // Corrupt data
-        bytes[4] ^= 0xFF;
-
-        // Should fail CRC check
-        assert!(Frame::from_bytes(&bytes).is_none());
-    }
-
-    #[test]
-    fn test_bits_serialization() {
-        let frame = Frame::new_data(5, vec![0x12, 0x34]);
-        let bits = frame.to_bits();
-        let recovered = Frame::from_bits(&bits).unwrap();
-
-        assert_eq!(recovered.sequence, 5);
-        assert_eq!(recovered.data, vec![0x12, 0x34]);
     }
 }

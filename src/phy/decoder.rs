@@ -1,7 +1,7 @@
 use super::frame::Frame;
 use super::line_coding::{LineCode, LineCodingKind};
 use crate::phy::FrameType;
-use crate::utils::consts::MAX_FRAME_DATA_SIZE;
+use crate::utils::consts::{MAX_FRAME_DATA_SIZE, PHY_HEADER_BYTES};
 use tracing::{debug, trace, warn};
 
 enum DecoderState {
@@ -141,7 +141,7 @@ impl PhyDecoder {
         let preamble_start_offset = frame_start_offset - self.preamble.len();
 
         // Not enough data for even the header
-        let header_bits = 40; // TODO: change me!
+        let header_bits = 8 * PHY_HEADER_BYTES;
         let header_samples = self.line_code.samples_for_bits(header_bits);
         if self.sample_buffer.len() < frame_start_offset + header_samples {
             return None; // Need more data
