@@ -83,7 +83,7 @@ impl PhyEncoder {
             }
         }
 
-        info!(
+        debug!(
             "Encoded {} frames, total samples: {}",
             frames.len(),
             output.len()
