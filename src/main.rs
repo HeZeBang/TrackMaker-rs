@@ -232,7 +232,7 @@ fn run_sender(
             let mut processed_samples_len = 0;
             let ack_wait_start = std::time::Instant::now();
             // Timeout for ACK
-            let ack_timeout = std::time::Duration::from_millis(500);
+            let ack_timeout = std::time::Duration::from_millis(ACK_TIMEOUT_MS);
 
             // 3. ACK waiting loop
             'ack_wait_loop: loop {
