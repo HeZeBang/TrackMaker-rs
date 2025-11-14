@@ -3,6 +3,10 @@
 use super::crc::{bits_to_bytes, bytes_to_bits, calculate_crc8, verify_crc8};
 use tracing::debug;
 
+pub type CRCType = u8;
+pub type SeqType = u8;
+pub type LenType = u16;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FrameType {
     Data = 0x01,
@@ -50,9 +54,18 @@ impl Frame {
     }
 
     /// Serialize frame to bytes (without preamble)
-    /// Format: [Type:1] [Seq:1] [Len:2] [Data:N] [CRC:1]
+    /// Format: [Len:2] [CRC:1] [Type:1] [Seq:1] [Data:N]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
+
+        // Data length (2 bytes, big-endian)
+        let len = self.data.len() as LenType;
+        bytes.push((len >> 8) as u8);
+        bytes.push((len & 0xFF) as u8);
+
+        // CRC8
+        let crc = calculate_crc8(&self.data);
+        bytes.push(crc);
 
         // Frame type (1 byte)
         bytes.push(self.frame_type.to_u8());
@@ -60,17 +73,8 @@ impl Frame {
         // Sequence number (1 byte)
         bytes.push(self.sequence);
 
-        // Data length (2 bytes, big-endian)
-        let len = self.data.len() as u16;
-        bytes.push((len >> 8) as u8);
-        bytes.push((len & 0xFF) as u8);
-
         // Data
         bytes.extend_from_slice(&self.data);
-
-        // CRC8 (calculated over type + seq + len + data)
-        let crc = calculate_crc8(&bytes);
-        bytes.push(crc);
 
         bytes
     }
@@ -80,18 +84,57 @@ impl Frame {
         bytes_to_bits(&self.to_bytes())
     }
 
-    /// Deserialize frame from bytes (without preamble)
-    /// Returns None if CRC check fails or format is invalid
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+
+    fn bits_to_byte(bits: &[u8]) -> u8 {
+        let mut byte = 0u8;
+        for (i, &bit) in bits.iter().enumerate().take(8) {
+            if bit != 0 {
+                byte |= 1 << (7 - i);
+            }
+        }
+        byte
+    }
+
+    pub fn parse_header(bits: &[u8]) -> Option<(LenType, CRCType, FrameType, SeqType)> {
+        let bytes = bits_to_bytes(bits);
+        Self::parse_header_bytes(&bytes)
+    }
+
+    fn parse_header_bytes(bytes: &[u8]) -> Option<(LenType, CRCType, FrameType, SeqType)> {
         if bytes.len() < 5 {
-            // Minimum: type(1) + seq(1) + len(2) + crc(1)
-            debug!("Frame too short: {} bytes", bytes.len());
+            debug!("PHY Header too short: {} bytes", bytes.len());
             return None;
         }
 
+        // Parse length
+        let len: LenType = ((bytes[0] as u16) << 8) | (bytes[1] as u16);
+
+        // Parse CRC
+        let crc: CRCType = bytes[2];
+
+        // Parse frame type
+        let frame_type: FrameType = FrameType::from_u8(bytes[3])?;
+
+        // Parse sequence
+        let sequence: SeqType = bytes[4];
+
+        Some((len, crc, frame_type, sequence))
+    }
+
+    /// Deserialize frame from bytes (without preamble)
+    /// Returns None if CRC check fails or format is invalid
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        // if bytes.len() < 5 { // TODO: remove?
+        //     // Minimum: type(1) + seq(1) + len(2) + crc(1)
+        //     debug!("Frame too short: {} bytes", bytes.len());
+        //     return None;
+        // }
+
+        let (len, crc, frame_type, sequence) = Self::parse_header_bytes(&bytes[..5])?;
+
         // Extract CRC and data
-        let data_bytes = &bytes[..bytes.len() - 1];
-        let crc = bytes[bytes.len() - 1];
+        let data_bytes = &bytes[5..5 + len as usize];
+        // let crc = bytes[bytes.len() - 1];
 
         // Verify CRC
         if !verify_crc8(data_bytes, crc) {
@@ -100,22 +143,23 @@ impl Frame {
         }
 
         // Parse frame type
-        let frame_type = FrameType::from_u8(bytes[0])?;
+        // let frame_type = FrameType::from_u8(bytes[0])?;
 
         // Parse sequence
-        let sequence = bytes[1];
+        // let sequence = bytes[1];
 
         // Parse length
-        let len = ((bytes[2] as u16) << 8) | (bytes[3] as u16);
+        // let len = ((bytes[2] as u16) << 8) | (bytes[3] as u16);
 
         // Check if we have enough data
-        if bytes.len() < 4 + len as usize + 1 {
+        if bytes.len() < 4 + len as usize + 1 { // TODO: change me!
             debug!("Frame data incomplete");
             return None;
         }
 
         // Extract data
-        let data = bytes[4..4 + len as usize].to_vec();
+        // let data = bytes[4..4 + len as usize].to_vec();
+        let data = data_bytes.to_vec();
 
         Some(Frame {
             frame_type,

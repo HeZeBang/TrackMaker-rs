@@ -141,7 +141,7 @@ impl PhyDecoder {
         let preamble_start_offset = frame_start_offset - self.preamble.len();
 
         // Not enough data for even the header
-        let header_bits = 32;
+        let header_bits = 40;
         let header_samples = self.line_code.samples_for_bits(header_bits);
         if self.sample_buffer.len() < frame_start_offset + header_samples {
             return None; // Need more data
@@ -151,20 +151,32 @@ impl PhyDecoder {
         let header_data = &self.sample_buffer[frame_start_offset..frame_start_offset + header_samples];
         let header_decoded = self.line_code.decode(header_data);
 
-        if header_decoded.len() < header_bits {
-            warn!(
-                "Failed to decode header at offset {}. Returning to search.",
-                preamble_start_offset
-            );
-            self.state = DecoderState::Searching;
-            return Some(1); // Consume 1 sample to avoid getting stuck
-        }
+        // if header_decoded.len() < header_bits {
+        //     warn!(
+        //         "Failed to decode header at offset {}. Returning to search.",
+        //         preamble_start_offset
+        //     );
+        //     self.state = DecoderState::Searching;
+        //     return Some(1); // Consume 1 sample to avoid getting stuck
+        // }
 
         // Extract data length
-        let len_high = Self::bits_to_byte(&header_decoded[16..24]);
-        let len_low = Self::bits_to_byte(&header_decoded[24..32]);
-        let data_len = ((len_high as usize) << 8) | (len_low as usize);
-        let data_type: FrameType = FrameType::from_u8(Self::bits_to_byte(&header_decoded[0..8])).unwrap_or(FrameType::Ack);
+        // let len_high = Self::bits_to_byte(&header_decoded[16..24]);
+        // let len_low = Self::bits_to_byte(&header_decoded[24..32]);
+        // let data_len = ((len_high as usize) << 8) | (len_low as usize);
+        // let data_type: FrameType = FrameType::from_u8(Self::bits_to_byte(&header_decoded[0..8])).unwrap_or(FrameType::Ack);
+        let (data_len_, _crc, data_type, _seq) = match Frame::parse_header(&header_decoded) {
+            Some(vals) => vals,
+            None => {
+                warn!(
+                    "Failed to parse header at offset {}. Returning to search.",
+                    preamble_start_offset
+                );
+                self.state = DecoderState::Searching;
+                return Some(1); // Consume 1 sample to avoid getting stuck
+            }
+        };
+        let data_len = data_len_ as usize;
 
         if data_type == FrameType::Data && data_len == 0 || data_len > self.max_frame_bytes {
             warn!(
@@ -245,15 +257,6 @@ impl PhyDecoder {
         dot_product / (window_energy * self.preamble_energy)
     }
 
-    fn bits_to_byte(bits: &[u8]) -> u8 {
-        let mut byte = 0u8;
-        for (i, &bit) in bits.iter().enumerate().take(8) {
-            if bit != 0 {
-                byte |= 1 << (7 - i);
-            }
-        }
-        byte
-    }
 }
 
 #[cfg(test)]
