@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn test_encoder() {
         let encoder = PhyEncoder::new(2, 2, LineCodingKind::FourBFiveB);
-        let frame = Frame::new_data(1, vec![0x12, 0x34, 0x56]);
+        let frame = Frame::new_data(1, 0, 1, vec![0x12, 0x34, 0x56]);
         let samples = encoder.encode_frame(&frame);
 
         // Should have preamble + frame data
@@ -116,8 +116,8 @@ mod tests {
     fn test_multiple_frames() {
         let encoder = PhyEncoder::new(2, 2, LineCodingKind::FourBFiveB);
         let frames = vec![
-            Frame::new_data(0, vec![0x01, 0x02]),
-            Frame::new_data(1, vec![0x03, 0x04]),
+            Frame::new_data(0, 0, 1, vec![0x01, 0x02]),
+            Frame::new_data(1, 0, 1, vec![0x03, 0x04]),
         ];
 
         let samples = encoder.encode_frames(&frames, 100);

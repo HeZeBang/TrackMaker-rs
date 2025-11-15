@@ -1,4 +1,4 @@
-use dialoguer::{Select, theme::ColorfulTheme};
+use dialoguer::{Select, theme::ColorfulTheme, Input};
 use jack;
 use std::fs;
 use tracing::{debug, error, info, warn};
@@ -6,6 +6,7 @@ use tracing::{debug, error, info, warn};
 mod audio;
 mod device;
 mod phy;
+mod mac;
 mod ui;
 mod utils;
 
@@ -103,7 +104,6 @@ fn main() {
         .interact()
         .unwrap();
     let line_coding = line_coding_options[line_coding_idx];
-    info!("Selected line coding: {}", line_coding.name());
 
     {
         shared
@@ -115,14 +115,36 @@ fn main() {
 
     if selection == 0 {
         // Sender
-        run_sender(shared, progress_manager, sample_rate as u32, line_coding);
+        let tx_addr = Input::<mac::types::MacAddr>::with_theme(&ColorfulTheme::default())
+            .with_prompt("Enter local sender addr")
+            .default(1)
+            .interact()
+            .unwrap();
+        let rx_addr = Input::<mac::types::MacAddr>::with_theme(&ColorfulTheme::default())
+            .with_prompt("Enter remote receiver addr")
+            .default(2)
+            .interact()
+            .unwrap();
+        run_sender(shared, progress_manager, sample_rate as u32, line_coding, tx_addr, rx_addr);
     } else if selection == 1 {
         // Receiver
+        let rx_addr = Input::<mac::types::MacAddr>::with_theme(&ColorfulTheme::default())
+            .with_prompt("Enter local receiver addr")
+            .default(2)
+            .interact()
+            .unwrap();
+        let tx_addr = Input::<mac::types::MacAddr>::with_theme(&ColorfulTheme::default())
+            .with_prompt("Enter remote sender addr")
+            .default(1)
+            .interact()
+            .unwrap();
         run_receiver(
             shared,
             progress_manager,
             max_duration_samples as u32,
             line_coding,
+            rx_addr,
+            tx_addr
         );
     } else {
         // Test mode (no JACK)
@@ -141,6 +163,8 @@ fn run_sender(
     progress_manager: ProgressManager,
     sample_rate: u32,
     line_coding: LineCodingKind,
+    sender_addr: mac::types::MacAddr,
+    receiver_addr: mac::types::MacAddr,
 ) {
     info!("=== Sender Mode (with Stop-and-Wait) ===");
     info!("Using line coding: {}", line_coding.name());
@@ -168,13 +192,14 @@ fn run_sender(
         SAMPLES_PER_LEVEL,
         PREAMBLE_PATTERN_BYTES,
         line_coding,
+        sender_addr,
     );
 
     // Split data into frames
     let mut frames = Vec::new();
     let mut seq = 0u8;
     for chunk in file_data.chunks(MAX_FRAME_DATA_SIZE) {
-        let frame = Frame::new_data(seq, chunk.to_vec());
+        let frame = Frame::new_data(seq, sender_addr, receiver_addr, chunk.to_vec()); // TODO: change this!
         frames.push(frame);
         seq = seq.wrapping_add(1);
     }
@@ -303,6 +328,8 @@ fn run_receiver(
     progress_manager: ProgressManager,
     max_recording_duration_samples: u32,
     line_coding: LineCodingKind,
+    receiver_addr: mac::types::MacAddr,
+    sender_addr: mac::types::MacAddr,
 ) {
     info!("=== Receiver Mode ===");
     info!("Using line coding: {}", line_coding.name());
@@ -312,6 +339,7 @@ fn run_receiver(
         SAMPLES_PER_LEVEL,
         PREAMBLE_PATTERN_BYTES,
         line_coding,
+        receiver_addr,
     );
     let encoder = PhyEncoder::new(
         SAMPLES_PER_LEVEL,
@@ -381,7 +409,7 @@ fn run_receiver(
                     // Always send an ACK for a data frame, even if it's a duplicate.
                     // This handles the case where our ACK was lost and the sender retransmitted.
                     debug!("Sending ACK for seq: {}", frame.sequence);
-                    let ack_frame = Frame::new_ack(frame.sequence);
+                    let ack_frame = Frame::new_ack(frame.sequence, receiver_addr, sender_addr); // TODO: change this to actual sender addr
                     let ack_track = encoder.encode_frames(&[ack_frame], 0);
 
                     // Put ACK in playback buffer
@@ -493,6 +521,7 @@ fn test_transmission(line_coding: LineCodingKind) {
         SAMPLES_PER_LEVEL,
         PREAMBLE_PATTERN_BYTES,
         line_coding,
+        2
     );
 
     // Create frames
@@ -500,7 +529,7 @@ fn test_transmission(line_coding: LineCodingKind) {
     let mut seq = 0u8;
 
     for chunk in test_data.chunks(MAX_FRAME_DATA_SIZE) {
-        let frame = Frame::new_data(seq, chunk.to_vec());
+        let frame = Frame::new_data(seq, 0, 1, chunk.to_vec());
         frames.push(frame);
         seq = seq.wrapping_add(1);
     }

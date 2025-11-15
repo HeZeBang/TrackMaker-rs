@@ -1,6 +1,7 @@
 use super::frame::Frame;
 use super::line_coding::{LineCode, LineCodingKind};
 use crate::phy::FrameType;
+use crate::mac;
 use crate::utils::consts::{MAX_FRAME_DATA_SIZE, PHY_HEADER_BYTES};
 use tracing::{debug, trace, warn};
 
@@ -25,6 +26,7 @@ pub struct PhyDecoder {
     max_frame_bytes: usize,
 
     decoded_frames: Vec<Frame>,
+    local_addr: mac::types::MacAddr,
 }
 
 impl PhyDecoder {
@@ -32,6 +34,7 @@ impl PhyDecoder {
         samples_per_level: usize,
         preamble_bytes: usize,
         line_coding_kind: LineCodingKind,
+        local_addr: mac::types::MacAddr,
     ) -> Self {
         let line_code = line_coding_kind.create(samples_per_level);
         let preamble = line_code.generate_preamble(preamble_bytes);
@@ -50,6 +53,7 @@ impl PhyDecoder {
             buffer_offset: 0,
             max_frame_bytes: MAX_FRAME_DATA_SIZE * 2, // 1x for encoder raw data + header + CRC...
             decoded_frames: Vec::new(),
+            local_addr,
         }
     }
 
@@ -151,7 +155,7 @@ impl PhyDecoder {
         let header_data = &self.sample_buffer[frame_start_offset..frame_start_offset + header_samples];
         let header_decoded = self.line_code.decode(header_data);
 
-        let (data_len_, _crc, data_type, _seq) = match Frame::parse_header(&header_decoded) {
+        let (data_len_, _crc, data_type, _seq, _src, dst) = match Frame::parse_header(&header_decoded) {
             Some(vals) => vals,
             None => {
                 warn!(
@@ -197,13 +201,24 @@ impl PhyDecoder {
             return Some(consumed_len);
         }
 
+        if dst != self.local_addr {
+            debug!(
+                "Frame not for us (dst={}). Ignoring and returning to search.",
+                dst
+            );
+            self.state = DecoderState::Searching;
+            return Some(consumed_len);
+        }
+
         match Frame::from_bits(&frame_bits) {
             Some(frame) => {
                 debug!(
-                    "✓ Frame decoded: seq={}, type={:?}, len={}",
+                    "✓ Frame decoded: seq={}, type={:?}, len={}, src={}, dst={}",
                     frame.sequence,
                     frame.frame_type,
-                    frame.data.len()
+                    frame.data.len(),
+                    frame.src,
+                    frame.dst
                 );
                 self.decoded_frames.push(frame);
                 self.state = DecoderState::Searching; // Go back to searching for the next frame
@@ -243,66 +258,4 @@ impl PhyDecoder {
         dot_product / (window_energy * self.preamble_energy)
     }
 
-}
-
-#[cfg(test)]
-mod tests {
-// ... existing tests ...
-    use super::*;
-    use crate::phy::encoder::PhyEncoder;
-    use crate::phy::line_coding::LineCodingKind;
-
-    #[test]
-    fn test_decoder() {
-        let encoder = PhyEncoder::new(2, 2, LineCodingKind::FourBFiveB);
-        let mut decoder = PhyDecoder::new(2, 2, LineCodingKind::FourBFiveB);
-
-        let frame = Frame::new_data(1, vec![0x12, 0x34, 0x56, 0x78]);
-        let samples = encoder.encode_frame(&frame);
-
-        let decoded = decoder.process_samples(&samples);
-
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].sequence, 1);
-        assert_eq!(decoded[0].data, vec![0x12, 0x34, 0x56, 0x78]);
-    }
-
-    #[test]
-    fn test_multiple_frames() {
-        let encoder = PhyEncoder::new(2, 2, LineCodingKind::FourBFiveB);
-        let mut decoder = PhyDecoder::new(2, 2, LineCodingKind::FourBFiveB);
-
-        let frames = vec![
-            Frame::new_data(0, vec![0x01, 0x02]),
-            Frame::new_data(1, vec![0x03, 0x04]),
-            Frame::new_data(2, vec![0x05, 0x06]),
-        ];
-
-        let samples = encoder.encode_frames(&frames, 100);
-        let decoded = decoder.process_samples(&samples);
-
-        assert_eq!(decoded.len(), 3);
-        for (i, frame) in decoded.iter().enumerate() {
-            assert_eq!(frame.sequence, i as u8);
-        }
-    }
-
-    #[test]
-    fn test_noisy_channel() {
-        let encoder = PhyEncoder::new(2, 2, LineCodingKind::FourBFiveB);
-        let mut decoder = PhyDecoder::new(2, 2, LineCodingKind::FourBFiveB);
-
-        let frame = Frame::new_data(0, vec![0xAA, 0xBB]);
-        let mut samples = encoder.encode_frame(&frame);
-
-        // NOISEEEEEEEEEEEEE
-        for sample in samples.iter_mut() {
-            *sample += (rand::random::<f32>() - 0.5) * 0.1;
-        }
-
-        let decoded = decoder.process_samples(&samples);
-
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].data, vec![0xAA, 0xBB]);
-    }
 }

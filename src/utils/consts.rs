@@ -45,7 +45,7 @@ pub const INTER_FRAME_GAP_SAMPLES: usize =
 
 pub const ACK_TIMEOUT_MS: u64 = 300;
 
-pub const PHY_HEADER_BYTES: usize = 5; // TODO: Length (2) + CRC (1) + Frame Type (1) + Sequence (1)
+pub const PHY_HEADER_BYTES: usize = 7; // Length (2) + CRC (1) + Frame Type (1) + Sequence (1) + Src (1) + Dst (1)
 
 // // Carrier Sensing (CSMA)
 // /// Power threshold for detecting busy channel

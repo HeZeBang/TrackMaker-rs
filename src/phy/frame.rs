@@ -35,28 +35,32 @@ impl FrameType {
 pub struct Frame {
     pub frame_type: FrameType,
     pub sequence: u8,  // Sequence number for ordering and ACK
+    pub src: u8,       // Source address
+    pub dst: u8,       // Destination address
     pub data: Vec<u8>, // Payload data
 }
 
 impl Frame {
-    pub fn new(frame_type: FrameType, sequence: u8, data: Vec<u8>) -> Self {
+    pub fn new(frame_type: FrameType, sequence: u8, src: u8, dst: u8, data: Vec<u8>) -> Self {
         Self {
             frame_type,
             sequence,
+            src,
+            dst,
             data,
         }
     }
 
-    pub fn new_data(sequence: u8, data: Vec<u8>) -> Self {
-        Self::new(FrameType::Data, sequence, data)
+    pub fn new_data(sequence: u8, src: u8, dst: u8, data: Vec<u8>) -> Self {
+        Self::new(FrameType::Data, sequence, src, dst, data)
     }
 
-    pub fn new_ack(sequence: u8) -> Self {
-        Self::new(FrameType::Ack, sequence, Vec::new())
+    pub fn new_ack(sequence: u8, from: u8, to: u8) -> Self {
+        Self::new(FrameType::Ack, sequence, from, to, Vec::new())
     }
 
     /// Serialize frame to bytes (without preamble)
-    /// Format: [Len:2] [CRC:1] [Type:1] [Seq:1] [Data:N]
+    /// Format: [Len:2] [CRC:1] [Type:1] [Seq:1] [Src:1] [Dst:1] [Data:N]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 
@@ -75,6 +79,12 @@ impl Frame {
         // Sequence number (1 byte)
         bytes.push(self.sequence);
 
+        // Source address (1 byte)
+        bytes.push(self.src);
+
+        // Destination address (1 byte)
+        bytes.push(self.dst);
+
         // Data
         bytes.extend_from_slice(&self.data);
 
@@ -86,12 +96,12 @@ impl Frame {
         bytes_to_bits(&self.to_bytes())
     }
 
-    pub fn parse_header(bits: &[u8]) -> Option<(LenType, CRCType, FrameType, SeqType)> {
+    pub fn parse_header(bits: &[u8]) -> Option<(LenType, CRCType, FrameType, SeqType, u8, u8)> {
         let bytes = bits_to_bytes(bits);
         Self::parse_header_bytes(&bytes)
     }
 
-    fn parse_header_bytes(bytes: &[u8]) -> Option<(LenType, CRCType, FrameType, SeqType)> {
+    fn parse_header_bytes(bytes: &[u8]) -> Option<(LenType, CRCType, FrameType, SeqType, u8, u8)> {
         if bytes.len() < PHY_HEADER_BYTES {
             debug!("PHY Header too short: {} bytes", bytes.len());
             return None;
@@ -109,13 +119,20 @@ impl Frame {
         // Parse sequence
         let sequence: SeqType = bytes[4];
 
-        Some((len, crc, frame_type, sequence))
+        // Parse source address
+        let src: u8 = bytes[5];
+
+        // Parse destination address
+        let dst: u8 = bytes[6];
+
+        Some((len, crc, frame_type, sequence, src, dst))
     }
 
     /// Deserialize frame from bytes (without preamble)
     /// Returns None if CRC check fails or format is invalid
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let (len, crc, frame_type, sequence) = Self::parse_header_bytes(&bytes[..PHY_HEADER_BYTES])?;
+        let (len, crc, frame_type, sequence, src, dst) =
+            Self::parse_header_bytes(&bytes[..PHY_HEADER_BYTES])?;
 
         // Extract CRC and data
         let data_bytes = &bytes[PHY_HEADER_BYTES..PHY_HEADER_BYTES + len as usize];
@@ -138,6 +155,8 @@ impl Frame {
         Some(Frame {
             frame_type,
             sequence,
+            src,
+            dst,
             data,
         })
     }
