@@ -22,7 +22,6 @@ use ui::print_banner;
 use ui::progress::{ProgressManager, templates};
 use utils::consts::*;
 use utils::logging::init_logging;
-use rand::Rng;
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
