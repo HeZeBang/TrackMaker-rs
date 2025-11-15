@@ -51,13 +51,13 @@ pub const PHY_HEADER_BYTES: usize = 7; // Length (2) + CRC (1) + Frame Type (1) 
 /// Energy level threshold to consider the channel busy.
 pub const ENERGY_THRESHOLD: f32 = 0.05;
 /// Energy detection minimum samples
-pub const ENERGY_DETECTION_SAMPLES: usize = 240; // 5 ms at 48 kHz
+pub const ENERGY_DETECTION_SAMPLES: usize = 40;
 /// Distributed Inter-frame Space (DIFS) in milliseconds.
 /// The duration to sense the channel to see if it's idle.
-pub const DIFS_DURATION_MS: u64 = 50;
+pub const DIFS_DURATION_MS: u64 = 20;
 /// Minimum contention window size (in slots).
-pub const CW_MIN: u32 = 15;
+pub const CW_MIN: u32 = 10;
 /// Maximum contention window size (in slots).
-pub const CW_MAX: u32 = 1023;
+pub const CW_MAX: u32 = 200;
 /// Duration of a single backoff slot in milliseconds.
-pub const SLOT_TIME_MS: u64 = 10;
+pub const SLOT_TIME_MS: u64 = 5;

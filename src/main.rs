@@ -229,6 +229,7 @@ fn run_sender(
         'csma_loop: loop {
             match state {
                 mac::CSMAState::Sensing => {
+                    debug!("Sensing channel for idleness...");
                     std::thread::sleep(std::time::Duration::from_millis(ENERGY_DETECTION_SAMPLES as u64 * 1000 / sample_rate as u64));
                     let recorded_samples = { shared.record_buffer.lock().unwrap().clone() };
                     match mac::is_channel_busy(&recorded_samples) {
@@ -247,12 +248,11 @@ fn run_sender(
                     }
                 }
                 mac::CSMAState::Backoff(mut counter) => {
+                    debug!("Backoff counter: {}", counter);
                     if counter > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(SLOT_TIME_MS));
                         match mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
                             Some(true) => {
                                 trace!("Channel busy detected during backoff.");
-                                shared.record_buffer.lock().unwrap().clear();
                                 state = mac::CSMAState::BackoffPaused(counter);
                             }
                             Some(false) => {
@@ -262,6 +262,7 @@ fn run_sender(
                                 state = mac::CSMAState::Backoff(counter);
                             }
                             None => {
+                                std::thread::sleep(std::time::Duration::from_millis(SLOT_TIME_MS));
                                 trace!("Not enough samples to determine channel state during backoff.");
                             }
                         }
@@ -270,6 +271,7 @@ fn run_sender(
                     }
                 }
                 mac::CSMAState::BackoffPaused(counter) => {
+                    debug!("Backoff paused at counter {}", counter);
                     match mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
                         Some(true) => {
                             trace!("Channel still busy during backoff pause.");
@@ -296,26 +298,32 @@ fn run_sender(
                             shared.record_buffer.lock().unwrap().clear();
                         }
                         None => {
-                            trace!("Not enough samples to determine channel state during backoff pause.");
+                            std::thread::sleep(std::time::Duration::from_millis(SLOT_TIME_MS));
+                            trace!("Not enough samples {} to determine channel state during backoff pause.", &{ shared.record_buffer.lock().unwrap().len() });
                         }
                     }
                 }
                 mac::CSMAState::WaitingForDIFS => {
+                    debug!("Channel idle, waiting for DIFS...");
                     std::thread::sleep(std::time::Duration::from_millis(DIFS_DURATION_MS));
 
                     match mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
                         Some(false) => {
                             trace!("DIFS wait is over and channel is still idle. Starting backoff.");
-                            let cw = (CW_MIN as u16 * 2_u16.pow(stage as u32)).min(CW_MAX as u16) as u8;
+                            let cw = (CW_MIN as u16 * 2_u16 * stage ).min(CW_MAX as u16) as u8;
                             state = mac::CSMAState::Backoff(rand::random_range(0..=cw));
+                            shared.record_buffer.lock().unwrap().clear();
                         }
                         Some(true) => {
                             trace!("Channel became busy during DIFS wait. Returning to sensing.");
                             state = mac::CSMAState::Sensing;
+                            shared.record_buffer.lock().unwrap().clear();
                         }
-                        None => !unreachable!(), // We always have enough samples after DIFS
+                        None => {
+                            std::thread::sleep(std::time::Duration::from_millis(SLOT_TIME_MS));
+                            trace!("Not enough samples to determine channel state after DIFS wait.");
+                        }
                     }
-                    shared.record_buffer.lock().unwrap().clear();
                 }
                 mac::CSMAState::Transmitting => {
                     debug!("Channel idle, proceeding to transmit frame seq: {}", frame_to_send.sequence);
@@ -354,7 +362,7 @@ fn run_sender(
                         if ack_wait_start.elapsed() > ack_timeout {
                             warn!("ACK timeout for seq: {}", frame_to_send.sequence);
                             stage += 1;
-                            let cw = (CW_MIN as u16 * 2_u16.pow(stage as u32)).min(CW_MAX as u16) as u8; // BEB
+                            let cw = (CW_MIN as u16 * 2_u16 * stage).min(CW_MAX as u16) as u8; // Not BEB
                             state = mac::CSMAState::Backoff(rand::random_range(0..=cw));
                             break 'ack_wait_loop; // Timed out, retransmit
                         }
