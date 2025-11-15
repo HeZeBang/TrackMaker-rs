@@ -170,8 +170,8 @@ fn run_sender(
     info!("Using line coding: {}", line_coding.name());
 
     // Read input file
-    let input_path = "INPUT.bin";
-    let file_data = match fs::read(input_path) {
+    let input_path = format!("INPUT{}to{}.bin", &sender_addr, &receiver_addr);
+    let file_data = match fs::read(&input_path) {
         Ok(data) => {
             info!("Read {} bytes from {}", data.len(), input_path);
             data
@@ -588,9 +588,9 @@ fn run_receiver(
     debug!("Reconstructed {} bytes", output_data.len());
 
     // Write to output file
-    let output_path = "OUTPUT.bin";
-    match fs::write(output_path, &output_data) {
-        Ok(_) => debug!("Written to {}", output_path),
+    let output_path = format!("OUTPUT{}to{}.bin", &sender_addr, &receiver_addr);
+    match fs::write(&output_path, &output_data) {
+        Ok(_) => debug!("Written to {}", &output_path),
         Err(e) => error!("Failed to write {}: {}", output_path, e),
     }
 }

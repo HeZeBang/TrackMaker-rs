@@ -180,3 +180,4 @@ tmp
 .direnv
 INPUT.bin
 OUTPUT.bin
+*.bin
