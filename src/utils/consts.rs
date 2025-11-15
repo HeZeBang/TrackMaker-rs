@@ -1,5 +1,5 @@
 /// 默认录音时长（秒）
-pub const DEFAULT_RECORD_SECONDS: usize = 120;
+pub const DEFAULT_RECORD_SECONDS: usize = 40;
 
 /// 日志级别（可被 RUST_LOG 覆盖）
 pub const LOG_LEVEL: &str = "info";
@@ -34,7 +34,7 @@ pub const SAMPLES_PER_LEVEL: usize = 3;
 pub const PREAMBLE_PATTERN_BYTES: usize = 4;
 
 /// Maximum data payload per frame (bytes)
-pub const MAX_FRAME_DATA_SIZE: usize = 256;
+pub const MAX_FRAME_DATA_SIZE: usize = 1024;
 
 /// Milliseconds between frames
 pub const INTER_FRAME_GAP_MS: u32 = 5;
