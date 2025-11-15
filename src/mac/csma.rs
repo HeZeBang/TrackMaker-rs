@@ -65,9 +65,34 @@ impl Csma {
                 if let CsmaState::WaitingForAck(_) = self.state {
                     if frame.sequence == self.expected_ack_seq {
                         info!("✅ ACK received for seq: {}", frame.sequence);
-                        self.state = CsmaState::Idle;
+
+                        // Remove the successfully acknowledged frame from the TX queue.
+                        // We expect the frame we just transmitted to be at the front of the queue
+                        // (it was push_front'ed when entering Transmitting state).
+                        if let Some(front) = self.tx_queue.front() {
+                            if front.sequence == self.expected_ack_seq {
+                                self.tx_queue.pop_front();
+                            } else {
+                                warn!(
+                                    "ACK seq {} does not match tx_queue front seq {}",
+                                    self.expected_ack_seq,
+                                    front.sequence
+                                );
+                            }
+                        }
+
+                        // If there are more frames to send, go back to sensing;
+                        // otherwise become idle.
+                        if self.tx_queue.is_empty() {
+                            self.state = CsmaState::Idle;
+                        } else {
+                            self.state = CsmaState::Sensing;
+                        }
                     } else {
-                        warn!("Received unexpected ACK seq: {}, expected: {}", frame.sequence, self.expected_ack_seq);
+                        warn!(
+                            "Received unexpected ACK seq: {}, expected: {}",
+                            frame.sequence, self.expected_ack_seq
+                        );
                     }
                 }
             }

@@ -1,5 +1,5 @@
 /// 默认录音时长（秒）
-pub const DEFAULT_RECORD_SECONDS: usize = 20;
+pub const DEFAULT_RECORD_SECONDS: usize = 120;
 
 /// 日志级别（可被 RUST_LOG 覆盖）
 pub const LOG_LEVEL: &str = "info";
@@ -48,7 +48,7 @@ pub const ACK_TIMEOUT_MS: u64 = 300;
 // CSMA
 pub const CARRIER_SENSE_SAMPLES: usize = 480; // 10ms at 48kHz
 pub const CARRIER_SENSE_THRESHOLD: f32 = 0.01; // RMS threshold
-pub const MAX_BACKOFF_MS: u64 = 200; // Max random backoff time
+pub const MAX_BACKOFF_MS: u64 = 500; // Max random backoff time
 
 // // Carrier Sensing (CSMA)
 // /// Power threshold for detecting busy channel
