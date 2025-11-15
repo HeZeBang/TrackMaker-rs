@@ -2,6 +2,7 @@ use dialoguer::{Select, theme::ColorfulTheme, Input};
 use jack;
 use std::fs;
 use tracing::{debug, error, info, trace, warn};
+use clap::{Parser, Subcommand};
 
 mod audio;
 mod device;
@@ -26,9 +27,103 @@ use std::{
 
 use phy::{Frame, FrameType, LineCodingKind, PhyDecoder, PhyEncoder};
 
+#[derive(Parser)]
+#[command(name = "trackmaker-rs")]
+#[command(about = "Audio-based wireless transmission system", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// Enable interactive mode (dialoguer) instead of CLI args
+    #[arg(long)]
+    interactive: bool,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Transmit a file
+    Tx {
+        /// Local sender address
+        #[arg(short = 'l', long, default_value = "1")]
+        local: u8,
+
+        /// Remote receiver address
+        #[arg(short = 'r', long, default_value = "2")]
+        remote: u8,
+
+        /// Line coding scheme (4b5b or manchester)
+        #[arg(long, default_value = "4b5b")]
+        encoding: String,
+    },
+
+    /// Receive a file
+    Rx {
+        /// Local receiver address
+        #[arg(short = 'l', long, default_value = "2")]
+        local: u8,
+
+        /// Remote sender address
+        #[arg(short = 'r', long, default_value = "1")]
+        remote: u8,
+
+        /// Line coding scheme (4b5b or manchester)
+        #[arg(long, default_value = "4b5b")]
+        encoding: String,
+
+        /// Recording duration in seconds
+        #[arg(short = 'd', long, default_value = DEFAULT_RECORD_SECONDS_STR)]
+        duration: u64,
+    },
+
+    /// Test mode (loopback without JACK)
+    Test {
+        /// Line coding scheme (4b5b or manchester)
+        #[arg(long, default_value = "4b5b")]
+        encoding: String,
+    },
+}
+
+fn parse_line_coding(encoding: &str) -> LineCodingKind {
+    match encoding.to_lowercase().as_str() {
+        "manchester" | "manchester-biphase" => LineCodingKind::Manchester,
+        "4b5b" | "4b5b-nrz" => LineCodingKind::FourBFiveB,
+        _ => {
+            warn!("Unknown encoding '{}', defaulting to 4B5B", encoding);
+            LineCodingKind::FourBFiveB
+        }
+    }
+}
+
 fn main() {
     init_logging();
     print_banner();
+
+    let cli = Cli::parse();
+
+    // Determine mode and parameters
+    let (selection, line_coding, tx_addr, rx_addr, rx_duration) = if cli.interactive || cli.command.is_none() {
+        // Interactive mode (original dialoguer behavior)
+        interactive_mode()
+    } else {
+        // Command-line mode
+        match cli.command.unwrap() {
+            Commands::Tx { local, remote, encoding } => {
+                let line_coding = parse_line_coding(&encoding);
+                info!("Using line coding: {}", line_coding.name());
+                (0, line_coding, local, remote, 60u64)
+            }
+            Commands::Rx { local, remote, encoding, duration } => {
+                let line_coding = parse_line_coding(&encoding);
+                info!("Using line coding: {}", line_coding.name());
+                (1, line_coding, local, remote, duration)
+            }
+            Commands::Test { encoding } => {
+                let line_coding = parse_line_coding(&encoding);
+                test_transmission(line_coding);
+                return;
+            }
+        }
+    };
 
     let (client, status) = jack::Client::new(
         format!("{}_{:04}", JACK_CLIENT_NAME, rand::rng().random_range(0..10000)).as_str(),
@@ -47,7 +142,7 @@ fn main() {
         warn!("Physical layer is designed for {} Hz", SAMPLE_RATE);
     }
 
-    let max_duration_samples = sample_rate * DEFAULT_RECORD_SECONDS;
+    let max_duration_samples = sample_rate * rx_duration as usize;
 
     // Shared State
     let shared = recorder::AppShared::new(max_duration_samples);
@@ -84,6 +179,39 @@ fn main() {
         out_port_name.as_str(),
     );
 
+    {
+        shared
+            .record_buffer
+            .lock()
+            .unwrap()
+            .clear();
+    }
+
+    if selection == 0 {
+        // Sender
+        run_sender(shared, progress_manager, sample_rate as u32, line_coding, tx_addr, rx_addr);
+    } else if selection == 1 {
+        // Receiver
+        run_receiver(
+            shared,
+            progress_manager,
+            max_duration_samples as u32,
+            line_coding,
+            tx_addr,
+            rx_addr,
+            rx_duration
+        );
+    } else {
+        unreachable!();
+    }
+
+    info!("Exiting gracefully...");
+    if let Err(err) = active_client.deactivate() {
+        error!("Error deactivating client: {}", err);
+    }
+}
+
+fn interactive_mode() -> (usize, LineCodingKind, u8, u8, u64) {
     let selections = &["Send File", "Receive File", "Test (No JACK - Loopback)"];
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Select mode")
@@ -91,6 +219,24 @@ fn main() {
         .items(&selections[..])
         .interact()
         .unwrap();
+
+    if selection == 2 {
+        // Test mode - return dummy values that won't be used
+        let line_coding_options = [
+            LineCodingKind::FourBFiveB,
+            LineCodingKind::Manchester,
+        ];
+        let line_coding_labels = ["4B5B (NRZ)", "Manchester (Bi-phase)"];
+        let line_coding_idx = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select line coding scheme")
+            .default(0)
+            .items(&line_coding_labels)
+            .interact()
+            .unwrap();
+        let line_coding = line_coding_options[line_coding_idx];
+        test_transmission(line_coding);
+        std::process::exit(0);
+    }
 
     let line_coding_options = [
         LineCodingKind::FourBFiveB,
@@ -105,57 +251,18 @@ fn main() {
         .unwrap();
     let line_coding = line_coding_options[line_coding_idx];
 
-    {
-        shared
-            .record_buffer
-            .lock()
-            .unwrap()
-            .clear();
-    }
+    let tx_addr = Input::<mac::types::MacAddr>::with_theme(&ColorfulTheme::default())
+        .with_prompt("Enter local sender addr")
+        .default(1)
+        .interact()
+        .unwrap();
+    let rx_addr = Input::<mac::types::MacAddr>::with_theme(&ColorfulTheme::default())
+        .with_prompt("Enter remote receiver addr")
+        .default(2)
+        .interact()
+        .unwrap();
 
-    if selection == 0 {
-        // Sender
-        let tx_addr = Input::<mac::types::MacAddr>::with_theme(&ColorfulTheme::default())
-            .with_prompt("Enter local sender addr")
-            .default(1)
-            .interact()
-            .unwrap();
-        let rx_addr = Input::<mac::types::MacAddr>::with_theme(&ColorfulTheme::default())
-            .with_prompt("Enter remote receiver addr")
-            .default(2)
-            .interact()
-            .unwrap();
-        run_sender(shared, progress_manager, sample_rate as u32, line_coding, tx_addr, rx_addr);
-    } else if selection == 1 {
-        // Receiver
-        let rx_addr = Input::<mac::types::MacAddr>::with_theme(&ColorfulTheme::default())
-            .with_prompt("Enter local receiver addr")
-            .default(2)
-            .interact()
-            .unwrap();
-        let tx_addr = Input::<mac::types::MacAddr>::with_theme(&ColorfulTheme::default())
-            .with_prompt("Enter remote sender addr")
-            .default(1)
-            .interact()
-            .unwrap();
-        run_receiver(
-            shared,
-            progress_manager,
-            max_duration_samples as u32,
-            line_coding,
-            rx_addr,
-            tx_addr
-        );
-    } else {
-        // Test mode (no JACK)
-        test_transmission(line_coding);
-        return;
-    }
-
-    info!("Exiting gracefully...");
-    if let Err(err) = active_client.deactivate() {
-        error!("Error deactivating client: {}", err);
-    }
+    (selection, line_coding, tx_addr, rx_addr, 60u64)
 }
 
 fn run_sender(
@@ -427,6 +534,7 @@ fn run_receiver(
     line_coding: LineCodingKind,
     receiver_addr: mac::types::MacAddr,
     sender_addr: mac::types::MacAddr,
+    rx_duration: u64,
 ) {
     info!("=== Receiver Mode ===");
     info!("Using line coding: {}", line_coding.name());
@@ -460,7 +568,7 @@ fn run_receiver(
     *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
 
     let start_time = std::time::Instant::now();
-    let recording_timeout = std::time::Duration::from_secs(60); // Increased timeout
+    let recording_timeout = std::time::Duration::from_secs(rx_duration);
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
