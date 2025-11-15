@@ -141,7 +141,7 @@ impl PhyDecoder {
         let preamble_start_offset = frame_start_offset - self.preamble.len();
 
         // Not enough data for even the header
-        let header_bits = 32;
+        let header_bits = 48; // FRAME: type(8) + seq(8) + src(8) + dst(8) + len(16)
         let header_samples = self.line_code.samples_for_bits(header_bits);
         if self.sample_buffer.len() < frame_start_offset + header_samples {
             return None; // Need more data
@@ -161,8 +161,8 @@ impl PhyDecoder {
         }
 
         // Extract data length
-        let len_high = Self::bits_to_byte(&header_decoded[16..24]);
-        let len_low = Self::bits_to_byte(&header_decoded[24..32]);
+        let len_high = Self::bits_to_byte(&header_decoded[32..40]);
+        let len_low = Self::bits_to_byte(&header_decoded[40..48]);
         let data_len = ((len_high as usize) << 8) | (len_low as usize);
         let data_type: FrameType = FrameType::from_u8(Self::bits_to_byte(&header_decoded[0..8])).unwrap_or(FrameType::Ack);
 
@@ -176,7 +176,7 @@ impl PhyDecoder {
         }
 
         // Check if we have enough data for the full frame
-        let total_bytes = 4 + data_len + 1; // header + data + crc
+        let total_bytes = 6 + data_len + 1; // header(6) + data + crc(1)
         let total_bits = total_bytes * 8;
         let total_samples = self.line_code.samples_for_bits(total_bits);
 
@@ -268,7 +268,7 @@ mod tests {
         let encoder = PhyEncoder::new(2, 2, LineCodingKind::FourBFiveB);
         let mut decoder = PhyDecoder::new(2, 2, LineCodingKind::FourBFiveB);
 
-        let frame = Frame::new_data(1, vec![0x12, 0x34, 0x56, 0x78]);
+        let frame = Frame::new_data(1, 1, 2, vec![0x12, 0x34, 0x56, 0x78]);
         let samples = encoder.encode_frame(&frame);
 
         let decoded = decoder.process_samples(&samples);
@@ -284,9 +284,9 @@ mod tests {
         let mut decoder = PhyDecoder::new(2, 2, LineCodingKind::FourBFiveB);
 
         let frames = vec![
-            Frame::new_data(0, vec![0x01, 0x02]),
-            Frame::new_data(1, vec![0x03, 0x04]),
-            Frame::new_data(2, vec![0x05, 0x06]),
+            Frame::new_data(0, 1, 2, vec![0x01, 0x02]),
+            Frame::new_data(1, 1, 2, vec![0x03, 0x04]),
+            Frame::new_data(2, 1, 2, vec![0x05, 0x06]),
         ];
 
         let samples = encoder.encode_frames(&frames, 100);
@@ -303,7 +303,7 @@ mod tests {
         let encoder = PhyEncoder::new(2, 2, LineCodingKind::FourBFiveB);
         let mut decoder = PhyDecoder::new(2, 2, LineCodingKind::FourBFiveB);
 
-        let frame = Frame::new_data(0, vec![0xAA, 0xBB]);
+        let frame = Frame::new_data(0, 1, 2, vec![0xAA, 0xBB]);
         let mut samples = encoder.encode_frame(&frame);
 
         // NOISEEEEEEEEEEEEE

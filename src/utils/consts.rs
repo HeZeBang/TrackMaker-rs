@@ -48,6 +48,7 @@ pub const ACK_TIMEOUT_MS: u64 = 300;
 // CSMA
 pub const CARRIER_SENSE_SAMPLES: usize = 480; // 10ms at 48kHz
 pub const CARRIER_SENSE_THRESHOLD: f32 = 0.01; // RMS threshold
+pub const MAX_BACKOFF_MS: u64 = 200; // Max random backoff time
 
 // // Carrier Sensing (CSMA)
 // /// Power threshold for detecting busy channel
