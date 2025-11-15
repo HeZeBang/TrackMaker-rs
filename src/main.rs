@@ -1,7 +1,7 @@
 use dialoguer::{Select, theme::ColorfulTheme, Input};
 use jack;
 use std::fs;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 mod audio;
 mod device;
@@ -93,10 +93,10 @@ fn main() {
         .unwrap();
 
     let line_coding_options = [
-        LineCodingKind::Manchester,
         LineCodingKind::FourBFiveB,
+        LineCodingKind::Manchester,
     ];
-    let line_coding_labels = ["Manchester (Bi-phase)", "4B5B (NRZ)"];
+    let line_coding_labels = ["4B5B (NRZ)", "Manchester (Bi-phase)"];
     let line_coding_idx = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Select line coding scheme")
         .default(0)
@@ -203,6 +203,8 @@ fn run_sender(
         frames.push(frame);
         seq = seq.wrapping_add(1);
     }
+
+    let mut state = mac::CSMAState::Idle;
     info!("Created {} frames to send.", frames.len());
 
     let total_frames = frames.len();
@@ -220,87 +222,174 @@ fn run_sender(
     let overall_start_time = std::time::Instant::now();
 
     for frame_to_send in &frames {
-        let mut attempts = 0;
-        'retransmit_loop: loop {
-            attempts += 1;
-            if attempts > 1 {
-                info!(
-                    "Retransmitting frame {} (seq: {}), attempt #{}",
-                    frames_sent + 1,
-                    frame_to_send.sequence,
-                    attempts
-                );
-            } else {
-                debug!(
-                    "Sending frame {}/{} (seq: {})",
-                    frames_sent + 1,
-                    total_frames,
-                    frame_to_send.sequence
-                );
-            }
+        state = mac::CSMAState::Sensing;
+        *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
+        let mut stage = 0;
 
-            // 1. Encode and send the frame
-            let output_track = encoder.encode_frames(&[frame_to_send.clone()], INTER_FRAME_GAP_SAMPLES);
-            {
-                let mut playback = shared.playback_buffer.lock().unwrap();
-                playback.clear();
-                playback.extend(output_track);
-            }
-            *shared.app_state.lock().unwrap() = recorder::AppState::Playing;
-
-            // Wait for playback to finish
-            while let recorder::AppState::Playing = { shared.app_state.lock().unwrap().clone() } {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            debug!("Frame {} sent, waiting for ACK...", frame_to_send.sequence);
-
-            // 2. Switch to recording to wait for ACK
-            {
-                // Clear previous recordings before listening for ACK
-                let mut rec_buf = shared.record_buffer.lock().unwrap();
-                rec_buf.clear();
-            }
-            *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
-            let mut processed_samples_len = 0;
-            let ack_wait_start = std::time::Instant::now();
-            // Timeout for ACK
-            let ack_timeout = std::time::Duration::from_millis(ACK_TIMEOUT_MS);
-
-            // 3. ACK waiting loop
-            'ack_wait_loop: loop {
-                if ack_wait_start.elapsed() > ack_timeout {
-                    warn!("ACK timeout for seq: {}", frame_to_send.sequence);
-                    continue 'retransmit_loop; // Timed out, retransmit
-                }
-
-                std::thread::sleep(std::time::Duration::from_millis(50));
-
-                let current_samples = { shared.record_buffer.lock().unwrap().clone() };
-
-                if current_samples.len() > processed_samples_len {
-                    let new_samples = &current_samples[processed_samples_len..];
-                    let decoded_frames = decoder.process_samples(new_samples);
-                    processed_samples_len = current_samples.len();
-
-                    for ack_frame in decoded_frames {
-                        if ack_frame.frame_type == FrameType::Ack && ack_frame.sequence == frame_to_send.sequence {
-                            debug!("ACK received for seq: {}", frame_to_send.sequence);
-                            frames_sent += 1;
-                            progress_manager.inc("sender", 1).unwrap();
-                            break 'retransmit_loop; // ACK OK, send next frame
-                        } else {
-                            warn!(
-                                "Received unexpected frame while waiting for ACK {}: type={:?}, seq={}",
-                                frame_to_send.sequence,
-                                ack_frame.frame_type,
-                                ack_frame.sequence
-                            );
+        'csma_loop: loop {
+            match state {
+                mac::CSMAState::Sensing => {
+                    std::thread::sleep(std::time::Duration::from_millis(ENERGY_DETECTION_SAMPLES as u64 * 1000 / sample_rate as u64));
+                    let recorded_samples = { shared.record_buffer.lock().unwrap().clone() };
+                    match mac::is_channel_busy(&recorded_samples) {
+                        Some(true) => {
+                            trace!("Channel busy detected during sensing.");
+                            shared.record_buffer.lock().unwrap().clear();
+                        }
+                        Some(false) => {
+                            state = mac::CSMAState::WaitingForDIFS;
+                            shared.record_buffer.lock().unwrap().clear();
+                        }
+                        None => {
+                            trace!("Not enough samples to determine channel state during sensing.");
+                            continue 'csma_loop;
                         }
                     }
                 }
-            } // end ack_wait_loop
-        } // end retransmit_loop
-    }
+                mac::CSMAState::Backoff(mut counter) => {
+                    if counter > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(SLOT_TIME_MS));
+                        match mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
+                            Some(true) => {
+                                trace!("Channel busy detected during backoff.");
+                                shared.record_buffer.lock().unwrap().clear();
+                                state = mac::CSMAState::BackoffPaused(counter);
+                            }
+                            Some(false) => {
+                                // Channel idle, continue countdown
+                                shared.record_buffer.lock().unwrap().clear();
+                                counter -= 1;
+                                state = mac::CSMAState::Backoff(counter);
+                            }
+                            None => {
+                                trace!("Not enough samples to determine channel state during backoff.");
+                            }
+                        }
+                    } else {
+                        state = mac::CSMAState::Transmitting;
+                    }
+                }
+                mac::CSMAState::BackoffPaused(counter) => {
+                    match mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
+                        Some(true) => {
+                            trace!("Channel still busy during backoff pause.");
+                            std::thread::sleep(std::time::Duration::from_millis(SLOT_TIME_MS / 2));
+                            shared.record_buffer.lock().unwrap().clear();
+                            state = mac::CSMAState::BackoffPaused(counter);
+                        }
+                        Some(false) => {
+                            trace!("Channel idle again, resuming backoff.");
+                            shared.record_buffer.lock().unwrap().clear();
+
+                            // 等待一个 DIFS 周期
+                            std::thread::sleep(std::time::Duration::from_millis(DIFS_DURATION_MS));
+                            
+                            // DIFS 结束后，必须再次检查信道，因为可能有别人在我们等待时开始发送
+                            if let Some(false) = mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
+                                // 如果信道在 DIFS 后仍然空闲，那么我们可以恢复倒计时
+                                trace!("DIFS wait over, channel still idle. Resuming backoff.");
+                                state = mac::CSMAState::Backoff(counter);
+                            } else {
+                                // 如果在 DIFS 期间信道又变忙了，我们必须保持 Paused 状态
+                                trace!("Channel became busy during DIFS wait. Staying paused.");
+                            }
+                            shared.record_buffer.lock().unwrap().clear();
+                        }
+                        None => {
+                            trace!("Not enough samples to determine channel state during backoff pause.");
+                        }
+                    }
+                }
+                mac::CSMAState::WaitingForDIFS => {
+                    std::thread::sleep(std::time::Duration::from_millis(DIFS_DURATION_MS));
+
+                    match mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
+                        Some(false) => {
+                            trace!("DIFS wait is over and channel is still idle. Starting backoff.");
+                            let cw = (CW_MIN as u16 * 2_u16.pow(stage as u32)).min(CW_MAX as u16) as u8;
+                            state = mac::CSMAState::Backoff(rand::random_range(0..=cw));
+                        }
+                        Some(true) => {
+                            trace!("Channel became busy during DIFS wait. Returning to sensing.");
+                            state = mac::CSMAState::Sensing;
+                        }
+                        None => !unreachable!(), // We always have enough samples after DIFS
+                    }
+                    shared.record_buffer.lock().unwrap().clear();
+                }
+                mac::CSMAState::Transmitting => {
+                    debug!("Channel idle, proceeding to transmit frame seq: {}", frame_to_send.sequence);
+                    // 1. Encode and send the frame
+                    let output_track = encoder.encode_frames(&[frame_to_send.clone()], INTER_FRAME_GAP_SAMPLES);
+                    {
+                        let mut playback = shared.playback_buffer.lock().unwrap();
+                        playback.clear();
+                        playback.extend(output_track);
+                    }
+                    *shared.app_state.lock().unwrap() = recorder::AppState::Playing;
+
+                    // Wait for playback to finish
+                    while let recorder::AppState::Playing = { shared.app_state.lock().unwrap().clone() } {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    debug!("Frame {} sent, waiting for ACK...", frame_to_send.sequence);
+
+                    // 2. Switch to recording to wait for ACK
+                    {
+                        // Clear previous recordings before listening for ACK
+                        let mut rec_buf = shared.record_buffer.lock().unwrap();
+                        rec_buf.clear();
+                    }
+                    *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
+                    state = mac::CSMAState::WaitingForAck;
+                }
+                mac::CSMAState::WaitingForAck => {
+                    let mut processed_samples_len = 0;
+                    let ack_wait_start = std::time::Instant::now();
+                    // Timeout for ACK
+                    let ack_timeout = std::time::Duration::from_millis(ACK_TIMEOUT_MS);
+
+                    // 3. ACK waiting loop
+                    'ack_wait_loop: loop {
+                        if ack_wait_start.elapsed() > ack_timeout {
+                            warn!("ACK timeout for seq: {}", frame_to_send.sequence);
+                            stage += 1;
+                            let cw = (CW_MIN as u16 * 2_u16.pow(stage as u32)).min(CW_MAX as u16) as u8; // BEB
+                            state = mac::CSMAState::Backoff(rand::random_range(0..=cw));
+                            break 'ack_wait_loop; // Timed out, retransmit
+                        }
+
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+
+                        let current_samples = { shared.record_buffer.lock().unwrap().clone() };
+
+                        if current_samples.len() > processed_samples_len {
+                            let new_samples = &current_samples[processed_samples_len..];
+                            let decoded_frames = decoder.process_samples(new_samples);
+                            processed_samples_len = current_samples.len();
+
+                            for ack_frame in decoded_frames {
+                                if ack_frame.frame_type == FrameType::Ack && ack_frame.sequence == frame_to_send.sequence {
+                                    debug!("ACK received for seq: {}", frame_to_send.sequence);
+                                    frames_sent += 1;
+                                    progress_manager.inc("sender", 1).unwrap();
+                                    break 'csma_loop; // ACK OK, send next frame
+                                } else {
+                                    warn!(
+                                        "Received unexpected frame while waiting for ACK {}: type={:?}, seq={}",
+                                        frame_to_send.sequence,
+                                        ack_frame.frame_type,
+                                        ack_frame.sequence
+                                    );
+                                }
+                            }
+                        }
+                    } // end ack_wait_loop
+                }
+                mac::CSMAState::Idle => unreachable!(),
+            } // end retransmit_loop
+        } // end csma_loop
+    } // end for frame_to_send
 
     progress_manager.finish("sender", "All frames acknowledged").unwrap();
     let total_duration = overall_start_time.elapsed().as_secs_f32();
@@ -365,7 +454,7 @@ fn run_receiver(
     let start_time = std::time::Instant::now();
     let recording_timeout = std::time::Duration::from_secs(60); // Increased timeout
 
-        let running = Arc::new(AtomicBool::new(true));
+    let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
 
     // Ctrl+C 设置标志
