@@ -92,7 +92,7 @@ impl Frame {
     }
 
     fn parse_header_bytes(bytes: &[u8]) -> Option<(LenType, CRCType, FrameType, SeqType)> {
-        if bytes.len() < 5 {
+        if bytes.len() < PHY_HEADER_BYTES {
             debug!("PHY Header too short: {} bytes", bytes.len());
             return None;
         }
@@ -115,10 +115,10 @@ impl Frame {
     /// Deserialize frame from bytes (without preamble)
     /// Returns None if CRC check fails or format is invalid
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let (len, crc, frame_type, sequence) = Self::parse_header_bytes(&bytes[..5])?;
+        let (len, crc, frame_type, sequence) = Self::parse_header_bytes(&bytes[..PHY_HEADER_BYTES])?;
 
         // Extract CRC and data
-        let data_bytes = &bytes[5..5 + len as usize];
+        let data_bytes = &bytes[PHY_HEADER_BYTES..PHY_HEADER_BYTES + len as usize];
 
         // Verify CRC
         if !verify_crc8(data_bytes, crc) {
@@ -146,15 +146,5 @@ impl Frame {
     pub fn from_bits(bits: &[u8]) -> Option<Self> {
         let bytes = bits_to_bytes(bits);
         Self::from_bytes(&bytes)
-    }
-
-    /// Get the total size in bytes (including CRC)
-    pub fn size_bytes(&self) -> usize {
-        4 + self.data.len() + 1 // type + seq + len(2) + data + crc
-    }
-
-    /// Get the total size in bits
-    pub fn size_bits(&self) -> usize {
-        self.size_bytes() * 8
     }
 }

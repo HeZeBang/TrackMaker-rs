@@ -174,7 +174,7 @@ impl PhyDecoder {
         }
 
         // Check if we have enough data for the full frame
-        let total_bytes = 4 + data_len + 1; // header + data + crc
+        let total_bytes = PHY_HEADER_BYTES + data_len; // header + data + crc
         let total_bits = total_bytes * 8;
         let total_samples = self.line_code.samples_for_bits(total_bits);
 
