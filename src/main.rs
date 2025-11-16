@@ -357,6 +357,7 @@ fn run_sender(
                 mac::CSMAState::Backoff(mut counter) => {
                     trace!("Backoff counter: {}", counter);
                     if counter > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(SLOT_TIME_MS));
                         match mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
                             Some(true) => {
                                 trace!("Channel busy detected during backoff.");
@@ -369,7 +370,6 @@ fn run_sender(
                                 state = mac::CSMAState::Backoff(counter);
                             }
                             None => {
-                                std::thread::sleep(std::time::Duration::from_millis(SLOT_TIME_MS));
                                 trace!("Not enough samples to determine channel state during backoff.");
                             }
                         }
@@ -379,33 +379,32 @@ fn run_sender(
                 }
                 mac::CSMAState::BackoffPaused(counter) => {
                     trace!("Backoff paused at counter {}", counter);
+                    // 等待一个 DIFS 周期
+                    std::thread::sleep(std::time::Duration::from_millis(DIFS_DURATION_MS));
                     match mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
                         Some(true) => {
                             trace!("Channel still busy during backoff pause.");
-                            std::thread::sleep(std::time::Duration::from_millis(SLOT_TIME_MS / 2));
                             shared.record_buffer.lock().unwrap().clear();
                             state = mac::CSMAState::BackoffPaused(counter);
                         }
                         Some(false) => {
                             trace!("Channel idle again, resuming backoff.");
                             shared.record_buffer.lock().unwrap().clear();
-
-                            // 等待一个 DIFS 周期
-                            std::thread::sleep(std::time::Duration::from_millis(DIFS_DURATION_MS));
+                            state = mac::CSMAState::Backoff(counter);
                             
-                            // DIFS 结束后，必须再次检查信道，因为可能有别人在我们等待时开始发送
-                            if let Some(false) = mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
-                                // 如果信道在 DIFS 后仍然空闲，那么我们可以恢复倒计时
-                                trace!("DIFS wait over, channel still idle. Resuming backoff.");
-                                state = mac::CSMAState::Backoff(counter);
-                            } else {
-                                // 如果在 DIFS 期间信道又变忙了，我们必须保持 Paused 状态
-                                trace!("Channel became busy during DIFS wait. Staying paused.");
-                            }
-                            shared.record_buffer.lock().unwrap().clear();
+                            // // DIFS 结束后，必须再次检查信道，因为可能有别人在我们等待时开始发送
+                            // if let Some(false) = mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
+                            //     // 如果信道在 DIFS 后仍然空闲，那么我们可以恢复倒计时
+                            //     trace!("DIFS wait over, channel still idle. Resuming backoff.");
+                            //     state = mac::CSMAState::Backoff(counter);
+                            // } else {
+                            //     // 如果在 DIFS 期间信道又变忙了，我们必须保持 Paused 状态
+                            //     trace!("Channel became busy during DIFS wait. Staying paused.");
+                            // }
+                            // shared.record_buffer.lock().unwrap().clear();
                         }
                         None => {
-                            std::thread::sleep(std::time::Duration::from_millis(SLOT_TIME_MS));
+                            
                             trace!("Not enough samples {} to determine channel state during backoff pause.", &{ shared.record_buffer.lock().unwrap().len() });
                         }
                     }
@@ -417,7 +416,7 @@ fn run_sender(
                     match mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
                         Some(false) => {
                             trace!("DIFS wait is over and channel is still idle. Starting backoff.");
-                            let cw = (CW_MIN as u16 * 2_u16 * stage ).min(CW_MAX as u16) as u8;
+                            let cw = (CW_MIN as u16 * 2_u16 * (stage)).min(CW_MAX as u16) as usize;
                             state = mac::CSMAState::Backoff(rand::random_range(0..=cw));
                             shared.record_buffer.lock().unwrap().clear();
                         }
@@ -427,7 +426,6 @@ fn run_sender(
                             shared.record_buffer.lock().unwrap().clear();
                         }
                         None => {
-                            std::thread::sleep(std::time::Duration::from_millis(SLOT_TIME_MS));
                             trace!("Not enough samples to determine channel state after DIFS wait.");
                         }
                     }
@@ -467,15 +465,15 @@ fn run_sender(
                     // 3. ACK waiting loop
                     'ack_wait_loop: loop {
                         if ack_wait_start.elapsed() > ack_timeout {
-                            warn!("ACK timeout for seq: {}", frame_to_send.sequence);
-                            stage += 1;
-                            let cw = (CW_MIN as u16 * 2_u16 * stage).min(CW_MAX as u16) as u8; // Not BEB
+                            warn!("ACK timeout for seq: {}, stage {}", frame_to_send.sequence, stage);
+                            stage = (stage + 1).min(20);
+                            let cw = (CW_MIN as u16 * 2_u16 * (stage)).min(CW_MAX as u16) as usize; // Not BEB
+                            warn!("Random range to {}", cw);
                             state = mac::CSMAState::Backoff(rand::random_range(0..=cw));
-                            stage = 0;
                             break 'ack_wait_loop; // Timed out, retransmit
                         }
 
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        std::thread::sleep(std::time::Duration::from_millis(10));
 
                         let current_samples = { shared.record_buffer.lock().unwrap().clone() };
 
@@ -589,17 +587,12 @@ fn run_receiver(
         }
 
         // Wait for some audio to be recorded
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(25));
 
-        let current_samples = {
-            let buffer = shared.record_buffer.lock().unwrap();
-            buffer.clone()
-        };
-
-        if current_samples.len() > processed_samples_len {
-            let new_samples = &current_samples[processed_samples_len..];
+        if shared.record_buffer.lock().unwrap().len() > 50 {
+            let new_samples = &shared.record_buffer.lock().unwrap().drain(..).collect::<Vec<_>>()[..];
             let decoded_frames = decoder.process_samples(new_samples);
-            processed_samples_len = current_samples.len();
+            processed_samples_len += new_samples.len();
 
             for frame in decoded_frames {
                 if frame.frame_type == FrameType::Data {
@@ -630,7 +623,7 @@ fn run_receiver(
 
                     // Wait for ACK playback to complete
                     while let recorder::AppState::Playing = { shared.app_state.lock().unwrap().clone() } {
-                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                     debug!("ACK sent for seq: {}", frame.sequence);
 
@@ -638,8 +631,8 @@ fn run_receiver(
                     *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
                     debug!("Switched back to recording mode.");
                 }
-            }
-        }
+            } // end for frame
+        } // end if new samples
 
         progress_manager.set_position("recording", processed_samples_len as u64).unwrap();
 
@@ -649,7 +642,7 @@ fn run_receiver(
             info!("Recording finished by user or duration limit.");
             break 'main_loop;
         }
-    }
+    } // end main_loop
 
     let elapsed = start_time.elapsed().as_secs_f32();
     info!("Receiver loop finished in {:.2} seconds", elapsed);

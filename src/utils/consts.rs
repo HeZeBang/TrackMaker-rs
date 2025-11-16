@@ -35,7 +35,7 @@ pub const SAMPLES_PER_LEVEL: usize = 3;
 pub const PREAMBLE_PATTERN_BYTES: usize = 4;
 
 /// Maximum data payload per frame (bytes)
-pub const MAX_FRAME_DATA_SIZE: usize = 100;
+pub const MAX_FRAME_DATA_SIZE: usize = 96;
 
 /// Milliseconds between frames
 pub const INTER_FRAME_GAP_MS: u32 = 5;
@@ -44,7 +44,7 @@ pub const INTER_FRAME_GAP_MS: u32 = 5;
 pub const INTER_FRAME_GAP_SAMPLES: usize =
     (SAMPLE_RATE as usize * INTER_FRAME_GAP_MS as usize) / 1000;
 
-pub const ACK_TIMEOUT_MS: u64 = 300;
+pub const ACK_TIMEOUT_MS: u64 = 100;
 
 pub const PHY_HEADER_BYTES: usize = 7; // Length (2) + CRC (1) + Frame Type (1) + Sequence (1) + Src (1) + Dst (1)
 
@@ -52,13 +52,13 @@ pub const PHY_HEADER_BYTES: usize = 7; // Length (2) + CRC (1) + Frame Type (1) 
 /// Energy level threshold to consider the channel busy.
 pub const ENERGY_THRESHOLD: f32 = 0.05;
 /// Energy detection minimum samples
-pub const ENERGY_DETECTION_SAMPLES: usize = 40;
+pub const ENERGY_DETECTION_SAMPLES: usize = 0;
 /// Distributed Inter-frame Space (DIFS) in milliseconds.
 /// The duration to sense the channel to see if it's idle.
 pub const DIFS_DURATION_MS: u64 = 20;
 /// Minimum contention window size (in slots).
-pub const CW_MIN: u32 = 2;
+pub const CW_MIN: u32 = 1;
 /// Maximum contention window size (in slots).
-pub const CW_MAX: u32 = 200;
+pub const CW_MAX: u32 = 100;
 /// Duration of a single backoff slot in milliseconds.
 pub const SLOT_TIME_MS: u64 = 5;

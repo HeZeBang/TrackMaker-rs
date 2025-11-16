@@ -3,8 +3,8 @@ pub mod types;
 pub enum CSMAState {
     Idle, // No Data
     Sensing, // Sensing Channel
-    Backoff(u8), // Backoff(i, k) at stage i, counter k
-    BackoffPaused(u8), // Backoff Paused at stage i, counter k
+    Backoff(usize), // Backoff(i, k) at stage i, counter k
+    BackoffPaused(usize), // Backoff Paused at stage i, counter k
     Transmitting, // Transmitting Frame
     WaitingForDIFS, // Waiting for DIFS
     WaitingForAck, // Waiting for ACK

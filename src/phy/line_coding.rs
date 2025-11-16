@@ -1,6 +1,6 @@
 use std::fmt;
 
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Trait for line coding
 pub trait LineCode: Send {
@@ -169,7 +169,7 @@ fn decode_4b5b_symbol(symbol: u8) -> Option<u8> {
         0b11011 => Some(0xD),
         0b11100 => Some(0xE),
         0b11101 => Some(0xF),
-        _ => {warn!("Warning: invalid 4B/5B symbol {:05b}", symbol); None }
+        _ => {debug!("Warning: invalid 4B/5B symbol {:05b}", symbol); None }
     }
 }
 

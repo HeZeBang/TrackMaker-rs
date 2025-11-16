@@ -163,7 +163,7 @@ impl PhyDecoder {
                     preamble_start_offset
                 );
                 self.state = DecoderState::Searching;
-                return Some(1); // Consume 1 sample to avoid getting stuck
+                return Some(header_samples); // Consume 1 sample to avoid getting stuck
             }
         };
         let data_len = data_len_ as usize;
@@ -190,7 +190,7 @@ impl PhyDecoder {
         let frame_data = &self.sample_buffer[frame_start_offset..frame_start_offset + total_samples];
         let frame_bits = self.line_code.decode(frame_data);
 
-        let consumed_len = self.preamble.len() + total_samples;
+        let consumed_len = self.preamble.len() + self.line_code.samples_for_bits(frame_bits.len());
 
         if frame_bits.len() < total_bits {
             warn!(
