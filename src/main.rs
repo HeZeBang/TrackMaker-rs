@@ -336,7 +336,7 @@ fn run_sender(
         'csma_loop: loop {
             match state {
                 mac::CSMAState::Sensing => {
-                    debug!("Sensing channel for idleness...");
+                    trace!("Sensing channel for idleness...");
                     std::thread::sleep(std::time::Duration::from_millis(ENERGY_DETECTION_SAMPLES as u64 * 1000 / sample_rate as u64));
                     let recorded_samples = { shared.record_buffer.lock().unwrap().clone() };
                     match mac::is_channel_busy(&recorded_samples) {
@@ -355,7 +355,7 @@ fn run_sender(
                     }
                 }
                 mac::CSMAState::Backoff(mut counter) => {
-                    debug!("Backoff counter: {}", counter);
+                    trace!("Backoff counter: {}", counter);
                     if counter > 0 {
                         match mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
                             Some(true) => {
@@ -378,7 +378,7 @@ fn run_sender(
                     }
                 }
                 mac::CSMAState::BackoffPaused(counter) => {
-                    debug!("Backoff paused at counter {}", counter);
+                    trace!("Backoff paused at counter {}", counter);
                     match mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
                         Some(true) => {
                             trace!("Channel still busy during backoff pause.");
@@ -411,7 +411,7 @@ fn run_sender(
                     }
                 }
                 mac::CSMAState::WaitingForDIFS => {
-                    debug!("Channel idle, waiting for DIFS...");
+                    trace!("Channel idle, waiting for DIFS...");
                     std::thread::sleep(std::time::Duration::from_millis(DIFS_DURATION_MS));
 
                     match mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
@@ -433,7 +433,7 @@ fn run_sender(
                     }
                 }
                 mac::CSMAState::Transmitting => {
-                    debug!("Channel idle, proceeding to transmit frame seq: {}", frame_to_send.sequence);
+                    trace!("Channel idle, proceeding to transmit frame seq: {}", frame_to_send.sequence);
                     // 1. Encode and send the frame
                     let output_track = encoder.encode_frames(&[frame_to_send.clone()], INTER_FRAME_GAP_SAMPLES);
                     {

@@ -35,7 +35,7 @@ pub const SAMPLES_PER_LEVEL: usize = 3;
 pub const PREAMBLE_PATTERN_BYTES: usize = 4;
 
 /// Maximum data payload per frame (bytes)
-pub const MAX_FRAME_DATA_SIZE: usize = 768;
+pub const MAX_FRAME_DATA_SIZE: usize = 512;
 
 /// Milliseconds between frames
 pub const INTER_FRAME_GAP_MS: u32 = 5;
@@ -57,7 +57,7 @@ pub const ENERGY_DETECTION_SAMPLES: usize = 40;
 /// The duration to sense the channel to see if it's idle.
 pub const DIFS_DURATION_MS: u64 = 20;
 /// Minimum contention window size (in slots).
-pub const CW_MIN: u32 = 10;
+pub const CW_MIN: u32 = 2;
 /// Maximum contention window size (in slots).
 pub const CW_MAX: u32 = 200;
 /// Duration of a single backoff slot in milliseconds.
