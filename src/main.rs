@@ -440,6 +440,11 @@ fn run_sender(
                         let mut playback = shared.playback_buffer.lock().unwrap();
                         playback.clear();
                         playback.extend(output_track);
+                    {
+                        // Clear previous recordings before listening for ACK
+                        let mut rec_buf = shared.record_buffer.lock().unwrap();
+                        rec_buf.clear();
+                    }
                     }
                     *shared.app_state.lock().unwrap() = recorder::AppState::Playing;
 
@@ -450,11 +455,6 @@ fn run_sender(
                     debug!("Frame {} sent, waiting for ACK...", frame_to_send.sequence);
 
                     // 2. Switch to recording to wait for ACK
-                    {
-                        // Clear previous recordings before listening for ACK
-                        let mut rec_buf = shared.record_buffer.lock().unwrap();
-                        rec_buf.clear();
-                    }
                     *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
                     state = mac::CSMAState::WaitingForAck;
                 }
@@ -471,6 +471,7 @@ fn run_sender(
                             stage += 1;
                             let cw = (CW_MIN as u16 * 2_u16 * stage).min(CW_MAX as u16) as u8; // Not BEB
                             state = mac::CSMAState::Backoff(rand::random_range(0..=cw));
+                            stage = 0;
                             break 'ack_wait_loop; // Timed out, retransmit
                         }
 
