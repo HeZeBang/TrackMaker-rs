@@ -20,3 +20,12 @@ If you're launching this program on MacOS with homebrew, link the dynamic librar
 ```bash
 export DYLD_LIBRARY_PATH="$HOME/homebrew/lib:$DYLD_LIBRARY_PATH"
 ```
+
+## Note for Linux Pipewire
+
+Pipewire contins its default jack implementation, to dajust settings, use:
+
+```bash
+pw-metadata -n settings 0 clock.force-rate 48000
+pw-metadata -n settings 0 clock.force-quantum 128
+```
