@@ -170,13 +170,11 @@ impl Default for ProgressManager {
 
 pub mod templates {
     pub const RECORDING: &str =
-        "RECORDING:   [{bar:30.red}] {percent}% ({pos}/{len} samples) {msg}";
+        "\u{f94a} REC  [{bar:30.red}] {percent}% ({pos}/{len} samples) {msg}";
     pub const PLAYBACK: &str =
-        "PLAYBACK:    [{bar:30.green}] {percent}% ({pos}/{len} samples) {msg}";
+        "\u{f909} PLAY [{bar:30.green}] {percent}% ({pos}/{len} samples) {msg}";
     pub const SENDER: &str =
-        "SENDER:      [{bar:30.cyan}] {percent}% ({pos}/{len} frames) {msg}";
-    pub const PROCESSING: &str =
-        "PROCESSING:  [{bar:30.blue}] {percent}% ({pos}/{len}) {msg}";
-    pub const PLAYREC: &str =
-        "PLAYREC:     [{bar:30.yellow}] {percent}% ({pos}/{len} samples) {msg}";
+        "\u{f048a} SEND [{bar:30.cyan}] {percent}% ({pos}/{len} frames) {msg}";
+    pub const RECEIVER: &str =
+        "\u{f04e6} RECV [{bar:30.blue}] {percent}% ({pos}/{len} frames) {msg}";
 }

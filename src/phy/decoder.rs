@@ -222,8 +222,10 @@ impl PhyDecoder {
 
         if frame_bits.len() < total_bits {
             warn!(
-                "Line decode failed for frame at offset {}. Returning to search.",
-                preamble_start_offset
+                "Line decode failed for frame(last valid {}/{}). Consumed {} samples",
+                frame_bits.len(),
+                total_bits,
+                consumed_len
             );
             self.state = DecoderState::Searching;
             return Some(consumed_len);
@@ -231,8 +233,8 @@ impl PhyDecoder {
 
         if dst != self.local_addr {
             debug!(
-                "Frame not for us (dst={}). Ignoring and returning to search.",
-                dst
+                "Frame not for us (dst={}, type={:?}). Consumed {} samples",
+                dst, data_type, consumed_len
             );
             self.state = DecoderState::Searching;
             return Some(consumed_len);

@@ -69,7 +69,7 @@ enum Commands {
         encoding: String,
 
         /// Recording duration in seconds
-        #[arg(short = 'd', long, default_value = DEFAULT_RECORD_SECONDS_STR)]
+        #[arg(short = 'd', long, default_value_t = DEFAULT_RECORD_SECONDS as u64)]
         duration: u64,
     },
 
@@ -564,10 +564,10 @@ fn run_sender(
                     *shared
                         .app_state
                         .lock()
-                        .unwrap() = recorder::AppState::Playing;
+                        .unwrap() = recorder::AppState::RecordingAndPlaying;
 
                     // Wait for playback to finish
-                    while let recorder::AppState::Playing = {
+                    while let recorder::AppState::RecordingAndPlaying = {
                         shared
                             .app_state
                             .lock()
@@ -716,7 +716,7 @@ fn run_receiver(
         .create_bar(
             "recording",
             max_recording_duration_samples as u64,
-            templates::RECORDING,
+            templates::RECEIVER,
             "receiver",
         )
         .unwrap();
@@ -809,10 +809,10 @@ fn run_receiver(
                     *shared
                         .app_state
                         .lock()
-                        .unwrap() = recorder::AppState::Playing;
+                        .unwrap() = recorder::AppState::RecordingAndPlaying;
 
                     // Wait for ACK playback to complete
-                    while let recorder::AppState::Playing = {
+                    while let recorder::AppState::RecordingAndPlaying = {
                         shared
                             .app_state
                             .lock()

@@ -21,6 +21,8 @@ If you're launching this program on MacOS with homebrew, link the dynamic librar
 export DYLD_LIBRARY_PATH="$HOME/homebrew/lib:$DYLD_LIBRARY_PATH"
 ```
 
+Additionally, we found the provided device will get much more noise when output volume is over 30%, se we recommend playback `0.29` or `-17dB` and record `0.64` or `16dB` to get the bset result.
+
 ## Note for Linux Pipewire
 
 Pipewire contins its default jack implementation, to dajust settings, use:

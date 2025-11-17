@@ -121,11 +121,6 @@ pub fn build_process_closure(
                             recorded.push(sample);
                             *counter += 1;
                         } else {
-                            let mut state = shared_cb
-                                .app_state
-                                .lock()
-                                .unwrap();
-                            *state = AppState::Idle;
                             break;
                         }
                     }
@@ -140,6 +135,11 @@ pub fn build_process_closure(
                         if let Some(sample) = playback.pop_front() {
                             *out_sample = sample;
                         } else {
+                            let mut state = shared_cb
+                                .app_state
+                                .lock()
+                                .unwrap();
+                            *state = AppState::Idle;
                             break;
                         }
                     }
