@@ -1,36 +1,148 @@
-use dialoguer::{theme::ColorfulTheme, Select};
+use dialoguer::{Select, theme::ColorfulTheme, Input};
 use jack;
-use std::io::Write;
+use std::fs;
+use tracing::{debug, error, info, trace, warn};
+use clap::{Parser, Subcommand};
+
 mod audio;
 mod device;
+mod phy;
+mod mac;
 mod ui;
 mod utils;
+
 use audio::recorder;
-use device::jack::{
-    print_jack_info,
-};
-use rand::{self, Rng, SeedableRng};
-use tracing::{debug, info};
+use device::jack::{connect_system_ports, print_jack_info};
 use ui::print_banner;
 use ui::progress::{ProgressManager, templates};
 use utils::consts::*;
 use utils::logging::init_logging;
+use rand::Rng;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
-use crate::device::jack::connect_system_ports;
+use phy::{Frame, FrameType, LineCodingKind, PhyDecoder, PhyEncoder};
+
+#[derive(Parser)]
+#[command(name = "trackmaker-rs")]
+#[command(about = "Audio-based wireless transmission system", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// Enable interactive mode (dialoguer) instead of CLI args
+    #[arg(long)]
+    interactive: bool,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Transmit a file
+    Tx {
+        /// Local sender address
+        #[arg(short = 'l', long, default_value = "1")]
+        local: u8,
+
+        /// Remote receiver address
+        #[arg(short = 'r', long, default_value = "2")]
+        remote: u8,
+
+        /// Line coding scheme (4b5b or manchester)
+        #[arg(long, default_value = "4b5b")]
+        encoding: String,
+    },
+
+    /// Receive a file
+    Rx {
+        /// Local receiver address
+        #[arg(short = 'l', long, default_value = "2")]
+        local: u8,
+
+        /// Remote sender address
+        #[arg(short = 'r', long, default_value = "1")]
+        remote: u8,
+
+        /// Line coding scheme (4b5b or manchester)
+        #[arg(long, default_value = "4b5b")]
+        encoding: String,
+
+        /// Recording duration in seconds
+        #[arg(short = 'd', long, default_value = DEFAULT_RECORD_SECONDS_STR)]
+        duration: u64,
+    },
+
+    /// Test mode (loopback without JACK)
+    Test {
+        /// Line coding scheme (4b5b or manchester)
+        #[arg(long, default_value = "4b5b")]
+        encoding: String,
+    },
+}
+
+fn parse_line_coding(encoding: &str) -> LineCodingKind {
+    match encoding.to_lowercase().as_str() {
+        "manchester" | "manchester-biphase" => LineCodingKind::Manchester,
+        "4b5b" | "4b5b-nrz" => LineCodingKind::FourBFiveB,
+        _ => {
+            warn!("Unknown encoding '{}', defaulting to 4B5B", encoding);
+            LineCodingKind::FourBFiveB
+        }
+    }
+}
 
 fn main() {
     init_logging();
     print_banner();
 
+    let cli = Cli::parse();
+
+    // Determine mode and parameters
+    let (selection, line_coding, tx_addr, rx_addr, rx_duration) = if cli.interactive || cli.command.is_none() {
+        // Interactive mode (original dialoguer behavior)
+        interactive_mode()
+    } else {
+        // Command-line mode
+        match cli.command.unwrap() {
+            Commands::Tx { local, remote, encoding } => {
+                let line_coding = parse_line_coding(&encoding);
+                info!("Using line coding: {}", line_coding.name());
+                (0, line_coding, local, remote, 60u64)
+            }
+            Commands::Rx { local, remote, encoding, duration } => {
+                let line_coding = parse_line_coding(&encoding);
+                info!("Using line coding: {}", line_coding.name());
+                (1, line_coding, local, remote, duration)
+            }
+            Commands::Test { encoding } => {
+                let line_coding = parse_line_coding(&encoding);
+                test_transmission(line_coding);
+                return;
+            }
+        }
+    };
+
     let (client, status) = jack::Client::new(
-        JACK_CLIENT_NAME,
+        format!("{}_{:04}", JACK_CLIENT_NAME, rand::rng().random_range(0..10000)).as_str(),
         jack::ClientOptions::NO_START_SERVER,
     )
     .unwrap();
     tracing::info!("JACK client status: {:?}", status);
     let (sample_rate, _buffer_size) = print_jack_info(&client);
 
-    let max_duration_samples = sample_rate * 15;
+    if sample_rate as u32 != SAMPLE_RATE {
+        warn!(
+            "Sample rate mismatch! Expected {}, got {}",
+            SAMPLE_RATE,
+            sample_rate
+        );
+        warn!("Physical layer is designed for {} Hz", SAMPLE_RATE);
+    }
+
+    let max_duration_samples = sample_rate * rx_duration as usize;
 
     // Shared State
     let shared = recorder::AppShared::new(max_duration_samples);
@@ -67,7 +179,40 @@ fn main() {
         out_port_name.as_str(),
     );
 
-    let selections = &["Sender", "Receiver", "Test (no JACK)"];
+    {
+        shared
+            .record_buffer
+            .lock()
+            .unwrap()
+            .clear();
+    }
+
+    if selection == 0 {
+        // Sender
+        run_sender(shared, progress_manager, sample_rate as u32, line_coding, tx_addr, rx_addr);
+    } else if selection == 1 {
+        // Receiver
+        run_receiver(
+            shared,
+            progress_manager,
+            max_duration_samples as u32,
+            line_coding,
+            tx_addr,
+            rx_addr,
+            rx_duration
+        );
+    } else {
+        unreachable!();
+    }
+
+    info!("Exiting gracefully...");
+    if let Err(err) = active_client.deactivate() {
+        error!("Error deactivating client: {}", err);
+    }
+}
+
+fn interactive_mode() -> (usize, LineCodingKind, u8, u8, u64) {
+    let selections = &["Send File", "Receive File", "Test (No JACK - Loopback)"];
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("Select mode")
         .default(0)
@@ -75,216 +220,342 @@ fn main() {
         .interact()
         .unwrap();
 
-    {
-        shared.record_buffer.lock().unwrap().clear();
+    if selection == 2 {
+        // Test mode - return dummy values that won't be used
+        let line_coding_options = [
+            LineCodingKind::FourBFiveB,
+            LineCodingKind::Manchester,
+        ];
+        let line_coding_labels = ["4B5B (NRZ)", "Manchester (Bi-phase)"];
+        let line_coding_idx = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select line coding scheme")
+            .default(0)
+            .items(&line_coding_labels)
+            .interact()
+            .unwrap();
+        let line_coding = line_coding_options[line_coding_idx];
+        test_transmission(line_coding);
+        std::process::exit(0);
     }
 
-    if selection == 0 {
-        // Sender
-        run_sender(shared, progress_manager, sample_rate as u32);
-    } else if selection == 1 {
-        // Receiver
-        run_receiver(shared, progress_manager, sample_rate as u32, max_duration_samples as u32);
-    } else {
-        // Test mode (no JACK)
-        test_sender_receiver();
-        return;
-    }
+    let line_coding_options = [
+        LineCodingKind::FourBFiveB,
+        LineCodingKind::Manchester,
+    ];
+    let line_coding_labels = ["4B5B (NRZ)", "Manchester (Bi-phase)"];
+    let line_coding_idx = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select line coding scheme")
+        .default(0)
+        .items(&line_coding_labels)
+        .interact()
+        .unwrap();
+    let line_coding = line_coding_options[line_coding_idx];
 
-    tracing::info!("Exiting gracefully...");
-    if let Err(err) = active_client.deactivate() {
-        tracing::error!("Error deactivating client: {}", err);
-    }
+    let tx_addr = Input::<mac::types::MacAddr>::with_theme(&ColorfulTheme::default())
+        .with_prompt("Enter local sender addr")
+        .default(1)
+        .interact()
+        .unwrap();
+    let rx_addr = Input::<mac::types::MacAddr>::with_theme(&ColorfulTheme::default())
+        .with_prompt("Enter remote receiver addr")
+        .default(2)
+        .interact()
+        .unwrap();
+
+    (selection, line_coding, tx_addr, rx_addr, 60u64)
 }
 
 fn run_sender(
     shared: recorder::AppShared,
     progress_manager: ProgressManager,
     sample_rate: u32,
+    line_coding: LineCodingKind,
+    sender_addr: mac::types::MacAddr,
+    receiver_addr: mac::types::MacAddr,
 ) {
-    // Read content from think-different.txt file
-    let file_content = std::fs::read_to_string("assets/think-different.txt")
-        .expect("Failed to read think-different.txt");
-    
-    // Convert text content to bits (ASCII encoding)
-    let text_bits: Vec<u8> = file_content
-        .bytes()
-        .flat_map(|byte| {
-            (0..8).map(move |i| ((byte >> (7 - i)) & 1) as u8)
-        })
-        .collect();
-    
-    let mut rng = rand::rngs::StdRng::from_seed([1u8; 32]);
-    let mut output_track = Vec::new();
+    info!("=== Sender Mode (with Stop-and-Wait) ===");
+    info!("Using line coding: {}", line_coding.name());
 
-    // 100 frames, each 100 bits
-    let mut frames = vec![vec![0u8; 100]; 100];
-
-    // Fill frames with content from think-different.txt
-    let mut bit_index = 0;
-    for i in 0..100 {
-        // Set first 8 bits to frame ID
-        let id = i + 1; // 1-indexed like MATLAB
-        for j in 0..8 {
-            frames[i][j] = ((id >> (7 - j)) & 1) as u8;
+    // Read input file
+    let input_path = format!("INPUT{}to{}.bin", &sender_addr, &receiver_addr);
+    let file_data = match fs::read(&input_path) {
+        Ok(data) => {
+            info!("Read {} bytes from {}", data.len(), input_path);
+            data
         }
-        
-        // Fill remaining 92 bits with content from file
-        for j in 8..100 {
-            if bit_index < text_bits.len() {
-                frames[i][j] = text_bits[bit_index];
-                bit_index += 1;
-            } else {
-                // If we run out of file content, wrap around
-                bit_index = 0;
-                frames[i][j] = text_bits[bit_index];
-                bit_index += 1;
-            }
+        Err(e) => {
+            error!("Failed to read {}: {}", input_path, e);
+            return;
         }
+    };
+
+    // Create PHY encoder and decoder (for ACKs)
+    let encoder = PhyEncoder::new(
+        SAMPLES_PER_LEVEL,
+        PREAMBLE_PATTERN_BYTES,
+        line_coding,
+    );
+    let mut decoder = PhyDecoder::new(
+        SAMPLES_PER_LEVEL,
+        PREAMBLE_PATTERN_BYTES,
+        line_coding,
+        sender_addr,
+    );
+
+    // Split data into frames
+    let mut frames = Vec::new();
+    let mut seq = 0u8;
+    for chunk in file_data.chunks(MAX_FRAME_DATA_SIZE) {
+        let frame = Frame::new_data(seq, sender_addr, receiver_addr, chunk.to_vec()); // TODO: change this!
+        frames.push(frame);
+        seq = seq.wrapping_add(1);
     }
 
-    // PHY Frame generation
-    // Generate time vector for 1 second at 48kHz
-    let sample_rate_f32 = sample_rate as f32;
-    let t: Vec<f32> = (0..48000)
-        .map(|i| i as f32 / sample_rate_f32)
-        .collect();
+    let mut state = mac::CSMAState::Idle;
+    info!("Created {} frames to send.", frames.len());
 
-    // Carrier frequency 10kHz
-    let fc = 10000.0;
-    let carrier: Vec<f32> = t
-        .iter()
-        .map(|&time| (2.0 * std::f32::consts::PI * fc * time).sin())
-        .collect();
+    let total_frames = frames.len();
+    let mut frames_sent = 0;
 
-    // CRC8 polynomial: x^8+x^7+x^5+x^2+x+1 (0x1D7)
-    let _crc8_poly = 0x1D7u16;
-
-    // Preamble generation (440 samples)
-    let mut f_p = Vec::with_capacity(440);
-    // First 220: linear from 2kHz to 10kHz
-    for i in 0..220 {
-        f_p.push(2000.0 + (8000.0 * i as f32 / 219.0));
-    }
-    // Next 220: linear from 10kHz to 2kHz
-    for i in 0..220 {
-        f_p.push(10000.0 - (8000.0 * i as f32 / 219.0));
-    }
-
-    // Generate preamble using cumulative trapezoidal integration
-    let mut omega = 0.0;
-    let mut preamble = Vec::with_capacity(440);
-    preamble.push((2.0 * std::f32::consts::PI * f_p[0] * t[0]).sin());
-
-    for i in 1..440 {
-        let dt = t[i] - t[i - 1];
-        omega += std::f32::consts::PI * (f_p[i] + f_p[i - 1]) * dt;
-        preamble.push(omega.sin());
-    }
-
-    // Process each frame
-    for i in 0..100 {
-        let frame = &frames[i];
-
-        // Add CRC8 (simplified implementation)
-        let mut frame_crc = frame.clone();
-        frame_crc.extend_from_slice(&[0u8; 8]); // Add 8 CRC bits (placeholder)
-
-        // Modulation: 44 samples per bit, baudrate ~1000bps
-        let mut frame_wave = Vec::with_capacity(frame_crc.len() * 44);
-        for (j, &bit) in frame_crc.iter().enumerate() {
-            let start_idx = j * 44;
-            let end_idx = (j + 1) * 44;
-            let amplitude = if bit == 1 { 1.0 } else { -1.0 };
-
-            for k in start_idx..end_idx.min(carrier.len()) {
-                frame_wave.push(carrier[k] * amplitude);
-            }
-        }
-
-        // Add preamble
-        let mut frame_wave_pre = preamble.clone();
-        frame_wave_pre.extend(frame_wave);
-
-        // Add random inter-frame spacing
-        let inter_frame_space1: usize = rng.random_range(0..100);
-        let inter_frame_space2: usize = rng.random_range(0..100);
-
-        output_track.extend(vec![0.0; inter_frame_space1]);
-        output_track.extend(frame_wave_pre);
-        output_track.extend(vec![0.0; inter_frame_space2]);
-    }
-
-    let output_track_len = output_track.len();
-
-    {
-        let mut playback = shared.playback_buffer.lock().unwrap();
-        playback.extend(output_track);
-        info!(
-            "Output track length: {} samples",
-            playback.len()
-        );
-    }
-
-    progress_manager
+    let sender_progress = progress_manager
         .create_bar(
-            "playback",
-            output_track_len as u64,
-            templates::PLAYBACK,
+            "sender",
+            total_frames as u64,
+            templates::SENDER,
             "sender",
         )
         .unwrap();
 
-    *shared.app_state.lock().unwrap() = recorder::AppState::Playing;
+    let overall_start_time = std::time::Instant::now();
 
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    for frame_to_send in &frames {
+        state = mac::CSMAState::Sensing;
+        *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
+        let mut stage = 0;
 
-        ui::update_progress(&shared, output_track_len, &progress_manager);
+        'csma_loop: loop {
+            match state {
+                mac::CSMAState::Sensing => {
+                    trace!("Sensing channel for idleness...");
+                    std::thread::sleep(std::time::Duration::from_millis(ENERGY_DETECTION_SAMPLES as u64 * 1000 / sample_rate as u64));
+                    let recorded_samples = { shared.record_buffer.lock().unwrap().clone() };
+                    match mac::is_channel_busy(&recorded_samples) {
+                        Some(true) => {
+                            trace!("Channel busy detected during sensing.");
+                            shared.record_buffer.lock().unwrap().clear();
+                        }
+                        Some(false) => {
+                            state = mac::CSMAState::WaitingForDIFS;
+                            shared.record_buffer.lock().unwrap().clear();
+                        }
+                        None => {
+                            trace!("Not enough samples to determine channel state during sensing.");
+                            continue 'csma_loop;
+                        }
+                    }
+                }
+                mac::CSMAState::Backoff(mut counter) => {
+                    trace!("Backoff counter: {}", counter);
+                    if counter > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(SLOT_TIME_MS));
+                        match mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
+                            Some(true) => {
+                                trace!("Channel busy detected during backoff.");
+                                state = mac::CSMAState::BackoffPaused(counter);
+                            }
+                            Some(false) => {
+                                // Channel idle, continue countdown
+                                shared.record_buffer.lock().unwrap().clear();
+                                counter -= 1;
+                                state = mac::CSMAState::Backoff(counter);
+                            }
+                            None => {
+                                trace!("Not enough samples to determine channel state during backoff.");
+                            }
+                        }
+                    } else {
+                        state = mac::CSMAState::Transmitting;
+                    }
+                }
+                mac::CSMAState::BackoffPaused(counter) => {
+                    trace!("Backoff paused at counter {}", counter);
+                    // 等待一个 DIFS 周期
+                    std::thread::sleep(std::time::Duration::from_millis(DIFS_DURATION_MS));
+                    match mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
+                        Some(true) => {
+                            trace!("Channel still busy during backoff pause.");
+                            shared.record_buffer.lock().unwrap().clear();
+                            state = mac::CSMAState::BackoffPaused(counter);
+                        }
+                        Some(false) => {
+                            trace!("Channel idle again, resuming backoff.");
+                            shared.record_buffer.lock().unwrap().clear();
+                            state = mac::CSMAState::Backoff(counter);
+                            
+                            // // DIFS 结束后，必须再次检查信道，因为可能有别人在我们等待时开始发送
+                            // if let Some(false) = mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
+                            //     // 如果信道在 DIFS 后仍然空闲，那么我们可以恢复倒计时
+                            //     trace!("DIFS wait over, channel still idle. Resuming backoff.");
+                            //     state = mac::CSMAState::Backoff(counter);
+                            // } else {
+                            //     // 如果在 DIFS 期间信道又变忙了，我们必须保持 Paused 状态
+                            //     trace!("Channel became busy during DIFS wait. Staying paused.");
+                            // }
+                            // shared.record_buffer.lock().unwrap().clear();
+                        }
+                        None => {
+                            
+                            trace!("Not enough samples {} to determine channel state during backoff pause.", &{ shared.record_buffer.lock().unwrap().len() });
+                        }
+                    }
+                }
+                mac::CSMAState::WaitingForDIFS => {
+                    trace!("Channel idle, waiting for DIFS...");
+                    std::thread::sleep(std::time::Duration::from_millis(DIFS_DURATION_MS));
 
-        let state = { shared.app_state.lock().unwrap().clone() };
-        if let recorder::AppState::Idle = state {
-            progress_manager.finish_all();
-            break;
-        }
-    }
+                    match mac::is_channel_busy(&{ shared.record_buffer.lock().unwrap().clone() }) {
+                        Some(false) => {
+                            trace!("DIFS wait is over and channel is still idle. Starting backoff.");
+                            let cw = (CW_MIN as u16 * 2_u16 * (stage)).min(CW_MAX as u16) as usize;
+                            state = mac::CSMAState::Backoff(rand::random_range(0..=cw));
+                            shared.record_buffer.lock().unwrap().clear();
+                        }
+                        Some(true) => {
+                            trace!("Channel became busy during DIFS wait. Returning to sensing.");
+                            state = mac::CSMAState::Sensing;
+                            shared.record_buffer.lock().unwrap().clear();
+                        }
+                        None => {
+                            trace!("Not enough samples to determine channel state after DIFS wait.");
+                        }
+                    }
+                }
+                mac::CSMAState::Transmitting => {
+                    trace!("Channel idle, proceeding to transmit frame seq: {}", frame_to_send.sequence);
+                    // 1. Encode and send the frame
+                    let output_track = encoder.encode_frames(&[frame_to_send.clone()], INTER_FRAME_GAP_SAMPLES);
+                    {
+                        let mut playback = shared.playback_buffer.lock().unwrap();
+                        playback.clear();
+                        playback.extend(output_track);
+                    {
+                        // Clear previous recordings before listening for ACK
+                        let mut rec_buf = shared.record_buffer.lock().unwrap();
+                        rec_buf.clear();
+                    }
+                    }
+                    *shared.app_state.lock().unwrap() = recorder::AppState::Playing;
+
+                    // Wait for playback to finish
+                    while let recorder::AppState::Playing = { shared.app_state.lock().unwrap().clone() } {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    debug!("Frame {} sent, waiting for ACK...", frame_to_send.sequence);
+
+                    // 2. Switch to recording to wait for ACK
+                    *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
+                    state = mac::CSMAState::WaitingForAck;
+                }
+                mac::CSMAState::WaitingForAck => {
+                    let mut processed_samples_len = 0;
+                    let ack_wait_start = std::time::Instant::now();
+                    // Timeout for ACK
+                    let ack_timeout = std::time::Duration::from_millis(ACK_TIMEOUT_MS);
+
+                    // 3. ACK waiting loop
+                    'ack_wait_loop: loop {
+                        if ack_wait_start.elapsed() > ack_timeout {
+                            warn!("ACK timeout for seq: {}, stage {}", frame_to_send.sequence, stage);
+                            stage = (stage + 1).min(20);
+                            let cw = (CW_MIN as u16 * 2_u16 * (stage)).min(CW_MAX as u16) as usize; // Not BEB
+                            warn!("Random range to {}", cw);
+                            state = mac::CSMAState::Backoff(rand::random_range(0..=cw));
+                            break 'ack_wait_loop; // Timed out, retransmit
+                        }
+
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+
+                        let current_samples = { shared.record_buffer.lock().unwrap().clone() };
+
+                        if current_samples.len() > processed_samples_len {
+                            let new_samples = &current_samples[processed_samples_len..];
+                            let decoded_frames = decoder.process_samples(new_samples);
+                            processed_samples_len = current_samples.len();
+
+                            for ack_frame in decoded_frames {
+                                if ack_frame.frame_type == FrameType::Ack && ack_frame.sequence == frame_to_send.sequence {
+                                    debug!("ACK received for seq: {}", frame_to_send.sequence);
+                                    frames_sent += 1;
+                                    progress_manager.inc("sender", 1).unwrap();
+                                    break 'csma_loop; // ACK OK, send next frame
+                                } else {
+                                    warn!(
+                                        "Received unexpected frame while waiting for ACK {}: type={:?}, seq={}",
+                                        frame_to_send.sequence,
+                                        ack_frame.frame_type,
+                                        ack_frame.sequence
+                                    );
+                                }
+                            }
+                        }
+                    } // end ack_wait_loop
+                }
+                mac::CSMAState::Idle => unreachable!(),
+            } // end retransmit_loop
+        } // end csma_loop
+    } // end for frame_to_send
+
+    progress_manager.finish("sender", "All frames acknowledged").unwrap();
+    let total_duration = overall_start_time.elapsed().as_secs_f32();
+    info!(
+        "🎉 All {} frames transmitted and acknowledged in {:.2} seconds.",
+        total_frames, total_duration
+    );
+
+    // // Save final received signal for debugging
+    // if let Err(e) = utils::dump::dump_to_wav(
+    //     "./tmp/sender_final_ack_recording.wav",
+    //     &utils::dump::AudioData {
+    //         sample_rate,
+    //         audio_data: shared.record_buffer.lock().unwrap().clone(),
+    //         duration: shared.record_buffer.lock().unwrap().len() as f32 / sample_rate as f32,
+    //         channels: 1,
+    //     },
+    // ) {
+    //     warn!("Failed to save sender's final recording: {}", e);
+    // }
 }
 
 fn run_receiver(
     shared: recorder::AppShared,
     progress_manager: ProgressManager,
-    sample_rate: u32,
     max_recording_duration_samples: u32,
+    line_coding: LineCodingKind,
+    receiver_addr: mac::types::MacAddr,
+    sender_addr: mac::types::MacAddr,
+    rx_duration: u64,
 ) {
-    // Generate preamble for receiver (same as in sender)
-    let sample_rate_f32 = sample_rate as f32;
-    let t: Vec<f32> = (0..48000)
-        .map(|i| i as f32 / sample_rate_f32)
-        .collect();
+    info!("=== Receiver Mode ===");
+    info!("Using line coding: {}", line_coding.name());
 
-    // Preamble generation (440 samples)
-    let mut f_p = Vec::with_capacity(440);
-    // First 220: linear from 2kHz to 10kHz
-    for i in 0..220 {
-        f_p.push(2000.0 + (8000.0 * i as f32 / 219.0));
-    }
-    // Next 220: linear from 10kHz to 2kHz
-    for i in 0..220 {
-        f_p.push(10000.0 - (8000.0 * i as f32 / 219.0));
-    }
+    // Create decoder and encoder for ACKs
+    let mut decoder = PhyDecoder::new(
+        SAMPLES_PER_LEVEL,
+        PREAMBLE_PATTERN_BYTES,
+        line_coding,
+        receiver_addr,
+    );
+    let encoder = PhyEncoder::new(
+        SAMPLES_PER_LEVEL,
+        PREAMBLE_PATTERN_BYTES,
+        line_coding,
+    );
 
-    // Generate preamble using cumulative trapezoidal integration
-    let mut omega = 0.0;
-    let mut preamble = Vec::with_capacity(440);
-    preamble.push((2.0 * std::f32::consts::PI * f_p[0] * t[0]).sin());
+    let mut all_data = Vec::new();
+    let mut received_sequences = std::collections::HashSet::new();
+    let mut processed_samples_len = 0;
 
-    for i in 1..440 {
-        let dt = t[i] - t[i - 1];
-        omega += std::f32::consts::PI * (f_p[i] + f_p[i - 1]) * dt;
-        preamble.push(omega.sin());
-    }
-
-    progress_manager
+    let progress_bar = progress_manager
         .create_bar(
             "recording",
             max_recording_duration_samples as u64,
@@ -295,500 +566,247 @@ fn run_receiver(
 
     *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
 
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    let start_time = std::time::Instant::now();
+    let recording_timeout = std::time::Duration::from_secs(rx_duration);
 
-        ui::update_progress(
-            &shared,
-            max_recording_duration_samples as usize,
-            &progress_manager,
-        );
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
 
-        let state = {
-            shared
-                .app_state
-                .lock()
-                .unwrap()
-                .clone()
-        };
+    // Ctrl+C 设置标志
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    }).expect("Error setting Ctrl-C handler");
+
+    'main_loop: loop {
+        if !running.load(Ordering::SeqCst) { break; }
+
+        // Check for overall timeout
+        if start_time.elapsed() > recording_timeout {
+            info!("Receiver timeout reached. Exiting.");
+            break 'main_loop;
+        }
+
+        // Wait for some audio to be recorded
+        std::thread::sleep(std::time::Duration::from_millis(25));
+
+        if shared.record_buffer.lock().unwrap().len() > 50 {
+            let new_samples = &shared.record_buffer.lock().unwrap().drain(..).collect::<Vec<_>>()[..];
+            let decoded_frames = decoder.process_samples(new_samples);
+            processed_samples_len += new_samples.len();
+
+            for frame in decoded_frames {
+                if frame.frame_type == FrameType::Data {
+                    if !received_sequences.contains(&frame.sequence) {
+                        debug!("Received new DATA frame with seq: {}", frame.sequence);
+                        // Store data and mark sequence as received
+                        all_data.push((frame.sequence, frame.data.clone()));
+                        received_sequences.insert(frame.sequence);
+                    } else {
+                        info!("Received duplicate DATA frame with seq: {}, re-sending ACK.", frame.sequence);
+                    }
+
+                    // Always send an ACK for a data frame, even if it's a duplicate.
+                    // This handles the case where our ACK was lost and the sender retransmitted.
+                    debug!("Sending ACK for seq: {}", frame.sequence);
+                    let ack_frame = Frame::new_ack(frame.sequence, receiver_addr, sender_addr); // TODO: change this to actual sender addr
+                    let ack_track = encoder.encode_frames(&[ack_frame], 0);
+
+                    // Put ACK in playback buffer
+                    {
+                        let mut playback = shared.playback_buffer.lock().unwrap();
+                        playback.clear();
+                        playback.extend(ack_track);
+                    }
+
+                    // Switch to playing state
+                    *shared.app_state.lock().unwrap() = recorder::AppState::Playing;
+
+                    // Wait for ACK playback to complete
+                    while let recorder::AppState::Playing = { shared.app_state.lock().unwrap().clone() } {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    debug!("ACK sent for seq: {}", frame.sequence);
+
+                    // After sending ACK, switch back to recording for the next frame
+                    *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
+                    debug!("Switched back to recording mode.");
+                }
+            } // end for frame
+        } // end if new samples
+
+        progress_manager.set_position("recording", processed_samples_len as u64).unwrap();
+
+        // Check if user manually stopped (e.g., by letting recording finish)
+        let state = { shared.app_state.lock().unwrap().clone() };
         if let recorder::AppState::Idle = state {
-            progress_manager.finish_all();
-            break;
+            info!("Recording finished by user or duration limit.");
+            break 'main_loop;
         }
-    }
+    } // end main_loop
 
-    let rx_fifo: std::collections::VecDeque<f32> = {
-        let record = shared.record_buffer.lock().unwrap();
-        record.iter().copied().collect()
+    let elapsed = start_time.elapsed().as_secs_f32();
+    info!("Receiver loop finished in {:.2} seconds", elapsed);
+    progress_manager.finish("recording", "Finished").unwrap();
+
+    // Final processing for any remaining samples
+    let final_samples = {
+        let buffer = shared.record_buffer.lock().unwrap();
+        buffer.clone()
     };
-
-    let mut power = 0.0f32;
-    let mut power_debug = vec![0.0f32; rx_fifo.len()];
-    let mut start_index = 0usize;
-    let mut start_index_debug = vec![0.0f32; rx_fifo.len()];
-    let mut sync_fifo = vec![0.0f32; 440];
-    let mut sync_power_debug = vec![0.0f32; rx_fifo.len()];
-    let mut sync_power_local_max = 0.0f32;
-
-    let mut decode_fifo = Vec::new();
-    let mut correct_frame_num = 0;
-    let mut decoded_content = Vec::new(); // Store decoded content for streaming output
-
-    let mut state = 0; // 0: sync, 1: decode
-
-    // This part is a bit of a hack for the simulation
-    // We need a carrier wave for decoding. In a real receiver, this would be handled differently.
-    let sample_rate_f32_decode = 48000.0;
-    let t_decode: Vec<f32> = (0..rx_fifo.len())
-        .map(|i| i as f32 / sample_rate_f32_decode)
-        .collect();
-    let fc_decode = 10000.0;
-    let carrier_decode: Vec<f32> = t_decode
-        .iter()
-        .map(|&time| (2.0 * std::f32::consts::PI * fc_decode * time).sin())
-        .collect();
-
-    for i in 0..rx_fifo.len() {
-        let current_sample = rx_fifo[i];
-
-        power = power * (1.0 - 1.0 / 64.0) + current_sample * current_sample / 64.0;
-        power_debug[i] = power;
-
-        if state == 0 {
-            // Packet sync
-            sync_fifo.rotate_left(1);
-            sync_fifo[439] = current_sample;
-
-            let sync_power = sync_fifo
-                .iter()
-                .zip(preamble.iter())
-                .map(|(a, b)| a * b)
-                .sum::<f32>()
-                / 200.0;
-            sync_power_debug[i] = sync_power;
-
-            if (sync_power > power * 2.0)
-                && (sync_power > sync_power_local_max)
-                && (sync_power > 0.05)
-            {
-                sync_power_local_max = sync_power;
-                start_index = i;
-            } else if (i > start_index + 200) && (start_index != 0) {
-                start_index_debug[start_index] = 1.5;
-                sync_power_local_max = 0.0;
-                sync_fifo.fill(0.0);
-                state = 1;
-
-                // Convert VecDeque slice to Vec
-                decode_fifo = rx_fifo.range(start_index + 1..i).copied().collect();
-            }
-        } else if state == 1 {
-            decode_fifo.push(current_sample);
-
-            if decode_fifo.len() == 44 * 108 {
-                // Decode
-                let decode_len = decode_fifo.len();
-                let carrier_slice = &carrier_decode[..decode_len.min(carrier_decode.len())];
-
-                // Remove carrier (simplified smoothing)
-                let mut decode_remove_carrier = Vec::with_capacity(decode_len);
-                for j in 0..decode_len {
-                    let start = j.saturating_sub(5);
-                    let end = (j + 6).min(decode_len);
-                    let sum: f32 = (start..end)
-                        .map(|k| decode_fifo[k] * carrier_slice.get(k).unwrap_or(&0.0))
-                        .sum();
-                    decode_remove_carrier.push(sum / (end - start) as f32);
-                }
-
-                let mut decode_power_bit = vec![false; 108];
-                for j in 0..108 {
-                    let start_idx = 10 + j * 44;
-                    let end_idx = (30 + j * 44).min(decode_remove_carrier.len());
-                    if start_idx < decode_remove_carrier.len() && start_idx < end_idx {
-                        let sum: f32 = decode_remove_carrier[start_idx..end_idx].iter().sum();
-                        decode_power_bit[j] = sum > 0.0;
-                    }
-                }
-
-                // CRC check (simplified - just compare first 8 bits with expected ID)
-                let mut temp_index = 0u8;
-                for k in 0..8 {
-                    if decode_power_bit[k] {
-                        temp_index += 1 << (7 - k);
-                    }
-                }
-
-                if temp_index > 0 && temp_index <= 100 {
-                    debug!("Frame ID: {}", temp_index);
-                    correct_frame_num += 1;
-                    
-                    // Extract data bits (skip first 8 bits which are ID)
-                    let data_bits = &decode_power_bit[8..100];
-                    decoded_content.extend_from_slice(data_bits);
-                    
-                    // Convert accumulated bits to text and output
-                    if decoded_content.len() >= 8 {
-                        let mut output_text = String::new();
-                        let mut i = 0;
-                        while i + 8 <= decoded_content.len() {
-                            let mut byte = 0u8;
-                            for j in 0..8 {
-                                if decoded_content[i + j] {
-                                    byte |= 1 << (7 - j);
-                                }
-                            }
-                            output_text.push(byte as char);
-                            i += 8;
-                        }
-                        
-                        if !output_text.is_empty() {
-                            print!("{}", output_text);
-                            std::io::stdout().flush().unwrap();
-                        }
-                        
-                        // Remove processed bits
-                        decoded_content.drain(0..i);
-                    }
-                } else {
-                    debug!("Wrong Frame ID: {}", temp_index);
-                }
-
-                start_index = 0;
-                decode_fifo.clear();
-                state = 0;
+    if final_samples.len() > processed_samples_len {
+        let remaining_samples = &final_samples[processed_samples_len..];
+        let decoded_frames = decoder.process_samples(remaining_samples);
+        for frame in decoded_frames {
+             if frame.frame_type == FrameType::Data && !received_sequences.contains(&frame.sequence) {
+                info!("Decoded final DATA frame with seq: {}", frame.sequence);
+                all_data.push((frame.sequence, frame.data.clone()));
+                received_sequences.insert(frame.sequence);
             }
         }
     }
 
-    // Output any remaining decoded content
-    if !decoded_content.is_empty() {
-        let mut output_text = String::new();
-        let mut i = 0;
-        while i + 8 <= decoded_content.len() {
-            let mut byte = 0u8;
-            for j in 0..8 {
-                if decoded_content[i + j] {
-                    byte |= 1 << (7 - j);
-                }
-            }
-            output_text.push(byte as char);
-            i += 8;
-        }
-        
-        if !output_text.is_empty() {
-            print!("{}", output_text);
-            std::io::stdout().flush().unwrap();
-        }
+    info!("Total unique data frames received: {}", all_data.len());
+
+    // Save recorded signal to WAV
+    let sample_rate = SAMPLE_RATE;
+    if let Err(e) = utils::dump::dump_to_wav(
+        "./tmp/receiver_input.wav",
+        &utils::dump::AudioData {
+            sample_rate,
+            audio_data: final_samples.clone(),
+            duration: final_samples.len() as f32 / sample_rate as f32,
+            channels: 1,
+        },
+    ) {
+        warn!("Failed to save receiver WAV: {}", e);
+    } else {
+        info!("Saved received signal to ./tmp/receiver_input.wav");
     }
-    
-    println!("\n接收完成！总共正确接收帧数: {}", correct_frame_num);
+
+    // Reconstruct file data
+    all_data.sort_by_key(|k| k.0);
+    let output_data: Vec<u8> = all_data.into_iter().flat_map(|(_, data)| data).collect();
+
+    debug!("Reconstructed {} bytes", output_data.len());
+
+    // Write to output file
+    let output_path = format!("OUTPUT{}to{}.bin", &sender_addr, &receiver_addr);
+    match fs::write(&output_path, &output_data) {
+        Ok(_) => debug!("Written to {}", &output_path),
+        Err(e) => error!("Failed to write {}: {}", output_path, e),
+    }
 }
 
-fn test_sender_receiver() {
-    println!("开始测试发送和接收功能...");
-    
-    // Read content from think-different.txt file
-    let file_content = std::fs::read_to_string("assets/think-different.txt")
-        .expect("Failed to read think-different.txt");
-    
-    println!("原始文件内容:\n{}", file_content);
-    println!("原始文件长度: {} bytes", file_content.len());
-    
-    // Convert text content to bits (ASCII encoding)
-    let text_bits: Vec<u8> = file_content
-        .bytes()
-        .flat_map(|byte| {
-            (0..8).map(move |i| ((byte >> (7 - i)) & 1) as u8)
-        })
-        .collect();
-    
-    let mut rng = rand::rngs::StdRng::from_seed([1u8; 32]);
-    let mut output_track = Vec::new();
+fn test_transmission(line_coding: LineCodingKind) {
+    info!("=== Test Mode (Loopback without JACK) ===");
+    info!("Using line coding: {}", line_coding.name());
 
-    // 100 frames, each 100 bits
-    let mut frames = vec![vec![0u8; 100]; 100];
+    // Create test data
+    let test_text = format!(
+        "114514Hello, Project 2! This is a test of cable-based transmission using {} line coding.",
+        line_coding.name()
+    );
+    let test_data = test_text.into_bytes();
+    info!("Test data: {} bytes", test_data.len());
+    info!("Content: {}", String::from_utf8_lossy(&test_data));
 
-    // Fill frames with content from think-different.txt
-    let mut bit_index = 0;
-    for i in 0..100 {
-        // Set first 8 bits to frame ID
-        let id = i + 1; // 1-indexed like MATLAB
-        for j in 0..8 {
-            frames[i][j] = ((id >> (7 - j)) & 1) as u8;
-        }
-        
-        // Fill remaining 92 bits with content from file
-        for j in 8..100 {
-            if bit_index < text_bits.len() {
-                frames[i][j] = text_bits[bit_index];
-                bit_index += 1;
-            } else {
-                // If we run out of file content, wrap around
-                bit_index = 0;
-                frames[i][j] = text_bits[bit_index];
-                bit_index += 1;
-            }
-        }
+    // Create encoder and decoder
+    let encoder = PhyEncoder::new(
+        SAMPLES_PER_LEVEL,
+        PREAMBLE_PATTERN_BYTES,
+        line_coding,
+    );
+    let mut decoder = PhyDecoder::new(
+        SAMPLES_PER_LEVEL,
+        PREAMBLE_PATTERN_BYTES,
+        line_coding,
+        2
+    );
+
+    // Create frames
+    let mut frames = Vec::new();
+    let mut seq = 0u8;
+
+    for chunk in test_data.chunks(MAX_FRAME_DATA_SIZE) {
+        let frame = Frame::new_data(seq, 0, 1, chunk.to_vec());
+        frames.push(frame);
+        seq = seq.wrapping_add(1);
     }
 
-    // PHY Frame generation
-    let sample_rate = 48000u32;
-    let sample_rate_f32 = sample_rate as f32;
-    let t: Vec<f32> = (0..48000)
-        .map(|i| i as f32 / sample_rate_f32)
-        .collect();
+    info!("Created {} frames", frames.len());
 
-    // Carrier frequency 10kHz
-    let fc = 10000.0;
-    let carrier: Vec<f32> = t
-        .iter()
-        .map(|&time| (2.0 * std::f32::consts::PI * fc * time).sin())
-        .collect();
+    // Encode
+    let samples = encoder.encode_frames(&frames, INTER_FRAME_GAP_SAMPLES);
+    info!(
+        "Encoded to {} samples ({:.2} seconds at {} Hz)",
+        samples.len(),
+        samples.len() as f32 / SAMPLE_RATE as f32,
+        SAMPLE_RATE
+    );
 
-    // Preamble generation (440 samples)
-    let mut f_p = Vec::with_capacity(440);
-    // First 220: linear from 2kHz to 10kHz
-    for i in 0..220 {
-        f_p.push(2000.0 + (8000.0 * i as f32 / 219.0));
-    }
-    // Next 220: linear from 10kHz to 2kHz
-    for i in 0..220 {
-        f_p.push(10000.0 - (8000.0 * i as f32 / 219.0));
-    }
-
-    // Generate preamble using cumulative trapezoidal integration
-    let mut omega = 0.0;
-    let mut preamble = Vec::with_capacity(440);
-    preamble.push((2.0 * std::f32::consts::PI * f_p[0] * t[0]).sin());
-
-    for i in 1..440 {
-        let dt = t[i] - t[i - 1];
-        omega += std::f32::consts::PI * (f_p[i] + f_p[i - 1]) * dt;
-        preamble.push(omega.sin());
-    }
-
-    // Process each frame
-    for i in 0..100 {
-        let frame = &frames[i];
-
-        // Add CRC8 (simplified implementation)
-        let mut frame_crc = frame.clone();
-        frame_crc.extend_from_slice(&[0u8; 8]); // Add 8 CRC bits (placeholder)
-
-        // Modulation: 44 samples per bit, baudrate ~1000bps
-        let mut frame_wave = Vec::with_capacity(frame_crc.len() * 44);
-        for (j, &bit) in frame_crc.iter().enumerate() {
-            let start_idx = j * 44;
-            let end_idx = (j + 1) * 44;
-            let amplitude = if bit == 1 { 1.0 } else { -1.0 };
-
-            for k in start_idx..end_idx.min(carrier.len()) {
-                frame_wave.push(carrier[k] * amplitude);
-            }
-        }
-
-        // Add preamble
-        let mut frame_wave_pre = preamble.clone();
-        frame_wave_pre.extend(frame_wave);
-
-        // Add random inter-frame spacing
-        let inter_frame_space1: usize = rng.random_range(0..100);
-        let inter_frame_space2: usize = rng.random_range(0..100);
-
-        output_track.extend(vec![0.0; inter_frame_space1]);
-        output_track.extend(frame_wave_pre);
-        output_track.extend(vec![0.0; inter_frame_space2]);
-    }
-
-    debug!("Total length: {} samples", output_track.len());
-
-    // dump json
-    utils::dump::dump_to_json("./tmp/output.json", &utils::dump::AudioData {
-        sample_rate,
-        audio_data: output_track.clone(),
-        duration: output_track.len() as f32 / sample_rate as f32,
-        channels: 1,
-    })
-        .expect("Failed to dump output track to JSON");
-    info!("Dumped output track to ./tmp/output.json");
-
-    utils::dump::dump_to_wav("./tmp/output.wav", &utils::dump::AudioData {
-        sample_rate,
-        audio_data: output_track.clone(),
-        duration: output_track.len() as f32 / sample_rate as f32,
-        channels: 1,
-    })
-        .expect("Failed to dump output track to WAV");
-    info!("Dumped output track to ./tmp/output.wav");
-
-    // Now decode the output_track
-    let rx_fifo: Vec<f32> = output_track;
-
-    let mut power = 0.0f32;
-    let mut start_index = 0usize;
-    let mut sync_fifo = vec![0.0f32; 440];
-    let mut sync_power_local_max = 0.0f32;
-
-    let mut decode_fifo = Vec::new();
-    let mut correct_frame_num = 0;
-    let mut decoded_content = Vec::new();
-    let mut decoded_text = String::new();
-
-    let mut state = 0; // 0: sync, 1: decode
-
-    // This part is a bit of a hack for the simulation
-    let sample_rate_f32_decode = 48000.0;
-    let t_decode: Vec<f32> = (0..rx_fifo.len())
-        .map(|i| i as f32 / sample_rate_f32_decode)
-        .collect();
-    let fc_decode = 10000.0;
-    let carrier_decode: Vec<f32> = t_decode
-        .iter()
-        .map(|&time| (2.0 * std::f32::consts::PI * fc_decode * time).sin())
-        .collect();
-
-    for i in 0..rx_fifo.len() {
-        let current_sample = rx_fifo[i];
-
-        power = power * (1.0 - 1.0 / 64.0) + current_sample * current_sample / 64.0;
-
-        if state == 0 {
-            // Packet sync
-            sync_fifo.rotate_left(1);
-            sync_fifo[439] = current_sample;
-
-            let sync_power = sync_fifo
-                .iter()
-                .zip(preamble.iter())
-                .map(|(a, b)| a * b)
-                .sum::<f32>()
-                / 200.0;
-
-            if (sync_power > power * 2.0)
-                && (sync_power > sync_power_local_max)
-                && (sync_power > 0.05)
-            {
-                sync_power_local_max = sync_power;
-                start_index = i;
-            } else if (i > start_index + 200) && (start_index != 0) {
-                sync_power_local_max = 0.0;
-                sync_fifo.fill(0.0);
-                state = 1;
-
-                decode_fifo = rx_fifo[start_index + 1..i].to_vec();
-            }
-        } else if state == 1 {
-            decode_fifo.push(current_sample);
-
-            if decode_fifo.len() == 44 * 108 {
-                // Decode
-                let decode_len = decode_fifo.len();
-                let carrier_slice = &carrier_decode[..decode_len.min(carrier_decode.len())];
-
-                // Remove carrier (simplified smoothing)
-                let mut decode_remove_carrier = Vec::with_capacity(decode_len);
-                for j in 0..decode_len {
-                    let start = j.saturating_sub(5);
-                    let end = (j + 6).min(decode_len);
-                    let sum: f32 = (start..end)
-                        .map(|k| decode_fifo[k] * carrier_slice.get(k).unwrap_or(&0.0))
-                        .sum();
-                    decode_remove_carrier.push(sum / (end - start) as f32);
-                }
-
-                let mut decode_power_bit = vec![false; 108];
-                for j in 0..108 {
-                    let start_idx = 10 + j * 44;
-                    let end_idx = (30 + j * 44).min(decode_remove_carrier.len());
-                    if start_idx < decode_remove_carrier.len() && start_idx < end_idx {
-                        let sum: f32 = decode_remove_carrier[start_idx..end_idx].iter().sum();
-                        decode_power_bit[j] = sum > 0.0;
-                    }
-                }
-
-                // CRC check (simplified - just compare first 8 bits with expected ID)
-                let mut temp_index = 0u8;
-                for k in 0..8 {
-                    if decode_power_bit[k] {
-                        temp_index += 1 << (7 - k);
-                    }
-                }
-
-                if temp_index > 0 && temp_index <= 100 {
-                    correct_frame_num += 1;
-                    
-                    // Extract data bits (skip first 8 bits which are ID)
-                    let data_bits = &decode_power_bit[8..100];
-                    decoded_content.extend_from_slice(data_bits);
-                    
-                    // Convert accumulated bits to text
-                    while decoded_content.len() >= 8 {
-                        let mut byte = 0u8;
-                        for j in 0..8 {
-                            if decoded_content[j] {
-                                byte |= 1 << (7 - j);
-                            }
-                        }
-                        decoded_text.push(byte as char);
-                        decoded_content.drain(0..8);
-                    }
-                }
-
-                start_index = 0;
-                decode_fifo.clear();
-                state = 0;
-            }
-        }
-    }
-
-    // Handle any remaining bits
-    if decoded_content.len() >= 8 {
-        while decoded_content.len() >= 8 {
-            let mut byte = 0u8;
-            for j in 0..8 {
-                if decoded_content[j] {
-                    byte |= 1 << (7 - j);
-                }
-            }
-            decoded_text.push(byte as char);
-            decoded_content.drain(0..8);
-        }
-    }
-    
-    println!("\n解码完成！");
-    println!("正确接收帧数: {}", correct_frame_num);
-    println!("解码的文件长度: {} bytes", decoded_text.len());
-    println!("解码内容:\n{}", decoded_text);
-    
-    // Compare with original (按照较小的长度来比较)
-    let original_trimmed = file_content.trim();
-    let decoded_trimmed = decoded_text.trim();
-    
-    let min_len = original_trimmed.len().min(decoded_trimmed.len());
-    let original_compare = &original_trimmed[..min_len];
-    let decoded_compare = &decoded_trimmed[..min_len];
-    
-    println!("比较长度: {} bytes", min_len);
-    
-    if original_compare == decoded_compare {
-        println!("✅ 测试通过！解码内容的前{}字节与原始文件完全匹配", min_len);
-        if decoded_trimmed.len() > original_trimmed.len() {
-            println!("注意：解码内容更长，这是因为帧填充时循环使用了原始内容");
-        }
+    // Save to WAV for inspection
+    if let Err(e) = utils::dump::dump_to_wav(
+        "./tmp/project2_test.wav",
+        &utils::dump::AudioData {
+            sample_rate: SAMPLE_RATE,
+            audio_data: samples.clone(),
+            duration: samples.len() as f32 / SAMPLE_RATE as f32,
+            channels: 1,
+        },
+    ) {
+        warn!("Failed to save WAV: {}", e);
     } else {
-        println!("❌ 测试失败！解码内容与原始文件不匹配");
-        println!("原始内容长度: {}", original_trimmed.len());
-        println!("解码内容长度: {}", decoded_trimmed.len());
-        
+        info!("Saved test signal to ./tmp/project2_test.wav");
+    }
+
+    // Decode
+    let decoded_frames = decoder.process_samples(&samples);
+    info!("Decoded {} frames", decoded_frames.len());
+
+    // Reconstruct data
+    let mut decoded_data = Vec::new();
+    for frame in decoded_frames {
+        decoded_data.extend_from_slice(&frame.data);
+    }
+
+    // Compare
+    if decoded_data == test_data {
+        info!("✅ Test PASSED - Data matches perfectly!");
+    } else {
+        error!("❌ Test FAILED - Data mismatch");
+        info!("Original: {} bytes", test_data.len());
+        info!("Decoded:  {} bytes", decoded_data.len());
+
         // Find first difference
-        for i in 0..min_len {
-            if original_compare.chars().nth(i) != decoded_compare.chars().nth(i) {
-                println!("第一个不同的字符位置: {}", i);
-                println!("原始: {:?}", original_compare.chars().nth(i));
-                println!("解码: {:?}", decoded_compare.chars().nth(i));
+        for i in 0..test_data
+            .len()
+            .min(decoded_data.len())
+        {
+            if test_data[i] != decoded_data[i] {
+                info!(
+                    "First difference at byte {}: expected {:#04x}, got {:#04x}",
+                    i,
+                    test_data[i],
+                    decoded_data
+                        .get(i)
+                        .unwrap_or(&0)
+                );
                 break;
             }
         }
     }
+
+    // Performance stats
+    let total_bits = test_data.len() * 8;
+    let duration_s = samples.len() as f32 / SAMPLE_RATE as f32;
+    let effective_bitrate = total_bits as f32 / duration_s;
+
+    info!("Performance:");
+    info!("  - Total bits: {}", total_bits);
+    info!("  - Duration: {:.3} seconds", duration_s);
+    info!("  - Effective bit rate: {:.0} bps", effective_bitrate);
+    info!(
+        "  - Overhead: {:.1}%",
+        (1.0 - effective_bitrate / BIT_RATE as f32) * 100.0
+    );
 }

@@ -1,11 +1,16 @@
-use audio::recorder;
-use device::jack::print_jack_info;
-use dialoguer::{Select, theme::ColorfulTheme};
+use dialoguer::{theme::ColorfulTheme, Select};
 use jack;
-use rand::{self, Rng, SeedableRng};
 use std::io::Write;
+mod audio;
+mod device;
+mod ui;
+mod utils;
+use audio::recorder;
+use device::jack::{
+    print_jack_info,
+};
+use rand::{self, Rng, SeedableRng};
 use tracing::{debug, info};
-use trackmaker_rs::{audio, device, ui, utils};
 use ui::print_banner;
 use ui::progress::{ProgressManager, templates};
 use utils::consts::*;
@@ -71,11 +76,7 @@ fn main() {
         .unwrap();
 
     {
-        shared
-            .record_buffer
-            .lock()
-            .unwrap()
-            .clear();
+        shared.record_buffer.lock().unwrap().clear();
     }
 
     if selection == 0 {
@@ -83,12 +84,7 @@ fn main() {
         run_sender(shared, progress_manager, sample_rate as u32);
     } else if selection == 1 {
         // Receiver
-        run_receiver(
-            shared,
-            progress_manager,
-            sample_rate as u32,
-            max_duration_samples as u32,
-        );
+        run_receiver(shared, progress_manager, sample_rate as u32, max_duration_samples as u32);
     } else {
         // Test mode (no JACK)
         test_sender_receiver();
@@ -109,13 +105,15 @@ fn run_sender(
     // Read content from think-different.txt file
     let file_content = std::fs::read_to_string("assets/think-different.txt")
         .expect("Failed to read think-different.txt");
-
+    
     // Convert text content to bits (ASCII encoding)
     let text_bits: Vec<u8> = file_content
         .bytes()
-        .flat_map(|byte| (0..8).map(move |i| ((byte >> (7 - i)) & 1) as u8))
+        .flat_map(|byte| {
+            (0..8).map(move |i| ((byte >> (7 - i)) & 1) as u8)
+        })
         .collect();
-
+    
     let mut rng = rand::rngs::StdRng::from_seed([1u8; 32]);
     let mut output_track = Vec::new();
 
@@ -130,7 +128,7 @@ fn run_sender(
         for j in 0..8 {
             frames[i][j] = ((id >> (7 - j)) & 1) as u8;
         }
-
+        
         // Fill remaining 92 bits with content from file
         for j in 8..100 {
             if bit_index < text_bits.len() {
@@ -220,12 +218,12 @@ fn run_sender(
     let output_track_len = output_track.len();
 
     {
-        let mut playback = shared
-            .playback_buffer
-            .lock()
-            .unwrap();
+        let mut playback = shared.playback_buffer.lock().unwrap();
         playback.extend(output_track);
-        info!("Output track length: {} samples", playback.len());
+        info!(
+            "Output track length: {} samples",
+            playback.len()
+        );
     }
 
     progress_manager
@@ -237,23 +235,14 @@ fn run_sender(
         )
         .unwrap();
 
-    *shared
-        .app_state
-        .lock()
-        .unwrap() = recorder::AppState::Playing;
+    *shared.app_state.lock().unwrap() = recorder::AppState::Playing;
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         ui::update_progress(&shared, output_track_len, &progress_manager);
 
-        let state = {
-            shared
-                .app_state
-                .lock()
-                .unwrap()
-                .clone()
-        };
+        let state = { shared.app_state.lock().unwrap().clone() };
         if let recorder::AppState::Idle = state {
             progress_manager.finish_all();
             break;
@@ -304,10 +293,7 @@ fn run_receiver(
         )
         .unwrap();
 
-    *shared
-        .app_state
-        .lock()
-        .unwrap() = recorder::AppState::Recording;
+    *shared.app_state.lock().unwrap() = recorder::AppState::Recording;
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -332,14 +318,8 @@ fn run_receiver(
     }
 
     let rx_fifo: std::collections::VecDeque<f32> = {
-        let record = shared
-            .record_buffer
-            .lock()
-            .unwrap();
-        record
-            .iter()
-            .copied()
-            .collect()
+        let record = shared.record_buffer.lock().unwrap();
+        record.iter().copied().collect()
     };
 
     let mut power = 0.0f32;
@@ -371,8 +351,7 @@ fn run_receiver(
     for i in 0..rx_fifo.len() {
         let current_sample = rx_fifo[i];
 
-        power =
-            power * (1.0 - 1.0 / 64.0) + current_sample * current_sample / 64.0;
+        power = power * (1.0 - 1.0 / 64.0) + current_sample * current_sample / 64.0;
         power_debug[i] = power;
 
         if state == 0 {
@@ -401,10 +380,7 @@ fn run_receiver(
                 state = 1;
 
                 // Convert VecDeque slice to Vec
-                decode_fifo = rx_fifo
-                    .range(start_index + 1..i)
-                    .copied()
-                    .collect();
+                decode_fifo = rx_fifo.range(start_index + 1..i).copied().collect();
             }
         } else if state == 1 {
             decode_fifo.push(current_sample);
@@ -412,8 +388,7 @@ fn run_receiver(
             if decode_fifo.len() == 44 * 108 {
                 // Decode
                 let decode_len = decode_fifo.len();
-                let carrier_slice =
-                    &carrier_decode[..decode_len.min(carrier_decode.len())];
+                let carrier_slice = &carrier_decode[..decode_len.min(carrier_decode.len())];
 
                 // Remove carrier (simplified smoothing)
                 let mut decode_remove_carrier = Vec::with_capacity(decode_len);
@@ -421,12 +396,7 @@ fn run_receiver(
                     let start = j.saturating_sub(5);
                     let end = (j + 6).min(decode_len);
                     let sum: f32 = (start..end)
-                        .map(|k| {
-                            decode_fifo[k]
-                                * carrier_slice
-                                    .get(k)
-                                    .unwrap_or(&0.0)
-                        })
+                        .map(|k| decode_fifo[k] * carrier_slice.get(k).unwrap_or(&0.0))
                         .sum();
                     decode_remove_carrier.push(sum / (end - start) as f32);
                 }
@@ -435,12 +405,8 @@ fn run_receiver(
                 for j in 0..108 {
                     let start_idx = 10 + j * 44;
                     let end_idx = (30 + j * 44).min(decode_remove_carrier.len());
-                    if start_idx < decode_remove_carrier.len()
-                        && start_idx < end_idx
-                    {
-                        let sum: f32 = decode_remove_carrier[start_idx..end_idx]
-                            .iter()
-                            .sum();
+                    if start_idx < decode_remove_carrier.len() && start_idx < end_idx {
+                        let sum: f32 = decode_remove_carrier[start_idx..end_idx].iter().sum();
                         decode_power_bit[j] = sum > 0.0;
                     }
                 }
@@ -456,11 +422,11 @@ fn run_receiver(
                 if temp_index > 0 && temp_index <= 100 {
                     debug!("Frame ID: {}", temp_index);
                     correct_frame_num += 1;
-
+                    
                     // Extract data bits (skip first 8 bits which are ID)
                     let data_bits = &decode_power_bit[8..100];
                     decoded_content.extend_from_slice(data_bits);
-
+                    
                     // Convert accumulated bits to text and output
                     if decoded_content.len() >= 8 {
                         let mut output_text = String::new();
@@ -475,14 +441,12 @@ fn run_receiver(
                             output_text.push(byte as char);
                             i += 8;
                         }
-
+                        
                         if !output_text.is_empty() {
                             print!("{}", output_text);
-                            std::io::stdout()
-                                .flush()
-                                .unwrap();
+                            std::io::stdout().flush().unwrap();
                         }
-
+                        
                         // Remove processed bits
                         decoded_content.drain(0..i);
                     }
@@ -511,34 +475,34 @@ fn run_receiver(
             output_text.push(byte as char);
             i += 8;
         }
-
+        
         if !output_text.is_empty() {
             print!("{}", output_text);
-            std::io::stdout()
-                .flush()
-                .unwrap();
+            std::io::stdout().flush().unwrap();
         }
     }
-
+    
     println!("\n接收完成！总共正确接收帧数: {}", correct_frame_num);
 }
 
 fn test_sender_receiver() {
     println!("开始测试发送和接收功能...");
-
+    
     // Read content from think-different.txt file
     let file_content = std::fs::read_to_string("assets/think-different.txt")
         .expect("Failed to read think-different.txt");
-
+    
     println!("原始文件内容:\n{}", file_content);
     println!("原始文件长度: {} bytes", file_content.len());
-
+    
     // Convert text content to bits (ASCII encoding)
     let text_bits: Vec<u8> = file_content
         .bytes()
-        .flat_map(|byte| (0..8).map(move |i| ((byte >> (7 - i)) & 1) as u8))
+        .flat_map(|byte| {
+            (0..8).map(move |i| ((byte >> (7 - i)) & 1) as u8)
+        })
         .collect();
-
+    
     let mut rng = rand::rngs::StdRng::from_seed([1u8; 32]);
     let mut output_track = Vec::new();
 
@@ -553,7 +517,7 @@ fn test_sender_receiver() {
         for j in 0..8 {
             frames[i][j] = ((id >> (7 - j)) & 1) as u8;
         }
-
+        
         // Fill remaining 92 bits with content from file
         for j in 8..100 {
             if bit_index < text_bits.len() {
@@ -640,28 +604,22 @@ fn test_sender_receiver() {
     debug!("Total length: {} samples", output_track.len());
 
     // dump json
-    utils::dump::dump_to_json(
-        "./tmp/output.json",
-        &utils::dump::AudioData {
-            sample_rate,
-            audio_data: output_track.clone(),
-            duration: output_track.len() as f32 / sample_rate as f32,
-            channels: 1,
-        },
-    )
-    .expect("Failed to dump output track to JSON");
+    utils::dump::dump_to_json("./tmp/output.json", &utils::dump::AudioData {
+        sample_rate,
+        audio_data: output_track.clone(),
+        duration: output_track.len() as f32 / sample_rate as f32,
+        channels: 1,
+    })
+        .expect("Failed to dump output track to JSON");
     info!("Dumped output track to ./tmp/output.json");
 
-    utils::dump::dump_to_wav(
-        "./tmp/output.wav",
-        &utils::dump::AudioData {
-            sample_rate,
-            audio_data: output_track.clone(),
-            duration: output_track.len() as f32 / sample_rate as f32,
-            channels: 1,
-        },
-    )
-    .expect("Failed to dump output track to WAV");
+    utils::dump::dump_to_wav("./tmp/output.wav", &utils::dump::AudioData {
+        sample_rate,
+        audio_data: output_track.clone(),
+        duration: output_track.len() as f32 / sample_rate as f32,
+        channels: 1,
+    })
+        .expect("Failed to dump output track to WAV");
     info!("Dumped output track to ./tmp/output.wav");
 
     // Now decode the output_track
@@ -693,8 +651,7 @@ fn test_sender_receiver() {
     for i in 0..rx_fifo.len() {
         let current_sample = rx_fifo[i];
 
-        power =
-            power * (1.0 - 1.0 / 64.0) + current_sample * current_sample / 64.0;
+        power = power * (1.0 - 1.0 / 64.0) + current_sample * current_sample / 64.0;
 
         if state == 0 {
             // Packet sync
@@ -727,8 +684,7 @@ fn test_sender_receiver() {
             if decode_fifo.len() == 44 * 108 {
                 // Decode
                 let decode_len = decode_fifo.len();
-                let carrier_slice =
-                    &carrier_decode[..decode_len.min(carrier_decode.len())];
+                let carrier_slice = &carrier_decode[..decode_len.min(carrier_decode.len())];
 
                 // Remove carrier (simplified smoothing)
                 let mut decode_remove_carrier = Vec::with_capacity(decode_len);
@@ -736,12 +692,7 @@ fn test_sender_receiver() {
                     let start = j.saturating_sub(5);
                     let end = (j + 6).min(decode_len);
                     let sum: f32 = (start..end)
-                        .map(|k| {
-                            decode_fifo[k]
-                                * carrier_slice
-                                    .get(k)
-                                    .unwrap_or(&0.0)
-                        })
+                        .map(|k| decode_fifo[k] * carrier_slice.get(k).unwrap_or(&0.0))
                         .sum();
                     decode_remove_carrier.push(sum / (end - start) as f32);
                 }
@@ -750,12 +701,8 @@ fn test_sender_receiver() {
                 for j in 0..108 {
                     let start_idx = 10 + j * 44;
                     let end_idx = (30 + j * 44).min(decode_remove_carrier.len());
-                    if start_idx < decode_remove_carrier.len()
-                        && start_idx < end_idx
-                    {
-                        let sum: f32 = decode_remove_carrier[start_idx..end_idx]
-                            .iter()
-                            .sum();
+                    if start_idx < decode_remove_carrier.len() && start_idx < end_idx {
+                        let sum: f32 = decode_remove_carrier[start_idx..end_idx].iter().sum();
                         decode_power_bit[j] = sum > 0.0;
                     }
                 }
@@ -770,11 +717,11 @@ fn test_sender_receiver() {
 
                 if temp_index > 0 && temp_index <= 100 {
                     correct_frame_num += 1;
-
+                    
                     // Extract data bits (skip first 8 bits which are ID)
                     let data_bits = &decode_power_bit[8..100];
                     decoded_content.extend_from_slice(data_bits);
-
+                    
                     // Convert accumulated bits to text
                     while decoded_content.len() >= 8 {
                         let mut byte = 0u8;
@@ -808,24 +755,22 @@ fn test_sender_receiver() {
             decoded_content.drain(0..8);
         }
     }
-
+    
     println!("\n解码完成！");
     println!("正确接收帧数: {}", correct_frame_num);
     println!("解码的文件长度: {} bytes", decoded_text.len());
     println!("解码内容:\n{}", decoded_text);
-
+    
     // Compare with original (按照较小的长度来比较)
     let original_trimmed = file_content.trim();
     let decoded_trimmed = decoded_text.trim();
-
-    let min_len = original_trimmed
-        .len()
-        .min(decoded_trimmed.len());
+    
+    let min_len = original_trimmed.len().min(decoded_trimmed.len());
     let original_compare = &original_trimmed[..min_len];
     let decoded_compare = &decoded_trimmed[..min_len];
-
+    
     println!("比较长度: {} bytes", min_len);
-
+    
     if original_compare == decoded_compare {
         println!("✅ 测试通过！解码内容的前{}字节与原始文件完全匹配", min_len);
         if decoded_trimmed.len() > original_trimmed.len() {
@@ -835,21 +780,12 @@ fn test_sender_receiver() {
         println!("❌ 测试失败！解码内容与原始文件不匹配");
         println!("原始内容长度: {}", original_trimmed.len());
         println!("解码内容长度: {}", decoded_trimmed.len());
-
+        
         // Find first difference
         for i in 0..min_len {
-            if original_compare
-                .chars()
-                .nth(i)
-                != decoded_compare.chars().nth(i)
-            {
+            if original_compare.chars().nth(i) != decoded_compare.chars().nth(i) {
                 println!("第一个不同的字符位置: {}", i);
-                println!(
-                    "原始: {:?}",
-                    original_compare
-                        .chars()
-                        .nth(i)
-                );
+                println!("原始: {:?}", original_compare.chars().nth(i));
                 println!("解码: {:?}", decoded_compare.chars().nth(i));
                 break;
             }

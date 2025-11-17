@@ -1,30 +1,30 @@
-use std::process::Command;
 use std::path::Path;
+use std::process::Command;
 
 fn main() {
     println!("🎵 启动音频数据可视化工具...");
-    
+
     // 切换到 tools 目录
     let tools_dir = Path::new("tools");
     if !tools_dir.exists() {
         eprintln!("❌ tools 目录不存在");
         std::process::exit(1);
     }
-    
+
     // 检查 Python 脚本是否存在
     let script_path = tools_dir.join("sample.py");
     if !script_path.exists() {
         eprintln!("❌ sample.py 脚本不存在");
         std::process::exit(1);
     }
-    
+
     // 运行 Python 脚本
     let mut cmd = Command::new("python3");
     cmd.current_dir(tools_dir)
         .arg("sample.py");
-    
+
     println!("🚀 执行命令: python3 sample.py (在 tools 目录)");
-    
+
     match cmd.status() {
         Ok(status) => {
             if status.success() {
