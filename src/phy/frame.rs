@@ -41,7 +41,13 @@ pub struct Frame {
 }
 
 impl Frame {
-    pub fn new(frame_type: FrameType, sequence: u8, src: u8, dst: u8, data: Vec<u8>) -> Self {
+    pub fn new(
+        frame_type: FrameType,
+        sequence: u8,
+        src: u8,
+        dst: u8,
+        data: Vec<u8>,
+    ) -> Self {
         Self {
             frame_type,
             sequence,
@@ -96,12 +102,16 @@ impl Frame {
         bytes_to_bits(&self.to_bytes())
     }
 
-    pub fn parse_header(bits: &[u8]) -> Option<(LenType, CRCType, FrameType, SeqType, u8, u8)> {
+    pub fn parse_header(
+        bits: &[u8],
+    ) -> Option<(LenType, CRCType, FrameType, SeqType, u8, u8)> {
         let bytes = bits_to_bytes(bits);
         Self::parse_header_bytes(&bytes)
     }
 
-    fn parse_header_bytes(bytes: &[u8]) -> Option<(LenType, CRCType, FrameType, SeqType, u8, u8)> {
+    fn parse_header_bytes(
+        bytes: &[u8],
+    ) -> Option<(LenType, CRCType, FrameType, SeqType, u8, u8)> {
         if bytes.len() < PHY_HEADER_BYTES {
             debug!("PHY Header too short: {} bytes", bytes.len());
             return None;
@@ -135,7 +145,8 @@ impl Frame {
             Self::parse_header_bytes(&bytes[..PHY_HEADER_BYTES])?;
 
         // Extract CRC and data
-        let data_bytes = &bytes[PHY_HEADER_BYTES..PHY_HEADER_BYTES + len as usize];
+        let data_bytes =
+            &bytes[PHY_HEADER_BYTES..PHY_HEADER_BYTES + len as usize];
 
         // Verify CRC
         if !verify_crc8(data_bytes, crc) {
