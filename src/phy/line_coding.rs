@@ -14,7 +14,7 @@ pub trait LineCode: Send {
         let mut bits = Vec::with_capacity(pattern_bytes * 8);
         for _ in 0..pattern_bytes {
             // 0xAA pattern: 10101010, 4B5B uses 0x33 pattern: 00110011
-            bits.extend_from_slice(&[0,0,1,1,0,0,1,1]);
+            bits.extend_from_slice(&[0, 0, 1, 1, 0, 0, 1, 1]);
         }
         self.encode(&bits)
     }
@@ -38,7 +38,9 @@ impl LineCodingKind {
 
     pub fn create(self, samples_per_level: usize) -> Box<dyn LineCode> {
         match self {
-            LineCodingKind::Manchester => Box::new(ManchesterCodec::new(samples_per_level)),
+            LineCodingKind::Manchester => {
+                Box::new(ManchesterCodec::new(samples_per_level))
+            }
             LineCodingKind::FourBFiveB => {
                 Box::new(FourBFiveBCodec::new(samples_per_level))
             }
@@ -169,7 +171,10 @@ fn decode_4b5b_symbol(symbol: u8) -> Option<u8> {
         0b11011 => Some(0xD),
         0b11100 => Some(0xE),
         0b11101 => Some(0xF),
-        _ => {debug!("Warning: invalid 4B/5B symbol {:05b}", symbol); None }
+        _ => {
+            debug!("Warning: invalid 4B/5B symbol {:05b}", symbol);
+            None
+        }
     }
 }
 
@@ -185,7 +190,7 @@ impl FourBFiveBCodec {
     pub fn new(samples_per_level: usize) -> Self {
         Self {
             samples_per_level,
-            last_level: 1.0, // Start with high level for NRZI
+            last_level: 1.0,     // Start with high level for NRZI
             prev_level_avg: 1.0, // Start with high level for NRZI
         }
     }
@@ -247,7 +252,9 @@ impl LineCode for FourBFiveBCodec {
         for i in 0..num_symbols {
             let start = i * self.samples_per_level;
             let end = start + self.samples_per_level;
-            let current_avg: f32 = samples[start..end].iter().sum::<f32>()
+            let current_avg: f32 = samples[start..end]
+                .iter()
+                .sum::<f32>()
                 / self.samples_per_level as f32;
 
             // Transition (change of sign) means '1', no transition means '0'
@@ -300,7 +307,6 @@ impl LineCode for FourBFiveBCodec {
         self.prev_level_avg = 1.0;
     }
 }
-
 
 #[cfg(test)]
 mod tests {

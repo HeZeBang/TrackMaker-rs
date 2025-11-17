@@ -1,7 +1,7 @@
 use super::frame::Frame;
 use super::line_coding::{LineCode, LineCodingKind};
-use crate::phy::FrameType;
 use crate::mac;
+use crate::phy::FrameType;
 use crate::utils::consts::{MAX_FRAME_DATA_SIZE, PHY_HEADER_BYTES};
 use tracing::{debug, trace, warn};
 
@@ -40,7 +40,11 @@ impl PhyDecoder {
         let preamble = line_code.generate_preamble(preamble_bytes);
 
         // for correlation normalization, this is pre-computed
-        let preamble_energy: f32 = preamble.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let preamble_energy: f32 = preamble
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt();
 
         Self {
             line_code,
@@ -60,7 +64,8 @@ impl PhyDecoder {
     // entry point for processing incoming samples
     pub fn process_samples(&mut self, samples: &[f32]) -> Vec<Frame> {
         self.decoded_frames.clear();
-        self.sample_buffer.extend_from_slice(samples);
+        self.sample_buffer
+            .extend_from_slice(samples);
 
         loop {
             let processed_len = match self.state {
@@ -80,11 +85,17 @@ impl PhyDecoder {
 
         // Clean up processed part of the buffer
         if self.buffer_offset > 0 {
-            let keep_overlap = self.preamble.len().saturating_sub(1);
-            let drain_end = self.buffer_offset.saturating_sub(keep_overlap);
+            let keep_overlap = self
+                .preamble
+                .len()
+                .saturating_sub(1);
+            let drain_end = self
+                .buffer_offset
+                .saturating_sub(keep_overlap);
 
             if drain_end > 0 {
-                self.sample_buffer.drain(..drain_end);
+                self.sample_buffer
+                    .drain(..drain_end);
                 self.buffer_offset -= drain_end;
 
                 // Adjust decoding offset if it's active
@@ -126,7 +137,8 @@ impl PhyDecoder {
                     correlation
                 );
                 // Preamble found, switch to decoding state
-                let frame_start_offset = self.buffer_offset + i + self.preamble.len();
+                let frame_start_offset =
+                    self.buffer_offset + i + self.preamble.len();
                 self.state = DecoderState::Decoding(frame_start_offset);
                 // Consume buffer up to the start of the preamble
                 return Some(i);
@@ -146,29 +158,37 @@ impl PhyDecoder {
 
         // Not enough data for even the header
         let header_bits = 8 * PHY_HEADER_BYTES;
-        let header_samples = self.line_code.samples_for_bits(header_bits);
+        let header_samples = self
+            .line_code
+            .samples_for_bits(header_bits);
         if self.sample_buffer.len() < frame_start_offset + header_samples {
             return None; // Need more data
         }
 
         // Decode header
-        let header_data = &self.sample_buffer[frame_start_offset..frame_start_offset + header_samples];
-        let header_decoded = self.line_code.decode(header_data);
+        let header_data = &self.sample_buffer
+            [frame_start_offset..frame_start_offset + header_samples];
+        let header_decoded = self
+            .line_code
+            .decode(header_data);
 
-        let (data_len_, _crc, data_type, _seq, _src, dst) = match Frame::parse_header(&header_decoded) {
-            Some(vals) => vals,
-            None => {
-                warn!(
-                    "Failed to parse header at offset {}. Returning to search.",
-                    preamble_start_offset
-                );
-                self.state = DecoderState::Searching;
-                return Some(header_samples); // Consume 1 sample to avoid getting stuck
-            }
-        };
+        let (data_len_, _crc, data_type, _seq, _src, dst) =
+            match Frame::parse_header(&header_decoded) {
+                Some(vals) => vals,
+                None => {
+                    warn!(
+                        "Failed to parse header at offset {}. Returning to search.",
+                        preamble_start_offset
+                    );
+                    self.state = DecoderState::Searching;
+                    return Some(header_samples); // Consume 1 sample to avoid getting stuck
+                }
+            };
         let data_len = data_len_ as usize;
 
-        if data_type == FrameType::Data && data_len == 0 || data_len > self.max_frame_bytes {
+        if data_type == FrameType::Data && data_len == 0
+            || data_len > self.max_frame_bytes
+        {
             warn!(
                 "Invalid data_len={} at offset {}. Returning to search.",
                 data_len, preamble_start_offset
@@ -180,17 +200,25 @@ impl PhyDecoder {
         // Check if we have enough data for the full frame
         let total_bytes = PHY_HEADER_BYTES + data_len; // header + data + crc
         let total_bits = total_bytes * 8;
-        let total_samples = self.line_code.samples_for_bits(total_bits);
+        let total_samples = self
+            .line_code
+            .samples_for_bits(total_bits);
 
         if self.sample_buffer.len() < frame_start_offset + total_samples {
             return None; // Need more data
         }
 
         // Decode and parse the full frame
-        let frame_data = &self.sample_buffer[frame_start_offset..frame_start_offset + total_samples];
-        let frame_bits = self.line_code.decode(frame_data);
+        let frame_data = &self.sample_buffer
+            [frame_start_offset..frame_start_offset + total_samples];
+        let frame_bits = self
+            .line_code
+            .decode(frame_data);
 
-        let consumed_len = self.preamble.len() + self.line_code.samples_for_bits(frame_bits.len());
+        let consumed_len = self.preamble.len()
+            + self
+                .line_code
+                .samples_for_bits(frame_bits.len());
 
         if frame_bits.len() < total_bits {
             warn!(
@@ -220,7 +248,8 @@ impl PhyDecoder {
                     frame.src,
                     frame.dst
                 );
-                self.decoded_frames.push(frame);
+                self.decoded_frames
+                    .push(frame);
                 self.state = DecoderState::Searching; // Go back to searching for the next frame
                 Some(consumed_len)
             }
@@ -249,7 +278,11 @@ impl PhyDecoder {
             .map(|(a, b)| a * b)
             .sum();
 
-        let window_energy: f32 = window.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let window_energy: f32 = window
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt();
 
         if window_energy < 1e-6 || self.preamble_energy < 1e-6 {
             return 0.0;
@@ -257,5 +290,4 @@ impl PhyDecoder {
 
         dot_product / (window_energy * self.preamble_energy)
     }
-
 }
