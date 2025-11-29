@@ -69,7 +69,7 @@ enum Commands {
         encoding: String,
 
         /// Recording duration in seconds
-        #[arg(short = 'd', long, default_value_t = DEFAULT_RECORD_SECONDS as u64)]
+        #[arg(short = 'd', long, default_value = DEFAULT_RECORD_SECONDS_STR)]
         duration: u64,
     },
 
@@ -282,13 +282,7 @@ fn interactive_mode() -> (usize, LineCodingKind, u8, u8, u64) {
             .interact()
             .unwrap();
 
-    (
-        selection,
-        line_coding,
-        tx_addr,
-        rx_addr,
-        DEFAULT_RECORD_SECONDS as u64,
-    )
+    (selection, line_coding, tx_addr, rx_addr, 60u64)
 }
 
 fn run_sender(
@@ -564,10 +558,10 @@ fn run_sender(
                     *shared
                         .app_state
                         .lock()
-                        .unwrap() = recorder::AppState::RecordingAndPlaying;
+                        .unwrap() = recorder::AppState::Playing;
 
                     // Wait for playback to finish
-                    while let recorder::AppState::RecordingAndPlaying = {
+                    while let recorder::AppState::Playing = {
                         shared
                             .app_state
                             .lock()
@@ -716,7 +710,7 @@ fn run_receiver(
         .create_bar(
             "recording",
             max_recording_duration_samples as u64,
-            templates::RECEIVER,
+            templates::RECORDING,
             "receiver",
         )
         .unwrap();
@@ -809,10 +803,10 @@ fn run_receiver(
                     *shared
                         .app_state
                         .lock()
-                        .unwrap() = recorder::AppState::RecordingAndPlaying;
+                        .unwrap() = recorder::AppState::Playing;
 
                     // Wait for ACK playback to complete
-                    while let recorder::AppState::RecordingAndPlaying = {
+                    while let recorder::AppState::Playing = {
                         shared
                             .app_state
                             .lock()
