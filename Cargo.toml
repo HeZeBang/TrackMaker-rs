@@ -19,3 +19,5 @@ dialoguer = "0.12.0"
 hound = "3.5.1"
 ctrlc = "3"
 clap = { version = "4", features = ["derive"] }
+pcap = "2.0.0"
+byteorder = "1.4"
