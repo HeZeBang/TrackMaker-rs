@@ -564,10 +564,10 @@ fn run_sender(
                     *shared
                         .app_state
                         .lock()
-                        .unwrap() = recorder::AppState::RecordingAndPlaying;
+                        .unwrap() = recorder::AppState::Playing;
 
                     // Wait for playback to finish
-                    while let recorder::AppState::RecordingAndPlaying = {
+                    while let recorder::AppState::Playing = {
                         shared
                             .app_state
                             .lock()
@@ -809,10 +809,10 @@ fn run_receiver(
                     *shared
                         .app_state
                         .lock()
-                        .unwrap() = recorder::AppState::RecordingAndPlaying;
+                        .unwrap() = recorder::AppState::Playing;
 
                     // Wait for ACK playback to complete
-                    while let recorder::AppState::RecordingAndPlaying = {
+                    while let recorder::AppState::Playing = {
                         shared
                             .app_state
                             .lock()
