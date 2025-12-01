@@ -546,6 +546,10 @@ pub fn run_receiver(
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                     debug!("ACK sent for seq: {}", frame.sequence);
+                    
+                    {
+                        shared.record_buffer.lock().unwrap().clear();
+                    }
 
                     // After sending ACK, switch back to recording for the next frame
                     *shared
