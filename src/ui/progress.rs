@@ -51,6 +51,23 @@ impl ProgressManager {
         Ok(())
     }
 
+    pub fn increasae_length(&self, id: &str, step: u64) -> Result<(), String> {
+        let bars = self
+            .bars
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if let Some(pb) = bars.get(id) {
+            pb.set_length(
+                pb.length()
+                    .unwrap_or_default()
+                    + step,
+            );
+            Ok(())
+        } else {
+            Err(format!("Progress bar '{}' not found", id))
+        }
+    }
+
     /// 更新进度条位置
     pub fn set_position(&self, id: &str, pos: u64) -> Result<(), String> {
         let bars = self

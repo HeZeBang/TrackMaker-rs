@@ -143,18 +143,28 @@ impl PhyDecoder {
                 // Refine alignment by searching for the Sync Word (last byte: 0x5A)
                 // The Sync Word is at the end of the preamble.
                 let sync_bits = 8;
-                let sync_len = self.line_code.samples_for_bits(sync_bits);
-                let sync_pattern = &self.preamble[self.preamble.len() - sync_len..];
+                let sync_len = self
+                    .line_code
+                    .samples_for_bits(sync_bits);
+                let sync_pattern =
+                    &self.preamble[self.preamble.len() - sync_len..];
 
                 // Calculate Sync Pattern Energy for normalization
-                let sync_energy: f32 = sync_pattern.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let sync_energy: f32 = sync_pattern
+                    .iter()
+                    .map(|x| x * x)
+                    .sum::<f32>()
+                    .sqrt();
 
                 // Search window: +/- 1 bit width
-                let search_margin = self.line_code.samples_for_bits(1);
+                let search_margin = self
+                    .line_code
+                    .samples_for_bits(1);
                 let expected_start = i + self.preamble.len() - sync_len;
 
                 let start_search = expected_start.saturating_sub(search_margin);
-                let end_search = (expected_start + search_margin).min(search_area.len() - sync_len);
+                let end_search = (expected_start + search_margin)
+                    .min(search_area.len() - sync_len);
 
                 let mut best_corr = -1.0;
                 let mut best_offset = expected_start;
@@ -164,7 +174,10 @@ impl PhyDecoder {
 
                     let mut dot = 0.0;
                     let mut win_energy = 0.0;
-                    for (w, p) in window.iter().zip(sync_pattern.iter()) {
+                    for (w, p) in window
+                        .iter()
+                        .zip(sync_pattern.iter())
+                    {
                         dot += w * p;
                         win_energy += w * w;
                     }
@@ -186,7 +199,8 @@ impl PhyDecoder {
                 );
 
                 // Preamble found, switch to decoding state
-                let frame_start_offset = self.buffer_offset + best_offset + sync_len;
+                let frame_start_offset =
+                    self.buffer_offset + best_offset + sync_len;
                 self.state = DecoderState::Decoding(frame_start_offset);
                 // Consume buffer up to the start of the preamble
                 return Some(i);

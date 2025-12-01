@@ -25,11 +25,11 @@ fn main() {
     tracing::info!("JACK client status: {:?}", status);
     let (sample_rate, _buffer_size) = print_jack_info(&client);
 
-    let recording_duration_samples = sample_rate * DEFAULT_RECORD_SECONDS;
+    let recording_duration_samples = sample_rate * DEFAULT_TIMEOUT;
     tracing::info!(
         "Recording duration: {} samples ({} seconds)",
         recording_duration_samples,
-        DEFAULT_RECORD_SECONDS
+        DEFAULT_TIMEOUT
     );
 
     // Shared State

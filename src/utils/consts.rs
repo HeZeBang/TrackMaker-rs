@@ -1,5 +1,5 @@
-/// 默认录音时长（秒）
-pub const DEFAULT_RECORD_SECONDS: usize = 30;
+/// 默认超时（秒）
+pub const DEFAULT_TIMEOUT: usize = 30;
 
 /// 日志级别（可被 RUST_LOG 覆盖）
 pub const LOG_LEVEL: &str = "info";

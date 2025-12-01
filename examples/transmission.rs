@@ -64,7 +64,7 @@ enum Commands {
         encoding: String,
 
         /// Recording duration in seconds
-        #[arg(short = 'd', long, default_value_t = DEFAULT_RECORD_SECONDS as u64)]
+        #[arg(short = 'd', long, default_value_t = DEFAULT_TIMEOUT as u64)]
         duration: u64,
     },
 
@@ -282,7 +282,7 @@ fn interactive_mode() -> (usize, LineCodingKind, u8, u8, u64) {
         line_coding,
         tx_addr,
         rx_addr,
-        DEFAULT_RECORD_SECONDS as u64,
+        DEFAULT_TIMEOUT as u64,
     )
 }
 
