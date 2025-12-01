@@ -12,10 +12,11 @@ pub trait LineCode: Send {
 
     fn generate_preamble(&self, pattern_bytes: usize) -> Vec<f32> {
         let mut bits = Vec::with_capacity(pattern_bytes * 8);
-        for _ in 0..pattern_bytes {
+        for _ in 0..(pattern_bytes - 1) {
             // 0xAA pattern: 10101010, 4B5B uses 0x33 pattern: 00110011
             bits.extend_from_slice(&[0, 0, 1, 1, 0, 0, 1, 1]);
         }
+        bits.extend_from_slice(&[0, 1, 0, 1, 1, 0, 1, 0]);
         self.encode(&bits)
     }
 
@@ -301,6 +302,33 @@ impl LineCode for FourBFiveBCodec {
         let num_5b_symbols = num_nibbles * 5;
         num_5b_symbols * self.samples_per_level
     }
+
+    // fn generate_preamble(&self, pattern_bytes: usize) -> Vec<f32> {
+    //     // 4B5B 'Idle' pattern is '11111' in 5B
+    //     // We generate enough Idle symbols to cover pattern_bytes
+    //     // 1 byte = 2 nibbles = 2 symbols (10 bits)
+    //     let num_symbols = pattern_bytes * 2;
+    //     let mut encoded_pattern = Vec::with_capacity(num_symbols * 5);
+
+    //     for _ in 0..num_symbols {
+    //         // Idle symbol 11111
+    //         encoded_pattern.extend_from_slice(&[1, 1, 1, 1, 1]);
+    //     }
+
+    //     // NRZI Encode
+    //     let mut samples =
+    //         Vec::with_capacity(encoded_pattern.len() * self.samples_per_level);
+    //     let mut current_level = self.last_level;
+
+    //     for bit in encoded_pattern {
+    //         if bit == 1 {
+    //             current_level = -current_level;
+    //         }
+    //         samples.extend(vec![current_level; self.samples_per_level]);
+    //     }
+
+    //     samples
+    // }
 
     fn reset(&mut self) {
         self.last_level = 1.0;

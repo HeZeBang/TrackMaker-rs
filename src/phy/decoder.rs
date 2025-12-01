@@ -139,9 +139,54 @@ impl PhyDecoder {
                     i,
                     correlation
                 );
+
+                // Refine alignment by searching for the Sync Word (last byte: 0x5A)
+                // The Sync Word is at the end of the preamble.
+                let sync_bits = 8;
+                let sync_len = self.line_code.samples_for_bits(sync_bits);
+                let sync_pattern = &self.preamble[self.preamble.len() - sync_len..];
+
+                // Calculate Sync Pattern Energy for normalization
+                let sync_energy: f32 = sync_pattern.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+                // Search window: +/- 1 bit width
+                let search_margin = self.line_code.samples_for_bits(1);
+                let expected_start = i + self.preamble.len() - sync_len;
+
+                let start_search = expected_start.saturating_sub(search_margin);
+                let end_search = (expected_start + search_margin).min(search_area.len() - sync_len);
+
+                let mut best_corr = -1.0;
+                let mut best_offset = expected_start;
+
+                for j in start_search..=end_search {
+                    let window = &search_area[j..j + sync_len];
+
+                    let mut dot = 0.0;
+                    let mut win_energy = 0.0;
+                    for (w, p) in window.iter().zip(sync_pattern.iter()) {
+                        dot += w * p;
+                        win_energy += w * w;
+                    }
+                    let corr = if win_energy > 1e-6 && sync_energy > 1e-6 {
+                        dot / (win_energy.sqrt() * sync_energy)
+                    } else {
+                        0.0
+                    };
+
+                    if corr > best_corr {
+                        best_corr = corr;
+                        best_offset = j;
+                    }
+                }
+
+                debug!(
+                    "Refined alignment: {} -> {} (corr: {:.3})",
+                    expected_start, best_offset, best_corr
+                );
+
                 // Preamble found, switch to decoding state
-                let frame_start_offset =
-                    self.buffer_offset + i + self.preamble.len();
+                let frame_start_offset = self.buffer_offset + best_offset + sync_len;
                 self.state = DecoderState::Decoding(frame_start_offset);
                 // Consume buffer up to the start of the preamble
                 return Some(i);
