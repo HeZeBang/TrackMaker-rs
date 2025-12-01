@@ -25,6 +25,8 @@ use ui::progress::{ProgressManager, templates};
 use utils::consts::*;
 use utils::logging::init_logging;
 
+use crate::phy::FrameType;
+
 #[derive(Parser)]
 #[command(name = "trackmaker-rs")]
 #[command(about = "Audio-based wireless transmission system", long_about = None)]
@@ -505,7 +507,7 @@ fn run_ping(target: String, local_ip_str: String) {
         let start = std::time::Instant::now();
 
         // Send IP Packet
-        if let Err(e) = interface.send_packet(&ip_bytes, dest_mac) {
+        if let Err(e) = interface.send_packet(&ip_bytes, dest_mac, FrameType::Data) {
             error!("Failed to send packet: {}", e);
             continue;
         }
@@ -693,7 +695,7 @@ fn run_ip_host(local_ip_str: String) {
                                 );
                                 // Send reply
                                 if let Err(e) =
-                                    interface.send_packet(&reply_bytes, dest_mac)
+                                    interface.send_packet(&reply_bytes, dest_mac, FrameType::Ack)
                                 {
                                     error!("Failed to send reply: {}", e);
                                 }

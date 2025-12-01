@@ -48,12 +48,17 @@ impl IpInterface {
         &mut self,
         data: &[u8],
         dest_mac: u8,
+        frame_type: FrameType,
     ) -> Result<(), String> {
         // Create frame
-        let frame = Frame::new_data(0, self.local_mac, dest_mac, data.to_vec());
+        let frame = if let FrameType::Ack = frame_type {
+            Frame::new_ack_mix(0, self.local_mac, dest_mac, data.to_vec())
+        } else {
+            Frame::new_data(0, self.local_mac, dest_mac, data.to_vec())
+        };
         let frames = vec![frame.clone()];
 
-        let mut state = CSMAState::Sensing;
+        let mut state = CSMAState::Transmitting;
         let mut stage = 0;
 
         // Start recording for sensing
@@ -232,7 +237,8 @@ impl IpInterface {
                         .app_state
                         .lock()
                         .unwrap() = AppState::Recording;
-                    state = CSMAState::WaitingForAck;
+                    // state = CSMAState::WaitingForAck
+                    return Ok(());
                 }
                 CSMAState::WaitingForAck => {
                     let start = Instant::now();
@@ -301,7 +307,7 @@ impl IpInterface {
                 }
             }
 
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(1));
 
             // Check for user interrupt or logic to stop?
             // For now just loop
@@ -320,53 +326,7 @@ impl IpInterface {
                 processed_len = samples.len();
 
                 for f in decoded {
-                    if f.frame_type == FrameType::Data {
-                        debug!("Received Data frame, sending ACK");
-
-                        // Send ACK
-                        let ack =
-                            Frame::new_ack(f.sequence, self.local_mac, f.src);
-                        let ack_samples = self
-                            .encoder
-                            .encode_frames(&[ack], 0);
-
-                        {
-                            let mut playback = self
-                                .shared
-                                .playback_buffer
-                                .lock()
-                                .unwrap();
-                            playback.clear();
-                            playback.extend(ack_samples);
-                        }
-
-                        *self
-                            .shared
-                            .app_state
-                            .lock()
-                            .unwrap() = AppState::Playing;
-                        while let AppState::Playing = {
-                            self.shared
-                                .app_state
-                                .lock()
-                                .unwrap()
-                                .clone()
-                        } {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-
-                        self.shared
-                            .record_buffer
-                            .lock()
-                            .unwrap()
-                            .clear();
-                        *self
-                            .shared
-                            .app_state
-                            .lock()
-                            .unwrap() = AppState::Recording;
-                        processed_len = 0; // Buffer cleared
-
+                    if f.frame_type == FrameType::Data || f.frame_type == FrameType::Ack && !f.data.is_empty() {
                         return Ok(f.data);
                     }
                 }

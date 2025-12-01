@@ -65,6 +65,10 @@ impl Frame {
         Self::new(FrameType::Ack, sequence, from, to, Vec::new())
     }
 
+    pub fn new_ack_mix(sequence: u8, from: u8, to: u8, data: Vec<u8>) -> Self {
+        Self::new(FrameType::Ack, sequence, from, to, data)
+    }
+
     /// Serialize frame to bytes (without preamble)
     /// Format: [Len:2] [CRC:1] [Type:1] [Seq:1] [Src:1] [Dst:1] [Data:N]
     pub fn to_bytes(&self) -> Vec<u8> {

@@ -31,13 +31,13 @@ pub const SAMPLES_PER_LEVEL: usize = 3;
 
 // Frame Parameters
 /// Number of 0xAA pattern bytes in preamble
-pub const PREAMBLE_PATTERN_BYTES: usize = 4;
+pub const PREAMBLE_PATTERN_BYTES: usize = 2;
 
 /// Maximum data payload per frame (bytes)
-pub const MAX_FRAME_DATA_SIZE: usize = 256;
+pub const MAX_FRAME_DATA_SIZE: usize = 128;
 
 /// Milliseconds between frames
-pub const INTER_FRAME_GAP_MS: u32 = 5;
+pub const INTER_FRAME_GAP_MS: u32 = 1;
 
 /// Samples between frames
 pub const INTER_FRAME_GAP_SAMPLES: usize =
@@ -66,7 +66,7 @@ pub const SLOT_TIME_MS: u64 = 5;
 pub const IP_TTL: u8 = 64;
 
 // --- Ping Constants ---
-pub const PING_PACKET_COUNT: u16 = 4;
+pub const PING_PACKET_COUNT: u16 = 10;
 pub const PING_PAYLOAD_SIZE: usize = 32;
 pub const PING_TIMEOUT_MS: u64 = 2000;
 pub const PING_INTERVAL_MS: u64 = 1000;

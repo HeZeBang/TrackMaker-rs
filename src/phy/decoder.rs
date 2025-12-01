@@ -126,11 +126,25 @@ impl PhyDecoder {
             return None; // Not enough data to search
         }
 
-        let window_count = search_area.len() - self.preamble.len() + 1;
+        let preamble_len = self.preamble.len();
+        let window_count = search_area.len() - preamble_len + 1;
+
+        // Calculate initial energy
+        let mut window_energy: f32 = search_area[0..preamble_len]
+            .iter()
+            .map(|x| x * x)
+            .sum();
 
         for i in 0..window_count {
-            let window = &search_area[i..i + self.preamble.len()];
-            let correlation = self.compute_normalized_correlation(window);
+            let window = &search_area[i..i + preamble_len];
+
+            // Optimization: Skip dot product if energy is too low
+            let correlation = if window_energy < 1e-6 {
+                0.0
+            } else {
+                let dot_product = self.compute_dot_product(window);
+                dot_product / (window_energy.sqrt() * self.preamble_energy)
+            };
 
             if correlation >= self.correlation_threshold {
                 debug!(
@@ -204,6 +218,17 @@ impl PhyDecoder {
                 self.state = DecoderState::Decoding(frame_start_offset);
                 // Consume buffer up to the start of the preamble
                 return Some(i);
+            }
+
+            // Update energy for next iteration
+            if i + 1 < window_count {
+                let leaving = search_area[i];
+                let entering = search_area[i + preamble_len];
+                window_energy = window_energy - leaving * leaving + entering * entering;
+                // Prevent negative energy due to floating point errors
+                if window_energy < 0.0 {
+                    window_energy = 0.0;
+                }
             }
         }
 
@@ -329,57 +354,43 @@ impl PhyDecoder {
         }
     }
 
-    /// Compute normalized cross-correlation between window and preamble
-    /// some math
-    fn compute_normalized_correlation(&self, window: &[f32]) -> f32 {
-        if window.len() != self.preamble.len() {
-            return 0.0;
-        }
 
-        let (dot_product, window_energy_sqrt) = {
-            #[cfg(target_arch = "x86_64")]
-            {
-                if is_x86_feature_detected!("avx") {
-                    unsafe { self.compute_stats_avx(window) }
-                } else {
-                    self.compute_stats_scalar(window)
-                }
+
+
+
+
+
+    fn compute_dot_product(&self, window: &[f32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx") {
+                unsafe { self.compute_dot_product_avx(window) }
+            } else {
+                self.compute_dot_product_scalar(window)
             }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                self.compute_stats_scalar(window)
-            }
-        };
-
-        if window_energy_sqrt < 1e-6 || self.preamble_energy < 1e-6 {
-            return 0.0;
         }
-
-        dot_product / (window_energy_sqrt * self.preamble_energy)
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.compute_dot_product_scalar(window)
+        }
     }
 
-    fn compute_stats_scalar(&self, window: &[f32]) -> (f32, f32) {
-        let mut dot_sum = 0.0;
-        let mut energy_sum = 0.0;
-        for (w, p) in window
+    fn compute_dot_product_scalar(&self, window: &[f32]) -> f32 {
+        window
             .iter()
             .zip(self.preamble.iter())
-        {
-            dot_sum += w * p;
-            energy_sum += w * w;
-        }
-        (dot_sum, energy_sum.sqrt())
+            .map(|(w, p)| w * p)
+            .sum()
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx")]
-    unsafe fn compute_stats_avx(&self, window: &[f32]) -> (f32, f32) {
+    unsafe fn compute_dot_product_avx(&self, window: &[f32]) -> f32 {
         unsafe {
             let len = window.len();
             let preamble = &self.preamble;
 
             let mut dot_vec = _mm256_setzero_ps();
-            let mut energy_vec = _mm256_setzero_ps();
 
             let mut i = 0;
             while i + 8 <= len {
@@ -387,7 +398,6 @@ impl PhyDecoder {
                 let p = _mm256_loadu_ps(preamble.as_ptr().add(i));
 
                 dot_vec = _mm256_add_ps(dot_vec, _mm256_mul_ps(w, p));
-                energy_vec = _mm256_add_ps(energy_vec, _mm256_mul_ps(w, w));
 
                 i += 8;
             }
@@ -396,27 +406,18 @@ impl PhyDecoder {
             let dot_high = _mm256_extractf128_ps(dot_vec, 1);
             let dot_128 = _mm_add_ps(dot_low, dot_high);
 
-            let energy_low = _mm256_castps256_ps128(energy_vec);
-            let energy_high = _mm256_extractf128_ps(energy_vec, 1);
-            let energy_128 = _mm_add_ps(energy_low, energy_high);
-
             let mut dot_arr = [0.0f32; 4];
             _mm_storeu_ps(dot_arr.as_mut_ptr(), dot_128);
             let mut dot_sum: f32 = dot_arr.iter().sum();
-
-            let mut energy_arr = [0.0f32; 4];
-            _mm_storeu_ps(energy_arr.as_mut_ptr(), energy_128);
-            let mut energy_sum: f32 = energy_arr.iter().sum();
 
             while i < len {
                 let w = *window.get_unchecked(i);
                 let p = *preamble.get_unchecked(i);
                 dot_sum += w * p;
-                energy_sum += w * w;
                 i += 1;
             }
 
-            (dot_sum, energy_sum.sqrt())
+            dot_sum
         }
     }
 }
