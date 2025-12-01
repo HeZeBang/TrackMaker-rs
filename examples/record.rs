@@ -195,7 +195,7 @@ fn main() {
         .create_bar(
             "playrec",
             recording_duration_samples as u64,
-            templates::PLAYREC,
+            templates::RECORDING,
             out_port_name.as_str(),
         )
         .unwrap();

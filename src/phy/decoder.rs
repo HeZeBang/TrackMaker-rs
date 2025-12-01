@@ -302,7 +302,10 @@ impl PhyDecoder {
     fn compute_stats_scalar(&self, window: &[f32]) -> (f32, f32) {
         let mut dot_sum = 0.0;
         let mut energy_sum = 0.0;
-        for (w, p) in window.iter().zip(self.preamble.iter()) {
+        for (w, p) in window
+            .iter()
+            .zip(self.preamble.iter())
+        {
             dot_sum += w * p;
             energy_sum += w * w;
         }
