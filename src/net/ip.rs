@@ -1,6 +1,8 @@
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read, Write};
 
+pub const IP_HEADER_BYTES: usize = 20;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Ipv4Header {
     pub version_ihl: u8,

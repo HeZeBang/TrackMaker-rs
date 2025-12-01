@@ -13,6 +13,7 @@ mod utils;
 use audio::recorder;
 use device::jack::{connect_system_ports, print_jack_info};
 use rand::Rng;
+use trackmaker_rs::net::{Protocol, ip::IP_HEADER_BYTES};
 use ui::print_banner;
 use ui::progress::ProgressManager;
 use utils::consts::*;
@@ -264,6 +265,7 @@ fn run_ping(target: String, local_ip_str: String) {
     use trackmaker_rs::net::icmp::{IcmpPacket, IcmpType};
     use trackmaker_rs::net::ip::Ipv4Header;
 
+    // Parse IP addresses
     let target_ip: Ipv4Addr = target
         .parse()
         .expect("Invalid target IP");
@@ -271,6 +273,7 @@ fn run_ping(target: String, local_ip_str: String) {
         .parse()
         .expect("Invalid local IP");
 
+    // Check static ARP table
     let arp = ArpTable::new();
     let dest_mac = arp
         .get_mac(&target_ip)
@@ -330,31 +333,39 @@ fn run_ping(target: String, local_ip_str: String) {
     let mut rtt_times: Vec<f32> = Vec::new();
     let ping_start = std::time::Instant::now();
 
-    for seq in 0..4 {
-        let payload = vec![0u8; 32]; // 32 bytes payload
-        let icmp = IcmpPacket::new(
-            IcmpType::EchoRequest,
-            0,
-            1234,
-            seq,
-            payload.clone(),
-        );
-        let icmp_bytes = icmp.to_bytes().unwrap();
+    // A Modern taste to use a random identifier for ICMP
+    let identifier = rand::random::<u16>();
 
-        let ip = Ipv4Header::new(
-            (20 + icmp_bytes.len()) as u16,
-            seq,
-            64,
-            1, // ICMP
-            local_ip.octets(),
-            target_ip.octets(),
-        );
-        let mut ip_bytes = ip.to_bytes().unwrap();
-        ip_bytes.extend(icmp_bytes);
+    for seq in 0..PING_PACKET_COUNT {
+        // icmp packet --> ip packet
+        let icmp_bytes = IcmpPacket::new(
+            IcmpType::EchoRequest,
+            0,                            // Code
+            identifier,                   // Identifier
+            seq,                          // Sequence number
+            vec![0u8; PING_PAYLOAD_SIZE], // PING_PAYLOAD_SIZE bytes payload
+        )
+        .to_bytes()
+        .unwrap();
+
+        let ip_bytes = Ipv4Header::new(
+            (IP_HEADER_BYTES + icmp_bytes.len()) as u16, // Total length
+            seq,                                         // Sequence number
+            IP_TTL,                                      // TTL
+            Protocol::Icmp.into(),                       // Protocol (ICMP)
+            local_ip.octets(),                           // Source IP
+            target_ip.octets(),                          // Destination IP
+        )
+        .to_bytes()
+        .unwrap()
+        .into_iter()
+        .chain(icmp_bytes)
+        .collect::<Vec<u8>>();
 
         info!("Sending ICMP Echo Request seq={}...", seq);
         let start = std::time::Instant::now();
 
+        // Send IP Packet
         if let Err(e) = interface.send_packet(&ip_bytes, dest_mac) {
             error!("Failed to send packet: {}", e);
             continue;
@@ -362,9 +373,9 @@ fn run_ping(target: String, local_ip_str: String) {
         packets_sent += 1;
 
         // Wait for reply
-        match interface
-            .receive_packet(Some(std::time::Duration::from_millis(2000)))
-        {
+        match interface.receive_packet(Some(std::time::Duration::from_millis(
+            PING_TIMEOUT_MS,
+        ))) {
             Ok(data) => {
                 let rtt = start.elapsed();
                 let rtt_ms = rtt.as_secs_f32() * 1000.0;
@@ -396,7 +407,7 @@ fn run_ping(target: String, local_ip_str: String) {
             }
         }
 
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_millis(PING_INTERVAL_MS));
     }
 
     // Print statistics
@@ -483,6 +494,7 @@ fn run_ip_host(local_ip_str: String) {
         .unwrap();
     connect_system_ports(active_client.as_client(), &in_name, &out_name);
 
+    // Setup IP Interface
     let mut interface = IpInterface::new(
         shared.clone(),
         sample_rate,
@@ -490,11 +502,15 @@ fn run_ip_host(local_ip_str: String) {
         local_mac,
     );
 
+    // Listen for packets
     loop {
+        // Get a packet from interface
         if let Ok(data) = interface.receive_packet(None) {
+            // Parse IP
             if let Ok(ip_header) = Ipv4Header::from_bytes(&data) {
                 // Check if it's for us
                 if ip_header.dest_ip == local_ip.octets() {
+                    // Parse ICMP
                     let icmp_data = &data[20..];
                     if let Ok(icmp_header) = IcmpPacket::from_bytes(icmp_data) {
                         if icmp_header.icmp_type == IcmpType::EchoRequest {
@@ -504,26 +520,30 @@ fn run_ip_host(local_ip_str: String) {
                             );
 
                             // Send Reply
-                            let reply_icmp = IcmpPacket::new(
-                                IcmpType::EchoReply,
-                                0,
-                                icmp_header.identifier,
-                                icmp_header.sequence_number,
-                                icmp_header.payload,
-                            );
-                            let reply_icmp_bytes =
-                                reply_icmp.to_bytes().unwrap();
+                            let reply_icmp_bytes = IcmpPacket::new(
+                                IcmpType::EchoReply,         // Echo Reply
+                                0,                           // Code
+                                icmp_header.identifier,      // Identifier
+                                icmp_header.sequence_number, // Sequence Number
+                                icmp_header.payload,         // Payload
+                            )
+                            .to_bytes()
+                            .unwrap();
 
-                            let reply_ip = Ipv4Header::new(
-                                (20 + reply_icmp_bytes.len()) as u16,
-                                0,
-                                64,
-                                1,
-                                local_ip.octets(),
-                                ip_header.source_ip,
-                            );
-                            let mut reply_bytes = reply_ip.to_bytes().unwrap();
-                            reply_bytes.extend(reply_icmp_bytes);
+                            let reply_bytes = Ipv4Header::new(
+                                (IP_HEADER_BYTES + reply_icmp_bytes.len())
+                                    as u16, // Total length
+                                0,                     // Sequence number
+                                IP_TTL,                // TTL
+                                Protocol::Icmp.into(), // Protocol
+                                local_ip.octets(),     // Source IP
+                                ip_header.source_ip,   // Destination IP
+                            )
+                            .to_bytes()
+                            .unwrap()
+                            .into_iter()
+                            .chain(reply_icmp_bytes)
+                            .collect::<Vec<u8>>();
 
                             // Find dest MAC
                             let src_ip = Ipv4Addr::from(ip_header.source_ip);
@@ -532,6 +552,7 @@ fn run_ip_host(local_ip_str: String) {
                                     "Sending Echo Reply to {} ({})",
                                     src_ip, dest_mac
                                 );
+                                // Send reply
                                 if let Err(e) =
                                     interface.send_packet(&reply_bytes, dest_mac)
                                 {

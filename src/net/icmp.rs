@@ -32,6 +32,7 @@ impl Into<u8> for IcmpType {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IcmpPacket {
     pub icmp_type: IcmpType,
+    // NOT USED CURRENTLY
     pub code: u8,
     // Not only header, complete packet
     pub checksum: u16,
