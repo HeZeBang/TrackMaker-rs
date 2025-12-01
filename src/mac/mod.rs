@@ -1,4 +1,5 @@
 pub mod csma;
+pub mod ip_interface;
 pub mod types;
 
 pub enum CSMAState {

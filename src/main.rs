@@ -76,6 +76,23 @@ enum Commands {
         #[arg(long, default_value = "4b5b")]
         encoding: String,
     },
+
+    /// Ping a remote host
+    Ping {
+        /// Target IP address
+        target: String,
+
+        /// Local IP address
+        #[arg(long, default_value = "192.168.1.1")]
+        local_ip: String,
+    },
+
+    /// Run as an IP Host (respond to pings)
+    IpHost {
+        /// Local IP address
+        #[arg(long, default_value = "192.168.1.2")]
+        local_ip: String,
+    },
 }
 
 fn parse_line_coding(encoding: &str) -> LineCodingKind {
@@ -128,6 +145,16 @@ fn main() {
                 Commands::Test { encoding } => {
                     let line_coding = parse_line_coding(&encoding);
                     test_transmission(line_coding);
+                    return;
+                }
+                Commands::Ping { target, local_ip } => {
+                    // Ping Mode
+                    run_ping(target, local_ip);
+                    return;
+                }
+                Commands::IpHost { local_ip } => {
+                    // IP Host Mode
+                    run_ip_host(local_ip);
                     return;
                 }
             }
@@ -227,6 +254,300 @@ fn main() {
     info!("Exiting gracefully...");
     if let Err(err) = active_client.deactivate() {
         error!("Error deactivating client: {}", err);
+    }
+}
+
+fn run_ping(target: String, local_ip_str: String) {
+    use crate::mac::ip_interface::IpInterface;
+    use std::net::Ipv4Addr;
+    use trackmaker_rs::net::arp::ArpTable;
+    use trackmaker_rs::net::icmp::{IcmpPacket, IcmpType};
+    use trackmaker_rs::net::ip::Ipv4Header;
+
+    let target_ip: Ipv4Addr = target
+        .parse()
+        .expect("Invalid target IP");
+    let local_ip: Ipv4Addr = local_ip_str
+        .parse()
+        .expect("Invalid local IP");
+
+    let arp = ArpTable::new();
+    let dest_mac = arp
+        .get_mac(&target_ip)
+        .expect("Target IP not in ARP table");
+    let local_mac = arp
+        .get_mac(&local_ip)
+        .expect("Local IP not in ARP table");
+
+    info!(
+        "PING {} ({}) from {} ({})",
+        target_ip, dest_mac, local_ip, local_mac
+    );
+
+    // Setup JACK
+    let (client, _status) = jack::Client::new(
+        &format!("{}_ping_{}", JACK_CLIENT_NAME, rand::random::<u16>()),
+        jack::ClientOptions::NO_START_SERVER,
+    )
+    .unwrap();
+
+    let sample_rate = client.sample_rate() as u32;
+    let shared = recorder::AppShared::new(sample_rate as usize * 10); // 10s buffer
+    let shared_cb = shared.clone();
+
+    let in_port = client
+        .register_port(INPUT_PORT_NAME, jack::AudioIn::default())
+        .unwrap();
+    let out_port = client
+        .register_port(OUTPUT_PORT_NAME, jack::AudioOut::default())
+        .unwrap();
+    let in_name = in_port.name().unwrap();
+    let out_name = out_port.name().unwrap();
+
+    let process = jack::contrib::ClosureProcessHandler::new(
+        recorder::build_process_closure(
+            in_port,
+            out_port,
+            shared_cb,
+            sample_rate as usize * 10,
+        ),
+    );
+    let active_client = client
+        .activate_async((), process)
+        .unwrap();
+    connect_system_ports(active_client.as_client(), &in_name, &out_name);
+
+    let mut interface = IpInterface::new(
+        shared.clone(),
+        sample_rate,
+        LineCodingKind::FourBFiveB,
+        local_mac,
+    );
+
+    // Statistics
+    let mut packets_sent = 0u32;
+    let mut packets_received = 0u32;
+    let mut rtt_times: Vec<f32> = Vec::new();
+    let ping_start = std::time::Instant::now();
+
+    for seq in 0..4 {
+        let payload = vec![0u8; 32]; // 32 bytes payload
+        let icmp = IcmpPacket::new(
+            IcmpType::EchoRequest,
+            0,
+            1234,
+            seq,
+            payload.clone(),
+        );
+        let icmp_bytes = icmp.to_bytes().unwrap();
+
+        let ip = Ipv4Header::new(
+            (20 + icmp_bytes.len()) as u16,
+            seq,
+            64,
+            1, // ICMP
+            local_ip.octets(),
+            target_ip.octets(),
+        );
+        let mut ip_bytes = ip.to_bytes().unwrap();
+        ip_bytes.extend(icmp_bytes);
+
+        info!("Sending ICMP Echo Request seq={}...", seq);
+        let start = std::time::Instant::now();
+
+        if let Err(e) = interface.send_packet(&ip_bytes, dest_mac) {
+            error!("Failed to send packet: {}", e);
+            continue;
+        }
+        packets_sent += 1;
+
+        // Wait for reply
+        match interface
+            .receive_packet(Some(std::time::Duration::from_millis(2000)))
+        {
+            Ok(data) => {
+                let rtt = start.elapsed();
+                let rtt_ms = rtt.as_secs_f32() * 1000.0;
+
+                // Parse IP
+                if let Ok(ip_header) = Ipv4Header::from_bytes(&data) {
+                    // Parse ICMP
+                    let icmp_data = &data[20..]; // Assuming no options
+                    if let Ok(icmp_header) = IcmpPacket::from_bytes(icmp_data) {
+                        if icmp_header.icmp_type == IcmpType::EchoReply
+                            && icmp_header.sequence_number == seq
+                        {
+                            packets_received += 1;
+                            rtt_times.push(rtt_ms);
+
+                            info!(
+                                "Reply from {}: bytes={} time={:.2}ms TTL={}",
+                                target_ip,
+                                data.len(),
+                                rtt_ms,
+                                ip_header.ttl
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Request timed out: {}", e);
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
+    // Print statistics
+    let total_time = ping_start.elapsed();
+    info!("\n--- {} ping statistics ---", target_ip);
+    info!(
+        "{} packets transmitted, {} received, {:.1}% packet loss, time {:.2}s",
+        packets_sent,
+        packets_received,
+        if packets_sent > 0 {
+            ((packets_sent - packets_received) as f32 / packets_sent as f32)
+                * 100.0
+        } else {
+            0.0
+        },
+        total_time.as_secs_f32()
+    );
+
+    if !rtt_times.is_empty() {
+        let min_rtt = rtt_times
+            .iter()
+            .cloned()
+            .fold(f32::INFINITY, f32::min);
+        let max_rtt = rtt_times
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let avg_rtt = rtt_times.iter().sum::<f32>() / rtt_times.len() as f32;
+
+        info!(
+            "rtt min/avg/max = {:.2}/{:.2}/{:.2} ms",
+            min_rtt, avg_rtt, max_rtt
+        );
+    }
+}
+
+fn run_ip_host(local_ip_str: String) {
+    use crate::mac::ip_interface::IpInterface;
+    use std::net::Ipv4Addr;
+    use trackmaker_rs::net::arp::ArpTable;
+    use trackmaker_rs::net::icmp::{IcmpPacket, IcmpType};
+    use trackmaker_rs::net::ip::Ipv4Header;
+
+    let local_ip: Ipv4Addr = local_ip_str
+        .parse()
+        .expect("Invalid local IP");
+    let arp = ArpTable::new();
+    let local_mac = arp
+        .get_mac(&local_ip)
+        .expect("Local IP not in ARP table");
+
+    info!("Starting IP Host on {} ({})", local_ip, local_mac);
+
+    // Setup JACK
+    let (client, _status) = jack::Client::new(
+        &format!("{}_host_{}", JACK_CLIENT_NAME, rand::random::<u16>()),
+        jack::ClientOptions::NO_START_SERVER,
+    )
+    .unwrap();
+
+    let sample_rate = client.sample_rate() as u32;
+    let shared = recorder::AppShared::new(sample_rate as usize * 10);
+    let shared_cb = shared.clone();
+
+    let in_port = client
+        .register_port(INPUT_PORT_NAME, jack::AudioIn::default())
+        .unwrap();
+    let out_port = client
+        .register_port(OUTPUT_PORT_NAME, jack::AudioOut::default())
+        .unwrap();
+    let in_name = in_port.name().unwrap();
+    let out_name = out_port.name().unwrap();
+
+    let process = jack::contrib::ClosureProcessHandler::new(
+        recorder::build_process_closure(
+            in_port,
+            out_port,
+            shared_cb,
+            sample_rate as usize * 10,
+        ),
+    );
+    let active_client = client
+        .activate_async((), process)
+        .unwrap();
+    connect_system_ports(active_client.as_client(), &in_name, &out_name);
+
+    let mut interface = IpInterface::new(
+        shared.clone(),
+        sample_rate,
+        LineCodingKind::FourBFiveB,
+        local_mac,
+    );
+
+    loop {
+        if let Ok(data) = interface.receive_packet(None) {
+            if let Ok(ip_header) = Ipv4Header::from_bytes(&data) {
+                // Check if it's for us
+                if ip_header.dest_ip == local_ip.octets() {
+                    let icmp_data = &data[20..];
+                    if let Ok(icmp_header) = IcmpPacket::from_bytes(icmp_data) {
+                        if icmp_header.icmp_type == IcmpType::EchoRequest {
+                            info!(
+                                "Received ICMP Echo Request from {:?}",
+                                ip_header.source_ip
+                            );
+
+                            // Send Reply
+                            let reply_icmp = IcmpPacket::new(
+                                IcmpType::EchoReply,
+                                0,
+                                icmp_header.identifier,
+                                icmp_header.sequence_number,
+                                icmp_header.payload,
+                            );
+                            let reply_icmp_bytes =
+                                reply_icmp.to_bytes().unwrap();
+
+                            let reply_ip = Ipv4Header::new(
+                                (20 + reply_icmp_bytes.len()) as u16,
+                                0,
+                                64,
+                                1,
+                                local_ip.octets(),
+                                ip_header.source_ip,
+                            );
+                            let mut reply_bytes = reply_ip.to_bytes().unwrap();
+                            reply_bytes.extend(reply_icmp_bytes);
+
+                            // Find dest MAC
+                            let src_ip = Ipv4Addr::from(ip_header.source_ip);
+                            if let Some(dest_mac) = arp.get_mac(&src_ip) {
+                                info!(
+                                    "Sending Echo Reply to {} ({})",
+                                    src_ip, dest_mac
+                                );
+                                if let Err(e) =
+                                    interface.send_packet(&reply_bytes, dest_mac)
+                                {
+                                    error!("Failed to send reply: {}", e);
+                                }
+                            } else {
+                                warn!(
+                                    "Unknown source IP {}, cannot reply",
+                                    src_ip
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
