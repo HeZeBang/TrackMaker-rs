@@ -66,7 +66,7 @@ enum Commands {
         encoding: String,
 
         /// Recording duration in seconds
-        #[arg(short = 'd', long, default_value = DEFAULT_RECORD_SECONDS_STR)]
+        #[arg(short = 'd', long, default_value_t = DEFAULT_RECORD_SECONDS as u64)]
         duration: u64,
     },
 
