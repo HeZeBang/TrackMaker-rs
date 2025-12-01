@@ -43,7 +43,7 @@ pub const INTER_FRAME_GAP_MS: u32 = 5;
 pub const INTER_FRAME_GAP_SAMPLES: usize =
     (SAMPLE_RATE as usize * INTER_FRAME_GAP_MS as usize) / 1000;
 
-pub const ACK_TIMEOUT_MS: u64 = 100;
+pub const ACK_TIMEOUT_MS: u64 = 120;
 
 pub const PHY_HEADER_BYTES: usize = 7; // Length (2) + CRC (1) + Frame Type (1) + Sequence (1) + Src (1) + Dst (1)
 

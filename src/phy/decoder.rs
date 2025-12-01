@@ -5,6 +5,9 @@ use crate::phy::FrameType;
 use crate::utils::consts::{MAX_FRAME_DATA_SIZE, PHY_HEADER_BYTES};
 use tracing::{debug, trace, warn};
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 enum DecoderState {
     Searching,
     Decoding(usize), // Stores the start of a potential frame
@@ -274,22 +277,84 @@ impl PhyDecoder {
             return 0.0;
         }
 
-        let dot_product: f32 = window
-            .iter()
-            .zip(self.preamble.iter())
-            .map(|(a, b)| a * b)
-            .sum();
+        let (dot_product, window_energy_sqrt) = {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx") {
+                    unsafe { self.compute_stats_avx(window) }
+                } else {
+                    self.compute_stats_scalar(window)
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                self.compute_stats_scalar(window)
+            }
+        };
 
-        let window_energy: f32 = window
-            .iter()
-            .map(|x| x * x)
-            .sum::<f32>()
-            .sqrt();
-
-        if window_energy < 1e-6 || self.preamble_energy < 1e-6 {
+        if window_energy_sqrt < 1e-6 || self.preamble_energy < 1e-6 {
             return 0.0;
         }
 
-        dot_product / (window_energy * self.preamble_energy)
+        dot_product / (window_energy_sqrt * self.preamble_energy)
+    }
+
+    fn compute_stats_scalar(&self, window: &[f32]) -> (f32, f32) {
+        let mut dot_sum = 0.0;
+        let mut energy_sum = 0.0;
+        for (w, p) in window.iter().zip(self.preamble.iter()) {
+            dot_sum += w * p;
+            energy_sum += w * w;
+        }
+        (dot_sum, energy_sum.sqrt())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx")]
+    unsafe fn compute_stats_avx(&self, window: &[f32]) -> (f32, f32) {
+        unsafe {
+            let len = window.len();
+            let preamble = &self.preamble;
+
+            let mut dot_vec = _mm256_setzero_ps();
+            let mut energy_vec = _mm256_setzero_ps();
+
+            let mut i = 0;
+            while i + 8 <= len {
+                let w = _mm256_loadu_ps(window.as_ptr().add(i));
+                let p = _mm256_loadu_ps(preamble.as_ptr().add(i));
+
+                dot_vec = _mm256_add_ps(dot_vec, _mm256_mul_ps(w, p));
+                energy_vec = _mm256_add_ps(energy_vec, _mm256_mul_ps(w, w));
+
+                i += 8;
+            }
+
+            let dot_low = _mm256_castps256_ps128(dot_vec);
+            let dot_high = _mm256_extractf128_ps(dot_vec, 1);
+            let dot_128 = _mm_add_ps(dot_low, dot_high);
+
+            let energy_low = _mm256_castps256_ps128(energy_vec);
+            let energy_high = _mm256_extractf128_ps(energy_vec, 1);
+            let energy_128 = _mm_add_ps(energy_low, energy_high);
+
+            let mut dot_arr = [0.0f32; 4];
+            _mm_storeu_ps(dot_arr.as_mut_ptr(), dot_128);
+            let mut dot_sum: f32 = dot_arr.iter().sum();
+
+            let mut energy_arr = [0.0f32; 4];
+            _mm_storeu_ps(energy_arr.as_mut_ptr(), energy_128);
+            let mut energy_sum: f32 = energy_arr.iter().sum();
+
+            while i < len {
+                let w = *window.get_unchecked(i);
+                let p = *preamble.get_unchecked(i);
+                dot_sum += w * p;
+                energy_sum += w * w;
+                i += 1;
+            }
+
+            (dot_sum, energy_sum.sqrt())
+        }
     }
 }
