@@ -33,3 +33,9 @@ pw-metadata -n settings 0 clock.force-quantum 128
 ```
 
 Sometimes Pipeware will oversample if you choose the volume that is too large, so my best trail is to set OUTPUT to about `31%` / `-30.63dB` and record to `153%` / `11.0dB`.
+
+For best performance with pipewire jack server, use the following command:
+
+```bash
+PIPEWIRE_QUANTUM=256/48000 pw-jack ./target/release/trackmaker-rs
+```
