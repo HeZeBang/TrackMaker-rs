@@ -23,8 +23,6 @@ pub struct CsmaNode {
     sample_rate: u32,
     local_addr: mac::types::MacAddr,
     remote_addr: mac::types::MacAddr,
-    pub tx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    pub rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
 }
 
 impl CsmaNode {
@@ -56,25 +54,9 @@ impl CsmaNode {
             sample_rate,
             local_addr: local_mac,
             remote_addr: remote_mac,
-            tx_queue: Arc::new(Mutex::new(VecDeque::new())),
-            rx_queue: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
-
-    pub fn push_frame(&mut self, data: Vec<u8>) {
-        self.tx_queue
-            .lock()
-            .unwrap()
-            .push_back(data);
-    }
-
-    pub fn pull_frame(&mut self) -> Option<Vec<u8>> {
-        self.rx_queue
-            .lock()
-            .unwrap()
-            .pop_front()
-    }
-
+    
     pub fn run_sender_loop(
         &mut self,
         tx_timeout: u64,
