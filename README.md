@@ -39,3 +39,9 @@ For best performance with pipewire jack server, use the following command:
 ```bash
 PIPEWIRE_QUANTUM=256/48000 pw-jack ./target/release/trackmaker-rs
 ```
+
+jackd
+
+```bash
+jackd -dalsa -r48000 -p128 -Xraw -D -Chw:Device -Phw:Device
+```

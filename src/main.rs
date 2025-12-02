@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 mod audio;
 mod device;
 mod mac;
+mod net;
 mod phy;
 mod ui;
 mod utils;
@@ -101,6 +102,37 @@ enum Commands {
         #[arg(long, default_value = "192.168.1.2")]
         local_ip: String,
     },
+
+    /// Run as a Router (forward packets between acoustic and WiFi interfaces)
+    Router {
+        /// Local IP on acoustic side (connected to NODE1)
+        #[arg(long, default_value = "192.168.1.2")]
+        acoustic_ip: String,
+
+        /// Local MAC on acoustic side
+        #[arg(long, default_value = "2")]
+        acoustic_mac: u8,
+
+        /// Local IP on WiFi side (connected to NODE3)
+        #[arg(long, default_value = "192.168.2.1")]
+        wifi_ip: String,
+
+        /// WiFi interface name (e.g., wlan0, wlp2s0)
+        #[arg(long, default_value = "wlan0")]
+        wifi_interface: String,
+
+        /// NODE3 IP address (for static ARP entry)
+        #[arg(long, default_value = "192.168.2.2")]
+        node3_ip: String,
+
+        /// NODE3 MAC address (for static ARP entry, format: aa:bb:cc:dd:ee:ff)
+        #[arg(long)]
+        node3_mac: Option<String>,
+
+        /// Line coding scheme (4b5b or manchester)
+        #[arg(long, default_value = "4b5b")]
+        encoding: String,
+    },
 }
 
 fn parse_line_coding(encoding: &str) -> LineCodingKind {
@@ -164,6 +196,28 @@ fn main() {
                 Commands::IpHost { local_ip } => {
                     // IP Host Mode
                     run_ip_host(local_ip);
+                    return;
+                }
+                Commands::Router {
+                    acoustic_ip,
+                    acoustic_mac,
+                    wifi_ip,
+                    wifi_interface,
+                    node3_ip,
+                    node3_mac,
+                    encoding,
+                } => {
+                    // Router Mode
+                    let line_coding = parse_line_coding(&encoding);
+                    run_router(
+                        acoustic_ip,
+                        acoustic_mac,
+                        wifi_ip,
+                        wifi_interface,
+                        node3_ip,
+                        node3_mac,
+                        line_coding,
+                    );
                     return;
                 }
             }
@@ -404,7 +458,7 @@ fn run_ping(target: String, local_ip_str: String) {
         Icmpv4Header, Icmpv4Type, IpNumber, Ipv4Header as EtherIpv4Header,
     };
     use std::net::Ipv4Addr;
-    use trackmaker_rs::net::arp::ArpTable;
+    use crate::net::arp::ArpTable;
 
     // Parse IP addresses
     let target_ip: Ipv4Addr = target
@@ -635,7 +689,7 @@ fn run_ip_host(local_ip_str: String) {
         Icmpv4Header, Icmpv4Type, IpNumber, Ipv4Header as EtherIpv4Header,
     };
     use std::net::Ipv4Addr;
-    use trackmaker_rs::net::arp::ArpTable;
+    use crate::net::arp::ArpTable;
 
     let local_ip: Ipv4Addr = local_ip_str
         .parse()
@@ -801,6 +855,138 @@ fn run_ip_host(local_ip_str: String) {
         {
             error!("Failed to send reply: {}", e);
         }
+    }
+}
+
+fn run_router(
+    acoustic_ip_str: String,
+    acoustic_mac: u8,
+    wifi_ip_str: String,
+    wifi_interface: String,
+    node3_ip_str: String,
+    node3_mac_str: Option<String>,
+    line_coding: LineCodingKind,
+) {
+    use crate::net::router::{Router, RouterConfig};
+    use std::net::Ipv4Addr;
+
+    // === Router Preparation ===
+
+    info!("Starting Router Preparation...");
+
+    // Parse IP addresses
+    let acoustic_ip: Ipv4Addr = acoustic_ip_str
+        .parse()
+        .expect("Invalid acoustic IP");
+    let wifi_ip: Ipv4Addr = wifi_ip_str
+        .parse()
+        .expect("Invalid WiFi IP");
+    let node3_ip: Ipv4Addr = node3_ip_str
+        .parse()
+        .expect("Invalid NODE3 IP");
+
+    // Parse NODE3 MAC if provided
+    let node3_mac: Option<[u8; 6]> = node3_mac_str.map(|s| {
+        let parts: Vec<u8> = s
+            .split(':')
+            .map(|p| u8::from_str_radix(p, 16).expect("Invalid MAC format"))
+            .collect();
+        if parts.len() != 6 {
+            panic!("MAC address must have 6 octets");
+        }
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&parts);
+        mac
+    });
+
+    info!("Starting Router Mode...");
+    info!("Acoustic interface: {} (MAC {})", acoustic_ip, acoustic_mac);
+    info!("WiFi interface: {} on {}", wifi_ip, wifi_interface);
+    info!("NODE3: {}", node3_ip);
+
+    // Determine acoustic and WiFi network from IPs
+    // Assume /24 networks
+    let acoustic_network: Ipv4Addr = {
+        let octets = acoustic_ip.octets();
+        Ipv4Addr::new(octets[0], octets[1], octets[2], 0)
+    };
+    let wifi_network: Ipv4Addr = {
+        let octets = wifi_ip.octets();
+        Ipv4Addr::new(octets[0], octets[1], octets[2], 0)
+    };
+    let netmask: Ipv4Addr = "255.255.255.0".parse().unwrap();
+
+    // Setup JACK
+    let (client, _status) = jack::Client::new(
+        &format!("{}_router_{}", JACK_CLIENT_NAME, rand::random::<u16>()),
+        jack::ClientOptions::NO_START_SERVER,
+    )
+    .unwrap();
+
+    let sample_rate = client.sample_rate() as u32;
+    let shared = recorder::AppShared::new(sample_rate as usize * 60); // 60s buffer
+    let shared_cb = shared.clone();
+
+    let in_port = client
+        .register_port(INPUT_PORT_NAME, jack::AudioIn::default())
+        .unwrap();
+    let out_port = client
+        .register_port(OUTPUT_PORT_NAME, jack::AudioOut::default())
+        .unwrap();
+    let in_name = in_port.name().unwrap();
+    let out_name = out_port.name().unwrap();
+
+    let process = jack::contrib::ClosureProcessHandler::new(
+        recorder::build_process_closure(
+            in_port,
+            out_port,
+            shared_cb,
+            sample_rate as usize * 60,
+        ),
+    );
+    let active_client = client
+        .activate_async((), process)
+        .unwrap();
+    connect_system_ports(active_client.as_client(), &in_name, &out_name);
+
+    // Get WiFi MAC address (we'll use a dummy one for now, could be detected)
+    let wifi_mac = [0x00, 0x00, 0x00, 0x00, 0x00, acoustic_mac];
+
+    // Create router config
+    let config = RouterConfig {
+        acoustic_ip,
+        acoustic_mac,
+        wifi_ip,
+        wifi_mac,
+        wifi_interface,
+        acoustic_network,
+        acoustic_netmask: netmask,
+        wifi_network,
+        wifi_netmask: netmask,
+    };
+
+    let mut router = Router::new(config);
+
+    // Add NODE3 ARP entry if MAC provided
+    if let Some(mac) = node3_mac {
+        router.add_wifi_arp_entry(node3_ip, mac);
+        info!(
+            "Added static ARP entry: {} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            node3_ip, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        );
+    } else {
+        warn!("No NODE3 MAC provided. Router will need to learn it or packets to NODE3 will fail.");
+        warn!("Use --node3-mac aa:bb:cc:dd:ee:ff to specify NODE3's MAC address");
+    }
+
+    // Run router
+    if let Err(e) = router.run(shared, sample_rate, line_coding) {
+        error!("Router error: {}", e);
+    }
+
+    // Cleanup
+    if let Err(err) = active_client.deactivate() {
+        error!("Error deactivating client: {}", err);
     }
 }
 
