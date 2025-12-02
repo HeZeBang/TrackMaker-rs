@@ -21,6 +21,7 @@ ctrlc = "3"
 clap = { version = "4", features = ["derive"] }
 pcap = "2.0.0"
 byteorder = "1.4"
+etherparse = "0.19.0"
 
 [build]
 rustflags = ["-C", "target-cpu=native"]

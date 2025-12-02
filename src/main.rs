@@ -19,7 +19,6 @@ use device::jack::{connect_system_ports, print_jack_info};
 use mac::csma::CsmaNode;
 use phy::{Frame, LineCodingKind, PhyDecoder, PhyEncoder};
 use rand::Rng;
-use trackmaker_rs::net::{Protocol, ip::IP_HEADER_BYTES};
 use ui::print_banner;
 use ui::progress::{ProgressManager, templates};
 use utils::consts::*;
@@ -401,10 +400,11 @@ fn run_receiver(
 
 fn run_ping(target: String, local_ip_str: String) {
     use crate::mac::ip_interface::IpInterface;
+    use etherparse::{
+        Icmpv4Header, Icmpv4Type, IpNumber, Ipv4Header as EtherIpv4Header,
+    };
     use std::net::Ipv4Addr;
     use trackmaker_rs::net::arp::ArpTable;
-    use trackmaker_rs::net::icmp::{IcmpPacket, IcmpType};
-    use trackmaker_rs::net::ip::Ipv4Header;
 
     // Parse IP addresses
     let target_ip: Ipv4Addr = target
@@ -478,41 +478,61 @@ fn run_ping(target: String, local_ip_str: String) {
     let identifier = rand::random::<u16>();
 
     for seq in 0..PING_PACKET_COUNT {
-        // icmp packet --> ip packet
-        let icmp_bytes = IcmpPacket::new(
-            IcmpType::EchoRequest,
-            0,                            // Code
-            identifier,                   // Identifier
-            seq,                          // Sequence number
-            vec![0u8; PING_PAYLOAD_SIZE], // PING_PAYLOAD_SIZE bytes payload
-        )
-        .to_bytes()
-        .unwrap();
+        // Build ICMP Echo Request using etherparse
+        // payload --> icmp header --> ip header
+        let payload = vec![0u8; PING_PAYLOAD_SIZE];
 
-        let ip_bytes = Ipv4Header::new(
-            (IP_HEADER_BYTES + icmp_bytes.len()) as u16, // Total length
-            seq,                                         // Sequence number
-            IP_TTL,                                      // TTL
-            Protocol::Icmp.into(),                       // Protocol (ICMP)
-            local_ip.octets(),                           // Source IP
-            target_ip.octets(),                          // Destination IP
-        )
-        .to_bytes()
-        .unwrap()
-        .into_iter()
-        .chain(icmp_bytes)
-        .collect::<Vec<u8>>();
+        let icmp_header = Icmpv4Header::new(Icmpv4Type::EchoRequest(
+            etherparse::IcmpEchoHeader {
+                id: identifier,
+                seq,
+            },
+        ));
+        let icmp_bytes = {
+            let mut buf = Vec::new();
+            icmp_header
+                .write(&mut buf)
+                .expect("Failed to write ICMP header");
+            buf.extend_from_slice(&payload);
+            buf
+        };
+
+        let ip_header = EtherIpv4Header {
+            dscp: Default::default(),
+            ecn: Default::default(),
+            total_len: (20 + icmp_bytes.len()) as u16,
+            identification: seq,
+            dont_fragment: false,
+            more_fragments: false,
+            fragment_offset: Default::default(),
+            time_to_live: IP_TTL,
+            protocol: IpNumber::ICMP,
+            header_checksum: 0, // Will be calculated
+            source: local_ip.octets(),
+            destination: target_ip.octets(),
+            options: Default::default(),
+        };
+
+        let ip_bytes = {
+            let mut buf = Vec::new();
+            ip_header
+                .write(&mut buf)
+                .expect("Failed to write IP header");
+            buf.extend_from_slice(&icmp_bytes);
+            buf
+        };
 
         info!("Sending ICMP Echo Request seq={}...", seq);
         let start = std::time::Instant::now();
 
         // Send IP Packet
-        if let Err(e) = interface.send_packet(&ip_bytes, dest_mac, FrameType::Data) {
+        if let Err(e) =
+            interface.send_packet(&ip_bytes, dest_mac, FrameType::Data)
+        {
             error!("Failed to send packet: {}", e);
             continue;
         }
         packets_sent += 1;
-
         // Wait for reply
         match interface.receive_packet(Some(std::time::Duration::from_millis(
             PING_TIMEOUT_MS,
@@ -521,25 +541,49 @@ fn run_ping(target: String, local_ip_str: String) {
                 let rtt = start.elapsed();
                 let rtt_ms = rtt.as_secs_f32() * 1000.0;
 
-                // Parse IP
-                if let Ok(ip_header) = Ipv4Header::from_bytes(&data) {
-                    // Parse ICMP
-                    let icmp_data = &data[20..]; // Assuming no options
-                    if let Ok(icmp_header) = IcmpPacket::from_bytes(icmp_data) {
-                        if icmp_header.icmp_type == IcmpType::EchoReply
-                            && icmp_header.sequence_number == seq
-                        {
-                            packets_received += 1;
-                            rtt_times.push(rtt_ms);
-
-                            info!(
-                                "Reply from {}: bytes={} time={:.2}ms TTL={}",
-                                target_ip,
-                                data.len(),
-                                rtt_ms,
-                                ip_header.ttl
-                            );
+                // Parse IPv4
+                let ip_slice =
+                    match etherparse::Ipv4HeaderSlice::from_slice(&data) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!("Failed to parse IP header: {:?}", e);
+                            continue;
                         }
+                    };
+
+                // Ensure packet is large enough for claimed IP header length
+                let ip_header_len = ip_slice.ihl() as usize * 4;
+                if data.len() < ip_header_len {
+                    warn!("Received packet too short for IP header length");
+                    continue;
+                }
+
+                // Parse ICMP
+                let icmp_data = &data[ip_header_len..];
+                let icmp_slice =
+                    match etherparse::Icmpv4Slice::from_slice(icmp_data) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!("Failed to parse ICMP: {:?}", e);
+                            continue;
+                        }
+                    };
+
+                // Only handle Echo Replies that match our sequence
+                if let Icmpv4Type::EchoReply(echo) =
+                    icmp_slice.header().icmp_type
+                {
+                    if echo.seq == seq {
+                        packets_received += 1;
+                        rtt_times.push(rtt_ms);
+
+                        info!(
+                            "Reply from {}: bytes={} time={:.2}ms TTL={}",
+                            target_ip,
+                            data.len(),
+                            rtt_ms,
+                            ip_slice.ttl()
+                        );
                     }
                 }
             }
@@ -587,10 +631,11 @@ fn run_ping(target: String, local_ip_str: String) {
 
 fn run_ip_host(local_ip_str: String) {
     use crate::mac::ip_interface::IpInterface;
+    use etherparse::{
+        Icmpv4Header, Icmpv4Type, IpNumber, Ipv4Header as EtherIpv4Header,
+    };
     use std::net::Ipv4Addr;
     use trackmaker_rs::net::arp::ArpTable;
-    use trackmaker_rs::net::icmp::{IcmpPacket, IcmpType};
-    use trackmaker_rs::net::ip::Ipv4Header;
 
     let local_ip: Ipv4Addr = local_ip_str
         .parse()
@@ -646,69 +691,115 @@ fn run_ip_host(local_ip_str: String) {
     // Listen for packets
     loop {
         // Get a packet from interface
-        if let Ok(data) = interface.receive_packet(None) {
-            // Parse IP
-            if let Ok(ip_header) = Ipv4Header::from_bytes(&data) {
-                // Check if it's for us
-                if ip_header.dest_ip == local_ip.octets() {
-                    // Parse ICMP
-                    let icmp_data = &data[20..];
-                    if let Ok(icmp_header) = IcmpPacket::from_bytes(icmp_data) {
-                        if icmp_header.icmp_type == IcmpType::EchoRequest {
-                            info!(
-                                "Received ICMP Echo Request from {:?}",
-                                ip_header.source_ip
-                            );
-
-                            // Send Reply
-                            let reply_icmp_bytes = IcmpPacket::new(
-                                IcmpType::EchoReply,         // Echo Reply
-                                0,                           // Code
-                                icmp_header.identifier,      // Identifier
-                                icmp_header.sequence_number, // Sequence Number
-                                icmp_header.payload,         // Payload
-                            )
-                            .to_bytes()
-                            .unwrap();
-
-                            let reply_bytes = Ipv4Header::new(
-                                (IP_HEADER_BYTES + reply_icmp_bytes.len())
-                                    as u16, // Total length
-                                0,                     // Sequence number
-                                IP_TTL,                // TTL
-                                Protocol::Icmp.into(), // Protocol
-                                local_ip.octets(),     // Source IP
-                                ip_header.source_ip,   // Destination IP
-                            )
-                            .to_bytes()
-                            .unwrap()
-                            .into_iter()
-                            .chain(reply_icmp_bytes)
-                            .collect::<Vec<u8>>();
-
-                            // Find dest MAC
-                            let src_ip = Ipv4Addr::from(ip_header.source_ip);
-                            if let Some(dest_mac) = arp.get_mac(&src_ip) {
-                                info!(
-                                    "Sending Echo Reply to {} ({})",
-                                    src_ip, dest_mac
-                                );
-                                // Send reply
-                                if let Err(e) =
-                                    interface.send_packet(&reply_bytes, dest_mac, FrameType::Ack)
-                                {
-                                    error!("Failed to send reply: {}", e);
-                                }
-                            } else {
-                                warn!(
-                                    "Unknown source IP {}, cannot reply",
-                                    src_ip
-                                );
-                            }
-                        }
-                    }
-                }
+        let data = match interface.receive_packet(None) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!("Failed to receive packet: {:?}", e);
+                continue;
             }
+        };
+
+        // Parse IPv4
+        let ip_slice = match etherparse::Ipv4HeaderSlice::from_slice(&data) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to parse IP header: {:?}", e);
+                continue;
+            }
+        };
+
+        // Check if it's for us
+        if ip_slice.destination() != local_ip.octets() {
+            continue; // Continue if not
+        }
+
+        // Ensure packet is large enough for claimed IP header length
+        let ip_header_len = ip_slice.ihl() as usize * 4;
+        if data.len() < ip_header_len {
+            warn!("Received packet too short for IP header length");
+            continue;
+        }
+
+        // Parse ICMP
+        let icmp_data = &data[ip_header_len..];
+        let icmp_slice = match etherparse::Icmpv4Slice::from_slice(icmp_data) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to parse ICMP: {:?}", e);
+                continue;
+            }
+        };
+
+        // Only handle Echo Requests
+        let echo = match icmp_slice.header().icmp_type {
+            Icmpv4Type::EchoRequest(echo) => echo,
+            _ => continue,
+        };
+
+        info!(
+            "Received ICMP Echo Request from {:?}",
+            ip_slice.source()
+        );
+
+        // Build Echo Reply using etherparse
+        let payload = icmp_slice.payload().to_vec();
+        let reply_icmp_header = Icmpv4Header::new(Icmpv4Type::EchoReply(
+            etherparse::IcmpEchoHeader {
+                id: echo.id,
+                seq: echo.seq,
+            },
+        ));
+        let reply_icmp_bytes = {
+            let mut buf = Vec::new();
+            reply_icmp_header
+                .write(&mut buf)
+                .expect("Failed to write ICMP header");
+            buf.extend_from_slice(&payload);
+            buf
+        };
+
+        // Build IPv4 reply header
+        let reply_ip_header = EtherIpv4Header {
+            dscp: Default::default(),
+            ecn: Default::default(),
+            total_len: (20 + reply_icmp_bytes.len()) as u16,
+            identification: 0,
+            dont_fragment: false,
+            more_fragments: false,
+            fragment_offset: Default::default(),
+            time_to_live: IP_TTL,
+            protocol: IpNumber::ICMP,
+            header_checksum: 0,
+            source: local_ip.octets(),
+            destination: ip_slice.source(),
+            options: Default::default(),
+        };
+
+        let reply_bytes = {
+            let mut buf = Vec::new();
+            reply_ip_header
+                .write(&mut buf)
+                .expect("Failed to write IP header");
+            buf.extend_from_slice(&reply_icmp_bytes);
+            buf
+        };
+
+        // Find dest MAC
+        let src_ip = Ipv4Addr::from(ip_slice.source());
+        let dest_mac = match arp.get_mac(&src_ip) {
+            Some(m) => m,
+            None => {
+                warn!("Unknown source IP {}, cannot reply", src_ip);
+                continue;
+            }
+        };
+
+        info!("Sending Echo Reply to {} ({})", src_ip, dest_mac);
+
+        if let Err(e) =
+            interface.send_packet(&reply_bytes, dest_mac, FrameType::Ack)
+        {
+            error!("Failed to send reply: {}", e);
         }
     }
 }
