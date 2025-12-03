@@ -177,7 +177,7 @@ fn main() {
         info!("Filling playback buffer with music from sample.flac");
 
         let mut music = Vec::new();
-        audio::decoder::decode_flac_to_f32("./assets/sample.flac")
+        audio::codec::decode_flac_to_f32("./assets/sample.flac")
             .unwrap_or_else(|_| {
                 tracing::warn!("Failed to decode sample.flac, using silence");
                 vec![0.0; recording_duration_samples as usize]
