@@ -843,8 +843,9 @@ fn run_ip_host(local_ip_str: String) {
         let dest_mac = match arp.get_mac(&src_ip) {
             Some(m) => m,
             None => {
-                warn!("Unknown source IP {}, cannot reply", src_ip);
-                continue;
+                // warn!("Unknown source IP {}, cannot reply", src_ip);
+                // continue;
+                1
             }
         };
 
