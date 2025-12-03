@@ -245,10 +245,13 @@ impl LineCode for FourBFiveBCodec {
             return Vec::new();
         }
 
-        // 1. NRZI Decode: Detect level changes
+        // Merged NRZI and 4B/5B Decode
         let num_symbols = samples.len() / self.samples_per_level;
-        let mut five_b_bits = Vec::with_capacity(num_symbols);
+        let mut decoded_bits = Vec::with_capacity((num_symbols / 5) * 4);
         let mut last_avg = self.prev_level_avg;
+
+        let mut current_symbol = 0u8;
+        let mut bit_count = 0;
 
         for i in 0..num_symbols {
             let start = i * self.samples_per_level;
@@ -259,37 +262,30 @@ impl LineCode for FourBFiveBCodec {
                 / self.samples_per_level as f32;
 
             // Transition (change of sign) means '1', no transition means '0'
-            if last_avg * current_avg < 0.0 {
-                five_b_bits.push(1);
-            } else {
-                five_b_bits.push(0);
-            }
+            let bit = if last_avg * current_avg < 0.0 { 1 } else { 0 };
+
             // Avoid last_avg being zero
             if current_avg.abs() > 1e-6 {
                 last_avg = current_avg;
             }
-        }
 
-        // 2. 5B/4B Decode
-        let num_nibbles = five_b_bits.len() / 5;
-        let mut decoded_bits = Vec::with_capacity(num_nibbles * 4);
+            // Accumulate bits for 4B/5B
+            current_symbol = (current_symbol << 1) | bit;
+            bit_count += 1;
 
-        for i in 0..num_nibbles {
-            let start = i * 5;
-            let mut symbol = 0u8;
-            for j in 0..5 {
-                symbol |= five_b_bits[start + j] << (4 - j);
-            }
-
-            if let Some(nibble) = decode_4b5b_symbol(symbol) {
-                for j in 0..4 {
-                    decoded_bits.push((nibble >> (3 - j)) & 1);
+            if bit_count == 5 {
+                if let Some(nibble) = decode_4b5b_symbol(current_symbol) {
+                    for j in 0..4 {
+                        decoded_bits.push((nibble >> (3 - j)) & 1);
+                    }
+                } else {
+                    // Error handling: if an invalid symbol is found, we might stop or fill with errors.
+                    // For now, we stop to avoid propagating errors.
+                    warn!("Decoding stopped due to invalid 4B/5B symbol.");
+                    break;
                 }
-            } else {
-                // Error handling: if an invalid symbol is found, we might stop or fill with errors.
-                // For now, we stop to avoid propagating errors.
-                warn!("Decoding stopped due to invalid 4B/5B symbol.");
-                break;
+                current_symbol = 0;
+                bit_count = 0;
             }
         }
 
@@ -360,7 +356,7 @@ mod tests {
 
     #[test]
     fn test_4b5b_encoding_decoding() {
-        let mut codec = FourBFiveBCodec::new(4);
+        let codec = FourBFiveBCodec::new(4);
         let bits = vec![1, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1]; // 0xA70F
         let samples = codec.encode(&bits);
         let decoded = codec.decode(&samples);
