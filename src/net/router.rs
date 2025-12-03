@@ -408,7 +408,7 @@ impl Router {
             }
 
             // Check acoustic interface (non-blocking with short timeout)
-            match acoustic_interface.receive_packet(Some(Duration::from_millis(100))) {
+            match acoustic_interface.receive_packet(Some(Duration::from_millis(150))) {
                 Ok(ip_packet) => {
                     self.handle_acoustic_packet(&mut wifi_capture, ip_packet);
                 }
