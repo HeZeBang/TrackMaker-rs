@@ -106,11 +106,11 @@ enum Commands {
     /// Run as a Router (forward packets between acoustic and WiFi interfaces)
     Router {
         /// Local IP on acoustic side (connected to NODE1)
-        #[arg(long, default_value = "192.168.1.2")]
+        #[arg(long, default_value = "192.168.1.1")]
         acoustic_ip: String,
 
         /// Local MAC on acoustic side
-        #[arg(long, default_value = "2")]
+        #[arg(long, default_value = "1")]
         acoustic_mac: u8,
 
         /// Local IP on WiFi side (connected to NODE3)
