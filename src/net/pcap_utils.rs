@@ -25,7 +25,7 @@ pub fn open_capture(device: Device) -> Result<Capture<Active>, Box<dyn Error>> {
         .snaplen(65535) // Maximum packet size to capture
         .immediate_mode(true)
         .open()?; // Open the capture
-    cap.filter("icmp", true).unwrap();
+    // cap.filter("icmp", true).unwrap();
     info!("Capture opened successfully");
     Ok(cap)
 }
