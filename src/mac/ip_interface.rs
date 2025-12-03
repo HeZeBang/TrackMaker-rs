@@ -327,6 +327,7 @@ impl IpInterface {
 
                 for f in decoded {
                     if f.frame_type == FrameType::Data || f.frame_type == FrameType::Ack && !f.data.is_empty() {
+                        self.shared.record_buffer.lock().unwrap().clear();
                         return Ok(f.data);
                     }
                 }

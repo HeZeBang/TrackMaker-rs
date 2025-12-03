@@ -1,6 +1,6 @@
 use std::fmt;
 
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 /// Trait for line coding
 pub trait LineCode: Send {
@@ -180,6 +180,7 @@ fn decode_4b5b_symbol(symbol: u8) -> Option<u8> {
 }
 
 pub struct FourBFiveBCodec {
+    /// Number of samples per 4B5B encoded bit
     samples_per_level: usize,
     // For NRZI encoding
     last_level: f32,
@@ -247,48 +248,73 @@ impl LineCode for FourBFiveBCodec {
 
         // 1. NRZI Decode: Detect level changes
         let num_symbols = samples.len() / self.samples_per_level;
-        let mut five_b_bits = Vec::with_capacity(num_symbols);
+        let mut decoded_bits = Vec::new();
+        let mut symbol_buf: Vec<u8> = Vec::with_capacity(5);
         let mut last_avg = self.prev_level_avg;
+        let mut offset = 0;
+        let mut i: usize = 0;
 
-        for i in 0..num_symbols {
-            let start = i * self.samples_per_level;
-            let end = start + self.samples_per_level;
+        'symbol_loop : loop {
+            let start = i * self.samples_per_level + offset;
+            let end = start + self.samples_per_level + offset;
+            if end > samples.len() {
+                break;
+            }
+
             let current_avg: f32 = samples[start..end]
                 .iter()
-                .sum::<f32>()
-                / self.samples_per_level as f32;
+                .map(|&s| if s < 0.0 { -1.0 } else { 1.0 })
+                .sum::<f32>();
 
             // Transition (change of sign) means '1', no transition means '0'
             if last_avg * current_avg < 0.0 {
-                five_b_bits.push(1);
+                symbol_buf.push(1);
             } else {
-                five_b_bits.push(0);
+                symbol_buf.push(0);
             }
+
             // Avoid last_avg being zero
             if current_avg.abs() > 1e-6 {
                 last_avg = current_avg;
             }
-        }
 
-        // 2. 5B/4B Decode
-        let num_nibbles = five_b_bits.len() / 5;
-        let mut decoded_bits = Vec::with_capacity(num_nibbles * 4);
-
-        for i in 0..num_nibbles {
-            let start = i * 5;
-            let mut symbol = 0u8;
-            for j in 0..5 {
-                symbol |= five_b_bits[start + j] << (4 - j);
-            }
-
-            if let Some(nibble) = decode_4b5b_symbol(symbol) {
-                for j in 0..4 {
-                    decoded_bits.push((nibble >> (3 - j)) & 1);
+            // If we have collected 5 bits, decode immediately
+            if symbol_buf.len() == 5 {
+                let mut symbol = 0u8;
+                for j in 0..5 {
+                    symbol |= symbol_buf[j] << (4 - j);
                 }
-            } else {
-                // Error handling: if an invalid symbol is found, we might stop or fill with errors.
-                // For now, we stop to avoid propagating errors.
-                warn!("Decoding stopped due to invalid 4B/5B symbol.");
+
+                if let Some(nibble) = decode_4b5b_symbol(symbol) {
+                    for j in 0..4 {
+                        decoded_bits.push((nibble >> (3 - j)) & 1);
+                    }
+                } else {
+                    error!(
+                        "Decoding stopped due to invalid 4B/5B symbol ({:05b} at i={}/{}).",
+                        symbol, i, num_symbols
+                    );
+                    let dbg_start = i.saturating_mul(self.samples_per_level);
+                    let dbg_end = (dbg_start + 5 * self.samples_per_level)
+                        .min(samples.len());
+                    debug!("Sample around: {:?}", &samples[dbg_start..dbg_end]);
+                    // break;
+                    i = std::cmp::max(0, i.saturating_sub(5));
+                    offset += 1;
+                    debug!("Adjusting offset to {}, i to {}", offset, i);
+                    symbol_buf.clear();
+                    if offset >= self.samples_per_level * 5 { // TODO: Adjust threshould
+                        warn!("Offset exceeded 5 samples_per_level, stopping decode.");
+                        break 'symbol_loop;
+                    }
+                    continue 'symbol_loop;
+                }
+
+                symbol_buf.clear();
+            }
+            
+            i += 1;
+            if i >= num_symbols {
                 break;
             }
         }

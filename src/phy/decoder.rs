@@ -3,7 +3,7 @@ use super::line_coding::{LineCode, LineCodingKind};
 use crate::mac;
 use crate::phy::FrameType;
 use crate::utils::consts::{MAX_FRAME_DATA_SIZE, PHY_HEADER_BYTES};
-use tracing::{debug, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -22,9 +22,10 @@ pub struct PhyDecoder {
     correlation_threshold: f32,
     preamble_energy: f32,
 
-    // Sample buffer for processing
+    /// Sample buffer for processing
     sample_buffer: Vec<f32>,
-    buffer_offset: usize, // Current processing position in buffer
+    /// Current processing position in buffer
+    buffer_offset: usize,
 
     max_frame_bytes: usize,
 
@@ -148,10 +149,13 @@ impl PhyDecoder {
 
             if correlation >= self.correlation_threshold {
                 debug!(
-                    "Preamble detected at offset {} (relative: {}) (corr={:.3})",
+                    "Preamble detected at offset {} (relative: {}) (corr={:.3}): {:?}",
                     self.buffer_offset + i,
                     i,
-                    correlation
+                    correlation,
+                    // preview first 10 samples according to buffer_offset
+                    &search_area
+                        [std::cmp::max(0, i.saturating_sub(3))..std::cmp::min(i + preamble_len.min(16), search_area.len())]
                 );
 
                 // Refine alignment by searching for the Sync Word (last byte: 0x5A)
@@ -209,7 +213,7 @@ impl PhyDecoder {
 
                 debug!(
                     "Refined alignment: {} -> {} (corr: {:.3})",
-                    expected_start, best_offset, best_corr
+                    expected_start, best_offset, best_corr,
                 );
 
                 // Preamble found, switch to decoding state
@@ -224,7 +228,8 @@ impl PhyDecoder {
             if i + 1 < window_count {
                 let leaving = search_area[i];
                 let entering = search_area[i + preamble_len];
-                window_energy = window_energy - leaving * leaving + entering * entering;
+                window_energy =
+                    window_energy - leaving * leaving + entering * entering;
                 // Prevent negative energy due to floating point errors
                 if window_energy < 0.0 {
                     window_energy = 0.0;
@@ -264,9 +269,26 @@ impl PhyDecoder {
                 Some(vals) => vals,
                 None => {
                     warn!(
-                        "Failed to parse header at offset {}. Returning to search.",
+                        "Failed to parse header at sample {}. Returning to search.",
                         preamble_start_offset
                     );
+
+                    // dump sample as wav
+                    let audio_data = crate::utils::dump::AudioData {
+                        sample_rate: 48000,
+                        channels: 1,
+                        duration: self.sample_buffer.len() as f32 / 48000.0,
+                        audio_data: self.sample_buffer.clone(),
+                    };
+                    crate::utils::dump::dump_to_wav(
+                        "./tmp/dump.wav",
+                        &audio_data,
+                    )
+                    .unwrap_or_else(|err| {
+                        error!("Error while dumping trace wav: {}", err);
+                    });
+
+                    debug!("Dumped trace wav to ./tmp/dump.wav for analysis.");
                     self.state = DecoderState::Searching;
                     return Some(header_samples); // Consume 1 sample to avoid getting stuck
                 }
@@ -309,11 +331,25 @@ impl PhyDecoder {
 
         if frame_bits.len() < total_bits {
             warn!(
-                "Line decode failed for frame(last valid {}/{}). Consumed {} samples",
+                "Line decode failed for bit(last valid {}/{}). Consumed {} samples",
                 frame_bits.len(),
                 total_bits,
                 consumed_len
             );
+
+            // dump sample as wav
+            let audio_data = crate::utils::dump::AudioData {
+                sample_rate: 48000,
+                channels: 1,
+                duration: self.sample_buffer.len() as f32 / 48000.0,
+                audio_data: self.sample_buffer.clone(),
+            };
+            crate::utils::dump::dump_to_wav("./tmp/dump.wav", &audio_data)
+                .unwrap_or_else(|err| {
+                    error!("Error while dumping trace wav: {}", err);
+                });
+
+            debug!("Dumped trace wav to ./tmp/dump.wav for analysis.");
             self.state = DecoderState::Searching;
             return Some(consumed_len);
         }
@@ -353,12 +389,6 @@ impl PhyDecoder {
             }
         }
     }
-
-
-
-
-
-
 
     fn compute_dot_product(&self, window: &[f32]) -> f32 {
         #[cfg(target_arch = "x86_64")]
