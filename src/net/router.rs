@@ -3,18 +3,20 @@
 //! This module implements a simple static router that forwards IP packets
 //! between an acoustic interface (to NODE1) and a WiFi interface (to NODE3).
 
-use etherparse::Ipv4HeaderSlice;
-use pcap::{Active, Capture};
+use etherparse::err::packet;
+use etherparse::{Ipv4HeaderSlice, PacketBuilder};
+use pcap::{Active, Capture, Device, Linktype};
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc::Sender};
+use std::thread;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::audio::recorder::AppShared;
 use crate::mac::ip_interface::IpInterface;
-use crate::net::icmp::{IcmpPacket, IcmpType};
+use crate::net::icmp::{self, IcmpPacket, IcmpType};
 use crate::net::nat::NatTable;
 use crate::phy::{FrameType, LineCodingKind};
 
@@ -39,7 +41,11 @@ pub struct DirectNetwork {
 }
 
 impl DirectNetwork {
-    pub fn new(network: Ipv4Addr, mask: Ipv4Addr, interface: InterfaceType) -> Self {
+    pub fn new(
+        network: Ipv4Addr,
+        mask: Ipv4Addr,
+        interface: InterfaceType,
+    ) -> Self {
         Self {
             network,
             mask,
@@ -54,7 +60,9 @@ impl DirectNetwork {
         let ip_octets = ip.octets();
 
         for i in 0..4 {
-            if (net_octets[i] & mask_octets[i]) != (ip_octets[i] & mask_octets[i]) {
+            if (net_octets[i] & mask_octets[i])
+                != (ip_octets[i] & mask_octets[i])
+            {
                 return false;
             }
         }
@@ -72,6 +80,7 @@ pub struct RouteEntry {
 }
 
 /// Static routing table
+#[derive(Clone)]
 pub struct RoutingTable {
     routes: Vec<RouteEntry>,
 }
@@ -97,7 +106,10 @@ impl RoutingTable {
     /// Lookup the interface for a destination IP
     pub fn lookup(&self, dest_ip: &Ipv4Addr) -> Option<InterfaceType> {
         for route in &self.routes {
-            if route.network.contains(dest_ip) {
+            if route
+                .network
+                .contains(dest_ip)
+            {
                 return Some(route.network.interface);
             }
         }
@@ -106,6 +118,7 @@ impl RoutingTable {
 }
 
 /// ARP table for WiFi interface (maps IP to MAC address)
+#[derive(Clone)]
 pub struct WiFiArpTable {
     table: HashMap<Ipv4Addr, [u8; 6]>,
 }
@@ -134,6 +147,7 @@ impl WiFiArpTable {
 }
 
 /// Router configuration
+#[derive(Clone)]
 pub struct RouterConfig {
     /// Local IP on acoustic side (connected to NODE1)
     pub acoustic_ip: Ipv4Addr,
@@ -166,16 +180,23 @@ impl Default for RouterConfig {
             wifi_mac: [0x00, 0x00, 0x00, 0x00, 0x00, 0x02],
             wifi_interface: "wlan0".to_string(),
             acoustic_network: "192.168.1.0".parse().unwrap(),
-            acoustic_netmask: "255.255.255.0".parse().unwrap(),
+            acoustic_netmask: "255.255.255.0"
+                .parse()
+                .unwrap(),
             wifi_network: "192.168.2.0".parse().unwrap(),
-            wifi_netmask: "255.255.255.0".parse().unwrap(),
-            gateway_ip: "192.168.2.254".parse().unwrap(),
+            wifi_netmask: "255.255.255.0"
+                .parse()
+                .unwrap(),
+            gateway_ip: "192.168.2.254"
+                .parse()
+                .unwrap(),
             gateway_mac: None,
         }
     }
 }
 
 /// Simple IP Router
+#[derive(Clone)]
 pub struct Router {
     config: RouterConfig,
     routing_table: RoutingTable,
@@ -211,11 +232,16 @@ impl Router {
 
     /// Add a static ARP entry for WiFi
     pub fn add_wifi_arp_entry(&mut self, ip: Ipv4Addr, mac: [u8; 6]) {
-        self.wifi_arp.add_entry(ip, mac);
+        self.wifi_arp
+            .add_entry(ip, mac);
     }
 
     /// Build an Ethernet frame for WiFi transmission
-    fn build_ethernet_frame(&self, dest_mac: [u8; 6], ip_packet: &[u8]) -> Vec<u8> {
+    fn build_ethernet_frame(
+        &self,
+        dest_mac: [u8; 6],
+        ip_packet: &[u8],
+    ) -> Vec<u8> {
         let mut frame = Vec::with_capacity(14 + ip_packet.len());
 
         // Ethernet header (14 bytes)
@@ -311,15 +337,19 @@ impl Router {
         let checksum = !(sum as u16);
         ip_packet[10] = (checksum >> 8) as u8;
         ip_packet[11] = (checksum & 0xFF) as u8;
+        debug!(
+            "Modified checksum to {:0x} {:02x}",
+            ip_packet[10], ip_packet[11]
+        );
     }
 
-    /// Forward a packet from WiFi to Acoustic interface
-    fn forward_to_acoustic(
+    /// Prepare a packet for Acoustic interface
+    /// Returns (ip_packet, dest_mac)
+    fn prepare_acoustic_packet(
         &self,
-        acoustic_interface: &mut IpInterface,
         mut ip_packet: Vec<u8>,
         dest_ip: Ipv4Addr,
-    ) -> Result<(), String> {
+    ) -> Result<(Vec<u8>, u8), String> {
         // Decrement TTL
         Self::decrement_ttl(&mut ip_packet).map_err(|e| e.to_string())?;
 
@@ -335,16 +365,16 @@ impl Router {
             dest_ip, dest_mac
         );
 
-        acoustic_interface.send_packet(&ip_packet, dest_mac, FrameType::Data)
+        Ok((ip_packet, dest_mac))
     }
 
-    /// Forward a packet from Acoustic to WiFi interface
-    fn forward_to_wifi(
+    /// Prepare a frame for WiFi interface
+    /// Returns ethernet_frame
+    fn prepare_wifi_frame(
         &self,
-        wifi_capture: &mut Capture<Active>,
         mut ip_packet: Vec<u8>,
         dest_ip: Ipv4Addr,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<u8>, String> {
         // Decrement TTL
         Self::decrement_ttl(&mut ip_packet).map_err(|e| e.to_string())?;
 
@@ -356,22 +386,23 @@ impl Router {
 
         info!(
             "Forwarding packet to WiFi interface: {} -> MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            dest_ip, dest_mac[0], dest_mac[1], dest_mac[2], dest_mac[3], dest_mac[4], dest_mac[5]
+            dest_ip,
+            dest_mac[0],
+            dest_mac[1],
+            dest_mac[2],
+            dest_mac[3],
+            dest_mac[4],
+            dest_mac[5]
         );
 
         // Build Ethernet frame
-        let frame = self.build_ethernet_frame(dest_mac, &ip_packet);
-
-        // Send via pcap
-        wifi_capture
-            .sendpacket(frame)
-            .map_err(|e| format!("Failed to send WiFi packet: {}", e))
+        Ok(self.build_ethernet_frame(dest_mac, &ip_packet))
     }
 
     /// Handle outbound NAT and forward to gateway
     fn handle_outbound_nat(
         &self,
-        wifi_capture: &mut Capture<Active>,
+        to_wifi: &Sender<Vec<u8>>,
         mut ip_packet: Vec<u8>,
         dest_ip: Ipv4Addr,
     ) {
@@ -395,55 +426,122 @@ impl Router {
                         "NAT: Registered Echo Request ID {} from {}",
                         icmp_packet.identifier, src_ip
                     );
+
+                    let src_mac = [0x9c, 0x29, 0x76, 0x0c, 0x49, 0x00];
+                    // let dst_mac = gateway_mac;
+                    let src_ip = [10, 20, 239, 6];
+                    // let dst_ip = [1, 1, 1, 1];
+                    if let Some(gateway_mac) = self.config.gateway_mac {
+                        // Decrement TTL
+                        if let Err(e) = Self::decrement_ttl(&mut ip_packet) {
+                            warn!("NAT: TTL expired: {}", e);
+                            return;
+                        }
+
+                        info!(
+                            "NAT Forwarding packet to Gateway: {} -> MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                            dest_ip,
+                            gateway_mac[0],
+                            gateway_mac[1],
+                            gateway_mac[2],
+                            gateway_mac[3],
+                            gateway_mac[4],
+                            gateway_mac[5]
+                        );
+
+                        let mut builder =
+                            PacketBuilder::ethernet2(src_mac, gateway_mac)
+                                .ipv4(src_ip, dest_ip.octets(), 60)
+                                .icmpv4_echo_request(
+                                    icmp_packet.identifier,
+                                    icmp_packet.sequence_number,
+                                );
+                        let mut new_frame = Vec::<u8>::with_capacity(
+                            builder.size(icmp_packet.payload.len()),
+                        );
+                        builder
+                            .write(&mut new_frame, &icmp_packet.payload)
+                            .unwrap();
+
+                        // Send via channel
+                        if let Err(e) = to_wifi.send(new_frame) {
+                            warn!(
+                                "Failed to send NAT packet to WiFi thread: {}",
+                                e
+                            );
+                        }
+                    }
                 }
             }
-        }
-
-        // Modify Source IP to WiFi IP
-        let wifi_ip_octets = self.config.wifi_ip.octets();
-        ip_packet[12] = wifi_ip_octets[0];
-        ip_packet[13] = wifi_ip_octets[1];
-        ip_packet[14] = wifi_ip_octets[2];
-        ip_packet[15] = wifi_ip_octets[3];
-
-        // Recalculate IP Checksum
-        Self::recalculate_ip_checksum(&mut ip_packet);
-
-        // Forward to Gateway
-        if let Some(gateway_mac) = self.config.gateway_mac {
-            // Decrement TTL
-            if let Err(e) = Self::decrement_ttl(&mut ip_packet) {
-                warn!("NAT: TTL expired: {}", e);
-                return;
-            }
-
-            info!(
-                "NAT Forwarding packet to Gateway: {} -> MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                dest_ip,
-                gateway_mac[0],
-                gateway_mac[1],
-                gateway_mac[2],
-                gateway_mac[3],
-                gateway_mac[4],
-                gateway_mac[5]
-            );
-
-            // Build Ethernet frame
-            let frame = self.build_ethernet_frame(gateway_mac, &ip_packet);
-
-            // Send via pcap
-            if let Err(e) = wifi_capture.sendpacket(frame) {
-                warn!("Failed to send NAT packet: {}", e);
-            }
         } else {
-            debug!("No gateway MAC configured, cannot perform NAT");
+            debug!("NAT: Not ICMP, dropped");
         }
+
+        // // Modify Source IP to WiFi IP
+        // let wifi_ip_octets = self.config.wifi_ip.octets();
+        // ip_packet[12] = wifi_ip_octets[0];
+        // ip_packet[13] = wifi_ip_octets[1];
+        // ip_packet[14] = wifi_ip_octets[2];
+        // ip_packet[15] = wifi_ip_octets[3];
+
+        // // Recalculate IP Checksum
+        // Self::recalculate_ip_checksum(&mut ip_packet);
+
+        // // Forward to Gateway
+        // if let Some(gateway_mac) = self.config.gateway_mac {
+        //     // Decrement TTL
+        //     if let Err(e) = Self::decrement_ttl(&mut ip_packet) {
+        //         warn!("NAT: TTL expired: {}", e);
+        //         return;
+        //     }
+
+        //     info!(
+        //         "NAT Forwarding packet to Gateway: {} -> MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        //         dest_ip,
+        //         gateway_mac[0],
+        //         gateway_mac[1],
+        //         gateway_mac[2],
+        //         gateway_mac[3],
+        //         gateway_mac[4],
+        //         gateway_mac[5]
+        //     );
+
+        //     // Build Ethernet frame
+        //     let frame = self.build_ethernet_frame(gateway_mac, &ip_packet);
+
+        //     let src_mac = [0x9c, 0x29, 0x76, 0x0c, 0x49, 0x00];
+        //     let dst_mac = gateway_mac;
+        //     let src_ip = [10, 20, 239, 6];
+        //     let dst_ip = [1, 1, 1, 1];
+
+        //     // 使用 etherparse 构造 ICMPv4 Echo Request, 不带额外 payload（或你也可以加 payload）
+        //     let builder = PacketBuilder::ethernet2(src_mac, dst_mac)
+        //         .ipv4(src_ip, dst_ip, 64) // TTL = 64
+        //         .icmpv4_echo_request(1/*id*/, 1 /*seq*/);
+
+        //     // 如果你想要额外 payload（比如 ping data）：
+        //     let payload: &[u8] = b"hello-icmp";
+
+        //     // 构造 raw bytes
+        //     let mut packet =
+        //         Vec::<u8>::with_capacity(builder.size(payload.len()));
+        //     builder
+        //         .write(&mut packet, payload)
+        //         .unwrap();
+
+        //     // Send via channel
+        //     if let Err(e) = to_wifi.send(packet) {
+        //         warn!("Failed to send NAT packet to WiFi thread: {}", e);
+        //     }
+        // } else {
+        //     debug!("No gateway MAC configured, cannot perform NAT");
+        // }
     }
 
     /// Handle inbound NAT and forward to acoustic interface
     fn handle_inbound_nat(
         &self,
-        acoustic_interface: &mut IpInterface,
+        to_acoustic: &Sender<(Vec<u8>, u8)>,
         mut ip_packet: Vec<u8>,
     ) {
         // Check if it's ICMP
@@ -458,8 +556,9 @@ impl Router {
             if let Ok(icmp_packet) = IcmpPacket::from_bytes(&ip_packet[ihl..]) {
                 if icmp_packet.icmp_type == IcmpType::EchoReply {
                     // Lookup in NAT table
-                    if let Some(original_ip) =
-                        self.nat_table.translate_echo_reply(icmp_packet.identifier)
+                    if let Some(original_ip) = self
+                        .nat_table
+                        .translate_echo_reply(icmp_packet.identifier)
                     {
                         debug!(
                             "NAT: Translating Echo Reply ID {} to {}",
@@ -477,12 +576,20 @@ impl Router {
                         Self::recalculate_ip_checksum(&mut ip_packet);
 
                         // Forward to Acoustic Interface
-                        if let Err(e) = self.forward_to_acoustic(
-                            acoustic_interface,
-                            ip_packet,
-                            original_ip,
-                        ) {
-                            warn!("Failed to forward NAT reply: {}", e);
+                        match self
+                            .prepare_acoustic_packet(ip_packet, original_ip)
+                        {
+                            Ok(msg) => {
+                                if let Err(e) = to_acoustic.send(msg) {
+                                    warn!(
+                                        "Failed to send NAT reply to Acoustic thread: {}",
+                                        e
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to prepare NAT reply: {}", e);
+                            }
                         }
                         return;
                     }
@@ -506,7 +613,8 @@ impl Router {
         sample_rate: u32,
         line_coding: LineCodingKind,
     ) -> Result<(), String> {
-        self.running.store(true, Ordering::SeqCst);
+        self.running
+            .store(true, Ordering::SeqCst);
 
         info!("Starting router...");
         info!(
@@ -519,8 +627,10 @@ impl Router {
         );
 
         // Open WiFi capture
-        let wifi_device = crate::net::pcap_utils::get_device_by_name(&self.config.wifi_interface)
-            .map_err(|e| format!("Failed to get WiFi device: {}", e))?;
+        let wifi_device = crate::net::pcap_utils::get_device_by_name(
+            &self.config.wifi_interface,
+        )
+        .map_err(|e| format!("Failed to get WiFi device: {}", e))?;
 
         let mut wifi_capture = crate::net::pcap_utils::open_capture(wifi_device)
             .map_err(|e| format!("Failed to open WiFi capture: {}", e))?;
@@ -540,42 +650,139 @@ impl Router {
 
         info!("Router is running. Press Ctrl+C to stop.");
 
-        // Main routing loop
-        // We need to poll both interfaces
+        // Channels for inter-thread communication
+        let (to_acoustic_txm, to_acoustic_rx) =
+            std::sync::mpsc::channel::<(Vec<u8>, u8)>();
+        let (to_wifi_tx, to_wifi_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
         let running = self.running.clone();
+        let router_wifi = self.clone();
+        let router_acoustic = self.clone();
+        let to_acoustic_tx = to_acoustic_txm.clone();
 
-        // For simplicity, we'll use a single-threaded approach with non-blocking receives
-        // In production, you'd want separate threads for each interface
-
-        while running.load(Ordering::SeqCst) {
-            // Check WiFi interface (non-blocking)
-            match wifi_capture.next_packet() {
-                Ok(packet) => {
-                    if let Some((ip_packet, src_mac)) = Self::parse_ethernet_frame(packet.data) {
-                        self.handle_wifi_packet(
-                            &mut acoustic_interface,
-                            ip_packet,
-                            src_mac,
-                        );
+        // Spawn WiFi Thread
+        let wifi_handle = thread::spawn(move || {
+            let running = running.clone();
+            while running.load(Ordering::SeqCst) {
+                // 1. Read from WiFi (with timeout)
+                match wifi_capture.next_packet() {
+                    Ok(packet) => {
+                        if let Some((ip_packet, src_mac)) =
+                            Self::parse_ethernet_frame(packet.data)
+                        {
+                            router_wifi.handle_wifi_packet(
+                                &to_acoustic_tx,
+                                ip_packet,
+                                src_mac,
+                            );
+                        }
+                    }
+                    Err(pcap::Error::TimeoutExpired) => {
+                        // Timeout, check for outgoing packets
+                    }
+                    Err(e) => {
+                        warn!("WiFi capture error: {}", e);
                     }
                 }
-                Err(pcap::Error::TimeoutExpired) => {
-                    // No packet available, continue
-                }
-                Err(e) => {
-                    warn!("WiFi capture error: {}", e);
-                }
             }
+        });
 
-            // Check acoustic interface (non-blocking with short timeout)
-            match acoustic_interface.receive_packet(Some(Duration::from_millis(150))) {
-                Ok(ip_packet) => {
-                    self.handle_acoustic_packet(&mut wifi_capture, ip_packet);
-                }
-                Err(_) => {
-                    // Timeout or error, continue
+        let running = self.running.clone();
+        // open wifi tx
+        let main_device = Device::lookup()
+            .unwrap()
+            .unwrap();
+        info!("Using {:?} as gateway device", main_device);
+        let mut gateway_send = crate::net::pcap_utils::open_capture(main_device.clone())
+            .map_err(|e| format!("Failed to open WiFi capture: {}", e))?;
+        let gateway_tx_handle = thread::spawn(move || {
+            while running.load(Ordering::SeqCst) {
+                // 2. Send to WiFi
+                while let Ok(frame) = to_wifi_rx.try_recv() {
+                    info!("Gateway sent");
+                    if let Err(e) = gateway_send.sendpacket(frame) {
+                        warn!("Failed to send packet to WiFi: {}", e);
+                    }
                 }
             }
+        });
+
+        let running = self.running.clone();
+        let router_wifi = self.clone();
+        let router_acoustic = self.clone();
+        let to_acoustic_tx = to_acoustic_txm.clone();
+        let mut gateway_recv = crate::net::pcap_utils::open_capture(main_device)
+            .map_err(|e| format!("Failed to open WiFi capture: {}", e))?;
+        gateway_recv.filter("icmp", true).unwrap();
+        let gateway_rx_handle = thread::spawn(move || {
+            let running = running.clone();
+            while running.load(Ordering::SeqCst) {
+                // 1. Read from WiFi (with timeout)
+                match gateway_recv.next_packet() {
+                    Ok(packet) => {
+                        if let Some((ip_packet, src_mac)) =
+                            Self::parse_ethernet_frame(packet.data)
+                        {
+                            router_wifi.handle_wifi_packet(
+                                &to_acoustic_tx,
+                                ip_packet,
+                                src_mac,
+                            );
+                        }
+                    }
+                    Err(pcap::Error::TimeoutExpired) => {
+                        // Timeout, check for outgoing packets
+                    }
+                    Err(e) => {
+                        warn!("WiFi capture error: {}", e);
+                    }
+                }
+            }
+        });
+
+        // Spawn Acoustic Thread
+        let running = self.running.clone();
+        let acoustic_handle = thread::spawn(move || {
+            let running = running.clone();
+            while running.load(Ordering::SeqCst) {
+                // 1. Read from Acoustic (non-blocking/timeout)
+                match acoustic_interface
+                    .receive_packet(Some(Duration::from_millis(10)))
+                {
+                    Ok(ip_packet) => {
+                        router_acoustic
+                            .handle_acoustic_packet(&to_wifi_tx, ip_packet);
+                    }
+                    Err(_) => {
+                        // Timeout or error
+                    }
+                }
+
+                // 2. Send to Acoustic
+                while let Ok((ip_packet, dest_mac)) = to_acoustic_rx.try_recv() {
+                    if let Err(e) = acoustic_interface.send_packet(
+                        &ip_packet,
+                        dest_mac,
+                        FrameType::Data,
+                    ) {
+                        warn!("Failed to send packet to Acoustic: {}", e);
+                    }
+                }
+            }
+        });
+
+        // Wait for threads to finish
+        if let Err(e) = wifi_handle.join() {
+            warn!("WiFi RX thread panicked: {:?}", e);
+        }
+        if let Err(e) = gateway_tx_handle.join() {
+            warn!("WiFi TX thread panicked: {:?}", e);
+        }
+        if let Err(e) = gateway_rx_handle.join() {
+            warn!("WiFi TX thread panicked: {:?}", e);
+        }
+        if let Err(e) = acoustic_handle.join() {
+            warn!("Acoustic thread panicked: {:?}", e);
         }
 
         info!("Router stopped.");
@@ -585,7 +792,7 @@ impl Router {
     /// Handle a packet received from WiFi interface
     fn handle_wifi_packet(
         &self,
-        acoustic_interface: &mut IpInterface,
+        to_acoustic: &Sender<(Vec<u8>, u8)>,
         ip_packet: Vec<u8>,
         _src_mac: [u8; 6],
     ) {
@@ -614,18 +821,29 @@ impl Router {
         // Check if packet is for us
         if self.is_for_us(&dest_ip) {
             // Check for NAT (inbound)
-            self.handle_inbound_nat(acoustic_interface, ip_packet);
+            self.handle_inbound_nat(to_acoustic, ip_packet);
             return;
         }
 
         // Lookup routing table
-        match self.routing_table.lookup(&dest_ip) {
+        match self
+            .routing_table
+            .lookup(&dest_ip)
+        {
             Some(InterfaceType::Acoustic) => {
                 // Forward to acoustic interface
-                if let Err(e) =
-                    self.forward_to_acoustic(acoustic_interface, ip_packet, dest_ip)
-                {
-                    warn!("Failed to forward to acoustic: {}", e);
+                match self.prepare_acoustic_packet(ip_packet, dest_ip) {
+                    Ok(msg) => {
+                        if let Err(e) = to_acoustic.send(msg) {
+                            warn!(
+                                "Failed to send packet to Acoustic thread: {}",
+                                e
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to prepare acoustic packet: {}", e);
+                    }
                 }
             }
             Some(InterfaceType::WiFi) => {
@@ -639,7 +857,11 @@ impl Router {
     }
 
     /// Handle a packet received from acoustic interface
-    fn handle_acoustic_packet(&self, wifi_capture: &mut Capture<Active>, ip_packet: Vec<u8>) {
+    fn handle_acoustic_packet(
+        &self,
+        to_wifi: &Sender<Vec<u8>>,
+        ip_packet: Vec<u8>,
+    ) {
         // Parse IP header
         let ip_header = match Ipv4HeaderSlice::from_slice(&ip_packet) {
             Ok(h) => h,
@@ -666,22 +888,38 @@ impl Router {
         }
 
         // Lookup routing table
-        match self.routing_table.lookup(&dest_ip) {
+        match self
+            .routing_table
+            .lookup(&dest_ip)
+        {
             Some(InterfaceType::WiFi) => {
                 // Forward to WiFi interface
-                if let Err(e) = self.forward_to_wifi(wifi_capture, ip_packet, dest_ip) {
-                    warn!("Failed to forward to WiFi: {}", e);
+                match self.prepare_wifi_frame(ip_packet, dest_ip) {
+                    Ok(frame) => {
+                        if let Err(e) = to_wifi.send(frame) {
+                            warn!("Failed to send packet to WiFi thread: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to prepare WiFi frame: {}", e);
+                    }
                 }
             }
             Some(InterfaceType::Acoustic) => {
                 // Same interface, shouldn't happen in normal routing
-                debug!("Packet destination is on same acoustic network, ignoring");
+                debug!(
+                    "Packet destination is on same acoustic network, ignoring"
+                );
             }
             None => {
                 // Check for default gateway
-                if self.config.gateway_mac.is_some() {
+                if self
+                    .config
+                    .gateway_mac
+                    .is_some()
+                {
                     // Perform NAT and forward to gateway
-                    self.handle_outbound_nat(wifi_capture, ip_packet, dest_ip);
+                    self.handle_outbound_nat(to_wifi, ip_packet, dest_ip);
                 } else {
                     debug!("No route to {}, dropping packet", dest_ip);
                 }
@@ -691,7 +929,8 @@ impl Router {
 
     /// Stop the router
     pub fn stop(&self) {
-        self.running.store(false, Ordering::SeqCst);
+        self.running
+            .store(false, Ordering::SeqCst);
     }
 }
 
@@ -703,12 +942,20 @@ mod tests {
     fn test_direct_network_contains() {
         let net = DirectNetwork::new(
             "192.168.1.0".parse().unwrap(),
-            "255.255.255.0".parse().unwrap(),
+            "255.255.255.0"
+                .parse()
+                .unwrap(),
             InterfaceType::Acoustic,
         );
 
         assert!(net.contains(&"192.168.1.1".parse().unwrap()));
-        assert!(net.contains(&"192.168.1.254".parse().unwrap()));
+        assert!(
+            net.contains(
+                &"192.168.1.254"
+                    .parse()
+                    .unwrap()
+            )
+        );
         assert!(!net.contains(&"192.168.2.1".parse().unwrap()));
         assert!(!net.contains(&"10.0.0.1".parse().unwrap()));
     }
@@ -718,12 +965,16 @@ mod tests {
         let mut table = RoutingTable::new();
         table.add_direct_network(
             "192.168.1.0".parse().unwrap(),
-            "255.255.255.0".parse().unwrap(),
+            "255.255.255.0"
+                .parse()
+                .unwrap(),
             InterfaceType::Acoustic,
         );
         table.add_direct_network(
             "192.168.2.0".parse().unwrap(),
-            "255.255.255.0".parse().unwrap(),
+            "255.255.255.0"
+                .parse()
+                .unwrap(),
             InterfaceType::WiFi,
         );
 
@@ -732,7 +983,11 @@ mod tests {
             Some(InterfaceType::Acoustic)
         );
         assert_eq!(
-            table.lookup(&"192.168.2.100".parse().unwrap()),
+            table.lookup(
+                &"192.168.2.100"
+                    .parse()
+                    .unwrap()
+            ),
             Some(InterfaceType::WiFi)
         );
         assert_eq!(table.lookup(&"10.0.0.1".parse().unwrap()), None);
