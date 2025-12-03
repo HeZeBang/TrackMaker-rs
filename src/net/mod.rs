@@ -1,6 +1,7 @@
 pub mod arp;
 pub mod icmp;
 pub mod ip;
+pub mod nat;
 pub mod pcap_utils;
 pub mod router;
 

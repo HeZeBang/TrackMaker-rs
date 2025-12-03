@@ -94,6 +94,10 @@ enum Commands {
         /// Local IP address
         #[arg(long, default_value = "192.168.1.1")]
         local_ip: String,
+
+        /// Gateway IP address
+        #[arg(long)]
+        gateway: Option<String>,
     },
 
     /// Run as an IP Host (respond to pings)
@@ -128,6 +132,14 @@ enum Commands {
         /// NODE3 MAC address (for static ARP entry, format: aa:bb:cc:dd:ee:ff)
         #[arg(long)]
         node3_mac: Option<String>,
+
+        /// Default Gateway IP (e.g., 192.168.2.254)
+        #[arg(long, default_value = "192.168.2.254")]
+        gateway_ip: String,
+
+        /// Default Gateway MAC (format: aa:bb:cc:dd:ee:ff)
+        #[arg(long)]
+        gateway_mac: Option<String>,
 
         /// Line coding scheme (4b5b or manchester)
         #[arg(long, default_value = "4b5b")]
@@ -188,9 +200,13 @@ fn main() {
                     test_transmission(line_coding);
                     return;
                 }
-                Commands::Ping { target, local_ip } => {
+                Commands::Ping {
+                    target,
+                    local_ip,
+                    gateway,
+                } => {
                     // Ping Mode
-                    run_ping(target, local_ip);
+                    run_ping(target, local_ip, gateway);
                     return;
                 }
                 Commands::IpHost { local_ip } => {
@@ -205,6 +221,8 @@ fn main() {
                     wifi_interface,
                     node3_ip,
                     node3_mac,
+                    gateway_ip,
+                    gateway_mac,
                     encoding,
                 } => {
                     // Router Mode
@@ -216,6 +234,8 @@ fn main() {
                         wifi_interface,
                         node3_ip,
                         node3_mac,
+                        gateway_ip,
+                        gateway_mac,
                         line_coding,
                     );
                     return;
@@ -452,13 +472,13 @@ fn run_receiver(
     }
 }
 
-fn run_ping(target: String, local_ip_str: String) {
+fn run_ping(target: String, local_ip_str: String, gateway: Option<String>) {
     use crate::mac::ip_interface::IpInterface;
+    use crate::net::arp::ArpTable;
     use etherparse::{
         Icmpv4Header, Icmpv4Type, IpNumber, Ipv4Header as EtherIpv4Header,
     };
     use std::net::Ipv4Addr;
-    use crate::net::arp::ArpTable;
 
     // Parse IP addresses
     let target_ip: Ipv4Addr = target
@@ -470,9 +490,18 @@ fn run_ping(target: String, local_ip_str: String) {
 
     // Check static ARP table
     let arp = ArpTable::new();
-    let dest_mac = arp
-        .get_mac(&target_ip)
-        .expect("Target IP not in ARP table");
+    let dest_mac = if let Some(mac) = arp.get_mac(&target_ip) {
+        mac
+    } else if let Some(gateway_str) = gateway {
+        let gateway_ip: Ipv4Addr = gateway_str
+            .parse()
+            .expect("Invalid gateway IP");
+        arp.get_mac(&gateway_ip)
+            .expect("Gateway IP not in ARP table")
+    } else {
+        panic!("Target IP not in ARP table and no gateway specified");
+    };
+
     let local_mac = arp
         .get_mac(&local_ip)
         .expect("Local IP not in ARP table");
@@ -866,6 +895,8 @@ fn run_router(
     wifi_interface: String,
     node3_ip_str: String,
     node3_mac_str: Option<String>,
+    gateway_ip_str: String,
+    gateway_mac_str: Option<String>,
     line_coding: LineCodingKind,
 ) {
     use crate::net::router::{Router, RouterConfig};
@@ -885,9 +916,26 @@ fn run_router(
     let node3_ip: Ipv4Addr = node3_ip_str
         .parse()
         .expect("Invalid NODE3 IP");
+    let gateway_ip: Ipv4Addr = gateway_ip_str
+        .parse()
+        .expect("Invalid Gateway IP");
 
     // Parse NODE3 MAC if provided
     let node3_mac: Option<[u8; 6]> = node3_mac_str.map(|s| {
+        let parts: Vec<u8> = s
+            .split(':')
+            .map(|p| u8::from_str_radix(p, 16).expect("Invalid MAC format"))
+            .collect();
+        if parts.len() != 6 {
+            panic!("MAC address must have 6 octets");
+        }
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&parts);
+        mac
+    });
+
+    // Parse Gateway MAC if provided
+    let gateway_mac: Option<[u8; 6]> = gateway_mac_str.map(|s| {
         let parts: Vec<u8> = s
             .split(':')
             .map(|p| u8::from_str_radix(p, 16).expect("Invalid MAC format"))
@@ -904,6 +952,14 @@ fn run_router(
     info!("Acoustic interface: {} (MAC {})", acoustic_ip, acoustic_mac);
     info!("WiFi interface: {} on {}", wifi_ip, wifi_interface);
     info!("NODE3: {}", node3_ip);
+    if let Some(mac) = gateway_mac {
+        info!(
+            "Gateway: {} (MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
+            gateway_ip, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        );
+    } else {
+        info!("Gateway: {} (MAC not provided)", gateway_ip);
+    }
 
     // Determine acoustic and WiFi network from IPs
     // Assume /24 networks
@@ -964,6 +1020,8 @@ fn run_router(
         acoustic_netmask: netmask,
         wifi_network,
         wifi_netmask: netmask,
+        gateway_ip,
+        gateway_mac,
     };
 
     let mut router = Router::new(config);

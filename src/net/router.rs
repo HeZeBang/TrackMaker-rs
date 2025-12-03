@@ -14,6 +14,8 @@ use tracing::{debug, info, warn};
 
 use crate::audio::recorder::AppShared;
 use crate::mac::ip_interface::IpInterface;
+use crate::net::icmp::{IcmpPacket, IcmpType};
+use crate::net::nat::NatTable;
 use crate::phy::{FrameType, LineCodingKind};
 
 /// Network interface type
@@ -149,6 +151,10 @@ pub struct RouterConfig {
     /// WiFi network (e.g., 192.168.2.0/24)
     pub wifi_network: Ipv4Addr,
     pub wifi_netmask: Ipv4Addr,
+    /// Default Gateway IP (e.g., 192.168.2.254)
+    pub gateway_ip: Ipv4Addr,
+    /// Default Gateway MAC
+    pub gateway_mac: Option<[u8; 6]>,
 }
 
 impl Default for RouterConfig {
@@ -163,6 +169,8 @@ impl Default for RouterConfig {
             acoustic_netmask: "255.255.255.0".parse().unwrap(),
             wifi_network: "192.168.2.0".parse().unwrap(),
             wifi_netmask: "255.255.255.0".parse().unwrap(),
+            gateway_ip: "192.168.2.254".parse().unwrap(),
+            gateway_mac: None,
         }
     }
 }
@@ -172,6 +180,7 @@ pub struct Router {
     config: RouterConfig,
     routing_table: RoutingTable,
     wifi_arp: WiFiArpTable,
+    nat_table: NatTable,
     running: Arc<AtomicBool>,
 }
 
@@ -195,6 +204,7 @@ impl Router {
             config,
             routing_table,
             wifi_arp: WiFiArpTable::new(),
+            nat_table: NatTable::new(),
             running: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -279,6 +289,30 @@ impl Router {
         Ok(())
     }
 
+    /// Recalculate IP header checksum
+    fn recalculate_ip_checksum(ip_packet: &mut [u8]) {
+        // Zero out checksum
+        ip_packet[10] = 0;
+        ip_packet[11] = 0;
+
+        let ihl = (ip_packet[0] & 0x0F) as usize;
+        let header_len = ihl * 4;
+
+        let mut sum: u32 = 0;
+        for i in (0..header_len).step_by(2) {
+            let word = u16::from_be_bytes([ip_packet[i], ip_packet[i + 1]]);
+            sum = sum.wrapping_add(word as u32);
+        }
+
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+
+        let checksum = !(sum as u16);
+        ip_packet[10] = (checksum >> 8) as u8;
+        ip_packet[11] = (checksum & 0xFF) as u8;
+    }
+
     /// Forward a packet from WiFi to Acoustic interface
     fn forward_to_acoustic(
         &self,
@@ -332,6 +366,132 @@ impl Router {
         wifi_capture
             .sendpacket(frame)
             .map_err(|e| format!("Failed to send WiFi packet: {}", e))
+    }
+
+    /// Handle outbound NAT and forward to gateway
+    fn handle_outbound_nat(
+        &self,
+        wifi_capture: &mut Capture<Active>,
+        mut ip_packet: Vec<u8>,
+        dest_ip: Ipv4Addr,
+    ) {
+        // Check if it's ICMP
+        let ip_header = match Ipv4HeaderSlice::from_slice(&ip_packet) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        if ip_header.protocol() == etherparse::IpNumber::ICMP {
+            // ICMP
+            // Parse ICMP
+            let ihl = ip_header.slice().len();
+            if let Ok(icmp_packet) = IcmpPacket::from_bytes(&ip_packet[ihl..]) {
+                if icmp_packet.icmp_type == IcmpType::EchoRequest {
+                    // Register in NAT table
+                    let src_ip = Ipv4Addr::from(ip_header.source());
+                    self.nat_table
+                        .register_echo_request(icmp_packet.identifier, src_ip);
+                    debug!(
+                        "NAT: Registered Echo Request ID {} from {}",
+                        icmp_packet.identifier, src_ip
+                    );
+                }
+            }
+        }
+
+        // Modify Source IP to WiFi IP
+        let wifi_ip_octets = self.config.wifi_ip.octets();
+        ip_packet[12] = wifi_ip_octets[0];
+        ip_packet[13] = wifi_ip_octets[1];
+        ip_packet[14] = wifi_ip_octets[2];
+        ip_packet[15] = wifi_ip_octets[3];
+
+        // Recalculate IP Checksum
+        Self::recalculate_ip_checksum(&mut ip_packet);
+
+        // Forward to Gateway
+        if let Some(gateway_mac) = self.config.gateway_mac {
+            // Decrement TTL
+            if let Err(e) = Self::decrement_ttl(&mut ip_packet) {
+                warn!("NAT: TTL expired: {}", e);
+                return;
+            }
+
+            info!(
+                "NAT Forwarding packet to Gateway: {} -> MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                dest_ip,
+                gateway_mac[0],
+                gateway_mac[1],
+                gateway_mac[2],
+                gateway_mac[3],
+                gateway_mac[4],
+                gateway_mac[5]
+            );
+
+            // Build Ethernet frame
+            let frame = self.build_ethernet_frame(gateway_mac, &ip_packet);
+
+            // Send via pcap
+            if let Err(e) = wifi_capture.sendpacket(frame) {
+                warn!("Failed to send NAT packet: {}", e);
+            }
+        } else {
+            debug!("No gateway MAC configured, cannot perform NAT");
+        }
+    }
+
+    /// Handle inbound NAT and forward to acoustic interface
+    fn handle_inbound_nat(
+        &self,
+        acoustic_interface: &mut IpInterface,
+        mut ip_packet: Vec<u8>,
+    ) {
+        // Check if it's ICMP
+        let ip_header = match Ipv4HeaderSlice::from_slice(&ip_packet) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        if ip_header.protocol() == etherparse::IpNumber::ICMP {
+            // ICMP
+            let ihl = ip_header.slice().len();
+            if let Ok(icmp_packet) = IcmpPacket::from_bytes(&ip_packet[ihl..]) {
+                if icmp_packet.icmp_type == IcmpType::EchoReply {
+                    // Lookup in NAT table
+                    if let Some(original_ip) =
+                        self.nat_table.translate_echo_reply(icmp_packet.identifier)
+                    {
+                        debug!(
+                            "NAT: Translating Echo Reply ID {} to {}",
+                            icmp_packet.identifier, original_ip
+                        );
+
+                        // Modify Destination IP
+                        let original_ip_octets = original_ip.octets();
+                        ip_packet[16] = original_ip_octets[0];
+                        ip_packet[17] = original_ip_octets[1];
+                        ip_packet[18] = original_ip_octets[2];
+                        ip_packet[19] = original_ip_octets[3];
+
+                        // Recalculate IP Checksum
+                        Self::recalculate_ip_checksum(&mut ip_packet);
+
+                        // Forward to Acoustic Interface
+                        if let Err(e) = self.forward_to_acoustic(
+                            acoustic_interface,
+                            ip_packet,
+                            original_ip,
+                        ) {
+                            warn!("Failed to forward NAT reply: {}", e);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        // If not handled by NAT, ignore (since it was addressed to us but not NATed)
+        debug!("Packet for router itself, ignoring (let host stack handle)");
     }
 
     /// Check if packet is for us (router itself)
@@ -453,7 +613,8 @@ impl Router {
 
         // Check if packet is for us
         if self.is_for_us(&dest_ip) {
-            debug!("Packet is for router itself, ignoring (let host stack handle)");
+            // Check for NAT (inbound)
+            self.handle_inbound_nat(acoustic_interface, ip_packet);
             return;
         }
 
@@ -517,7 +678,13 @@ impl Router {
                 debug!("Packet destination is on same acoustic network, ignoring");
             }
             None => {
-                debug!("No route to {}, dropping packet", dest_ip);
+                // Check for default gateway
+                if self.config.gateway_mac.is_some() {
+                    // Perform NAT and forward to gateway
+                    self.handle_outbound_nat(wifi_capture, ip_packet, dest_ip);
+                } else {
+                    debug!("No route to {}, dropping packet", dest_ip);
+                }
             }
         }
     }
