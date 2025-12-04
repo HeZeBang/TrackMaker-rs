@@ -7,7 +7,7 @@ use crate::mac::{self, CSMAState};
 use crate::phy::{Frame, FrameType, LineCodingKind, PhyDecoder, PhyEncoder};
 use crate::utils::consts::*;
 
-pub struct IpInterface {
+pub struct AcousticInterface {
     shared: AppShared,
     encoder: PhyEncoder,
     decoder: PhyDecoder,
@@ -15,7 +15,7 @@ pub struct IpInterface {
     sample_rate: u32,
 }
 
-impl IpInterface {
+impl AcousticInterface {
     pub fn new(
         shared: AppShared,
         sample_rate: u32,

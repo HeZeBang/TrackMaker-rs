@@ -473,7 +473,7 @@ fn run_receiver(
 }
 
 fn run_ping(target: String, local_ip_str: String, gateway: Option<String>) {
-    use crate::mac::ip_interface::IpInterface;
+    use crate::mac::acoustic_interface::AcousticInterface;
     use crate::net::arp::ArpTable;
     use etherparse::{
         Icmpv4Header, Icmpv4Type, IpNumber, Ipv4Header as EtherIpv4Header,
@@ -544,7 +544,7 @@ fn run_ping(target: String, local_ip_str: String, gateway: Option<String>) {
         .unwrap();
     connect_system_ports(active_client.as_client(), &in_name, &out_name);
 
-    let mut interface = IpInterface::new(
+    let mut interface = AcousticInterface::new(
         shared.clone(),
         sample_rate,
         LineCodingKind::FourBFiveB,
@@ -713,7 +713,7 @@ fn run_ping(target: String, local_ip_str: String, gateway: Option<String>) {
 }
 
 fn run_ip_host(local_ip_str: String) {
-    use crate::mac::ip_interface::IpInterface;
+    use crate::mac::acoustic_interface::AcousticInterface;
     use etherparse::{
         Icmpv4Header, Icmpv4Type, IpNumber, Ipv4Header as EtherIpv4Header,
     };
@@ -764,7 +764,7 @@ fn run_ip_host(local_ip_str: String) {
     connect_system_ports(active_client.as_client(), &in_name, &out_name);
 
     // Setup IP Interface
-    let mut interface = IpInterface::new(
+    let mut interface = AcousticInterface::new(
         shared.clone(),
         sample_rate,
         LineCodingKind::FourBFiveB,

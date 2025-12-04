@@ -14,7 +14,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::audio::recorder::AppShared;
-use crate::mac::ip_interface::IpInterface;
+use crate::mac::acoustic_interface::AcousticInterface;
 use crate::net::icmp::{self, IcmpPacket, IcmpType};
 use crate::net::nat::NatTable;
 use crate::phy::{FrameType, LineCodingKind};
@@ -658,7 +658,7 @@ impl Router {
             .map_err(|e| format!("Failed to set filter: {}", e))?;
 
         // Create acoustic interface
-        let mut acoustic_interface = IpInterface::new(
+        let mut acoustic_interface = AcousticInterface::new(
             shared.clone(),
             sample_rate,
             line_coding,
