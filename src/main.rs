@@ -1030,12 +1030,22 @@ fn run_router(
     if let Some(mac) = node3_mac {
         router.add_wifi_arp_entry(node3_ip, mac);
         info!(
-            "Added static ARP entry: {} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            "Added static ARP entry for Node3, WiFi: {} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             node3_ip, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
     } else {
         warn!("No NODE3 MAC provided. Router will need to learn it or packets to NODE3 will fail.");
         warn!("Use --node3-mac aa:bb:cc:dd:ee:ff to specify NODE3's MAC address");
+    }
+
+    if let Some(mac) = gateway_mac {
+        router.add_arp_entry(gateway_ip, mac);
+        info!(
+            "Added static ARP entry for Gateway: {} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            gateway_ip, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        );
+    } else {
+        warn!("No Gateway Provided. NAT will be failed.");
     }
 
     // Run router

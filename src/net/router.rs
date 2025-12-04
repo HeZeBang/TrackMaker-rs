@@ -3,7 +3,6 @@
 //! This module implements a simple static router that forwards IP packets
 //! between an acoustic interface (to NODE1) and a WiFi interface (to NODE3).
 
-use etherparse::err::packet;
 use etherparse::{Ipv4HeaderSlice, PacketBuilder};
 use pcap::{Active, Capture, Device, Linktype};
 use std::collections::HashMap;
@@ -27,6 +26,8 @@ pub enum InterfaceType {
     Acoustic,
     /// WiFi interface (to NODE3)
     WiFi,
+    /// Other
+    Ethernet,
 }
 
 /// A directly connected network
@@ -117,13 +118,13 @@ impl RoutingTable {
     }
 }
 
-/// ARP table for WiFi interface (maps IP to MAC address)
+/// ARP table for Network interface (maps IP to MAC address)
 #[derive(Clone)]
-pub struct WiFiArpTable {
-    table: HashMap<Ipv4Addr, [u8; 6]>,
+pub struct ArpTable {
+    table: HashMap<InterfaceType, HashMap<Ipv4Addr, [u8; 6]>>,
 }
 
-impl WiFiArpTable {
+impl ArpTable {
     pub fn new() -> Self {
         Self {
             table: HashMap::new(),
@@ -131,18 +132,25 @@ impl WiFiArpTable {
     }
 
     /// Add a static ARP entry
-    pub fn add_entry(&mut self, ip: Ipv4Addr, mac: [u8; 6]) {
-        self.table.insert(ip, mac);
+    pub fn add_entry(&mut self, ip: Ipv4Addr, mac: [u8; 6], iface: InterfaceType) {
+        self.table
+            .entry(iface)
+            .or_insert_with(HashMap::new)
+            .insert(ip, mac);
     }
 
     /// Get MAC address for an IP
-    pub fn get_mac(&self, ip: &Ipv4Addr) -> Option<[u8; 6]> {
-        self.table.get(ip).copied()
+    pub fn get_mac(&self, ip: &Ipv4Addr, iface: InterfaceType) -> Option<[u8; 6]> {
+        // Borrow the interface key for lookup, then copy the MAC out of the inner map
+        self.table.get(&iface).and_then(|m| m.get(ip).copied())
     }
 
     /// Update or add an ARP entry (for learning)
-    pub fn update(&mut self, ip: Ipv4Addr, mac: [u8; 6]) {
-        self.table.insert(ip, mac);
+    pub fn update(&mut self, ip: Ipv4Addr, mac: [u8; 6], interface: InterfaceType) {
+        self.table
+            .entry(interface)
+            .or_insert_with(HashMap::new)
+            .insert(ip, mac);
     }
 }
 
@@ -200,7 +208,7 @@ impl Default for RouterConfig {
 pub struct Router {
     config: RouterConfig,
     routing_table: RoutingTable,
-    wifi_arp: WiFiArpTable,
+    arp_table: ArpTable,
     nat_table: NatTable,
     running: Arc<AtomicBool>,
 }
@@ -224,7 +232,7 @@ impl Router {
         Self {
             config,
             routing_table,
-            wifi_arp: WiFiArpTable::new(),
+            arp_table: ArpTable::new(),
             nat_table: NatTable::new(),
             running: Arc::new(AtomicBool::new(false)),
         }
@@ -232,8 +240,14 @@ impl Router {
 
     /// Add a static ARP entry for WiFi
     pub fn add_wifi_arp_entry(&mut self, ip: Ipv4Addr, mac: [u8; 6]) {
-        self.wifi_arp
-            .add_entry(ip, mac);
+        self.arp_table
+            .add_entry(ip, mac, InterfaceType::WiFi);
+    }
+
+    /// Add a static ARP entry for Other(Gateway)
+    pub fn add_arp_entry(&mut self, ip: Ipv4Addr, mac: [u8; 6]) {
+        self.arp_table
+            .add_entry(ip, mac, InterfaceType::Ethernet);
     }
 
     /// Build an Ethernet frame for WiFi transmission
@@ -380,8 +394,8 @@ impl Router {
 
         // Get destination MAC from WiFi ARP table
         let dest_mac = self
-            .wifi_arp
-            .get_mac(&dest_ip)
+            .arp_table
+            .get_mac(&dest_ip, InterfaceType::WiFi)
             .ok_or_else(|| format!("No WiFi ARP entry for {}", dest_ip))?;
 
         info!(
@@ -427,9 +441,12 @@ impl Router {
                         icmp_packet.identifier, src_ip
                     );
 
+                    // TODO: use Ethernet Mac and IP
                     let src_mac = [0x9c, 0x29, 0x76, 0x0c, 0x49, 0x00];
-                    // let dst_mac = gateway_mac;
                     let src_ip = [10, 20, 239, 6];
+                    // let src_mac = self.config.wifi_mac;
+                    // let dst_mac = gateway_mac;
+                    // let src_ip = self.config.wifi_ip.octets();
                     // let dst_ip = [1, 1, 1, 1];
                     if let Some(gateway_mac) = self.config.gateway_mac {
                         // Decrement TTL
@@ -449,7 +466,7 @@ impl Router {
                             gateway_mac[5]
                         );
 
-                        let mut builder =
+                        let builder =
                             PacketBuilder::ethernet2(src_mac, gateway_mac)
                                 .ipv4(src_ip, dest_ip.octets(), 60)
                                 .icmpv4_echo_request(
@@ -655,6 +672,7 @@ impl Router {
             std::sync::mpsc::channel::<(Vec<u8>, u8)>();
         let (to_wifi_tx, to_wifi_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
+        // WiFi Hotspot RX
         let running = self.running.clone();
         let router_wifi = self.clone();
         let router_acoustic = self.clone();
@@ -679,6 +697,7 @@ impl Router {
                     }
                     Err(pcap::Error::TimeoutExpired) => {
                         // Timeout, check for outgoing packets
+                        info!("WIFI Capture Timeout");
                     }
                     Err(e) => {
                         warn!("WiFi capture error: {}", e);
@@ -687,8 +706,8 @@ impl Router {
             }
         });
 
+        // Gateway TX
         let running = self.running.clone();
-        // open wifi tx
         let main_device = Device::lookup()
             .unwrap()
             .unwrap();
@@ -697,7 +716,7 @@ impl Router {
             .map_err(|e| format!("Failed to open WiFi capture: {}", e))?;
         let gateway_tx_handle = thread::spawn(move || {
             while running.load(Ordering::SeqCst) {
-                // 2. Send to WiFi
+                // 2. Send to Gateway
                 while let Ok(frame) = to_wifi_rx.try_recv() {
                     info!("Gateway sent");
                     if let Err(e) = gateway_send.sendpacket(frame) {
@@ -707,6 +726,7 @@ impl Router {
             }
         });
 
+        // Gateway RX
         let running = self.running.clone();
         let router_wifi = self.clone();
         let router_acoustic = self.clone();
@@ -850,6 +870,9 @@ impl Router {
                 // Same interface, shouldn't happen in normal routing
                 debug!("Packet destination is on same WiFi network, ignoring");
             }
+            Some(InterfaceType::Ethernet) => {
+                // TODO: NAT Traverse
+            }
             None => {
                 debug!("No route to {}, dropping packet", dest_ip);
             }
@@ -910,6 +933,9 @@ impl Router {
                 debug!(
                     "Packet destination is on same acoustic network, ignoring"
                 );
+            }
+            Some(InterfaceType::Ethernet) => {
+                // TODO: NAT Traverse
             }
             None => {
                 // Check for default gateway
