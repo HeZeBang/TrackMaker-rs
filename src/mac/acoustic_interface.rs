@@ -1,9 +1,9 @@
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::audio::recorder::{AppShared, AppState};
 use crate::mac::{self, CSMAState};
+use crate::net::fragmentation::{IpFragmenter, IpReassembler};
 use crate::phy::{Frame, FrameType, LineCodingKind, PhyDecoder, PhyEncoder};
 use crate::utils::consts::*;
 
@@ -13,6 +13,8 @@ pub struct AcousticInterface {
     decoder: PhyDecoder,
     local_mac: u8,
     sample_rate: u32,
+    fragmenter: IpFragmenter,
+    reassembler: IpReassembler,
 }
 
 impl AcousticInterface {
@@ -40,11 +42,37 @@ impl AcousticInterface {
             decoder,
             local_mac,
             sample_rate,
+            fragmenter: IpFragmenter::new(DEFAULT_MTU),
+            reassembler: IpReassembler::new(),
         }
     }
 
     // Send a packet for the given destination MAC address
     pub fn send_packet(
+        &mut self,
+        data: &[u8],
+        dest_mac: u8,
+        frame_type: FrameType,
+    ) -> Result<(), String> {
+        // Fragment the packet if it's too large
+        let packets_to_send = if let FrameType::Data = frame_type {
+            // Only fragment IP data packets
+            self.fragmenter.fragment_packet(data)?
+        } else {
+            // For ACK frames, send as-is
+            vec![data.to_vec()]
+        };
+
+        // Send each fragment
+        for packet_data in packets_to_send {
+            self.send_single_packet(&packet_data, dest_mac, frame_type)?;
+        }
+
+        Ok(())
+    }
+
+    // Send a single packet
+    fn send_single_packet(
         &mut self,
         data: &[u8],
         dest_mac: u8,
@@ -327,8 +355,17 @@ impl AcousticInterface {
 
                 for f in decoded {
                     if f.frame_type == FrameType::Data || f.frame_type == FrameType::Ack && !f.data.is_empty() {
-                        self.shared.record_buffer.lock().unwrap().clear();
-                        return Ok(f.data);
+                        // Try to reassemble fragments
+                        match self.reassembler.process_fragment(&f.data)? {
+                            Some(reassembled_packet) => {
+                                self.shared.record_buffer.lock().unwrap().clear();
+                                return Ok(reassembled_packet);
+                            }
+                            None => {
+                                // Fragment received but packet not complete yet
+                                debug!("Fragment received, waiting for more fragments...");
+                            }
+                        }
                     }
                 }
             }

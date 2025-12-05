@@ -98,6 +98,11 @@ enum Commands {
         /// Gateway IP address
         #[arg(long)]
         gateway: Option<String>,
+
+        /// Payload size in bytes
+        /// Default is 32 bytes
+        #[arg(long, default_value_t = PING_PAYLOAD_SIZE)]
+        payload_size: usize,
     },
 
     /// Run as an IP Host (respond to pings)
@@ -204,9 +209,10 @@ fn main() {
                     target,
                     local_ip,
                     gateway,
+                    payload_size,
                 } => {
                     // Ping Mode
-                    run_ping(target, local_ip, gateway);
+                    run_ping(target, local_ip, gateway, payload_size);
                     return;
                 }
                 Commands::IpHost { local_ip } => {
@@ -472,7 +478,7 @@ fn run_receiver(
     }
 }
 
-fn run_ping(target: String, local_ip_str: String, gateway: Option<String>) {
+fn run_ping(target: String, local_ip_str: String, gateway: Option<String>, payload_size: usize) {
     use crate::mac::acoustic_interface::AcousticInterface;
     use crate::net::arp::ArpTable;
     use etherparse::{
@@ -563,7 +569,7 @@ fn run_ping(target: String, local_ip_str: String, gateway: Option<String>) {
     for seq in 0..PING_PACKET_COUNT {
         // Build ICMP Echo Request using etherparse
         // payload --> icmp header --> ip header
-        let payload = vec![0u8; PING_PAYLOAD_SIZE];
+        let payload = vec![0u8; payload_size];
 
         let icmp_header = Icmpv4Header::new(Icmpv4Type::EchoRequest(
             etherparse::IcmpEchoHeader {
@@ -881,7 +887,7 @@ fn run_ip_host(local_ip_str: String) {
         info!("Sending Echo Reply to {} ({})", src_ip, dest_mac);
 
         if let Err(e) =
-            interface.send_packet(&reply_bytes, dest_mac, FrameType::Ack)
+            interface.send_packet(&reply_bytes, dest_mac, FrameType::Data)
         {
             error!("Failed to send reply: {}", e);
         }

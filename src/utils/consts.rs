@@ -64,6 +64,8 @@ pub const SLOT_TIME_MS: u64 = 5;
 
 // --- Ip Constants ---
 pub const IP_TTL: u8 = 64;
+/// Default MTU for Aethernet (should be smaller than Ethernet MTU of 1500/3)
+pub const DEFAULT_MTU: usize = 200;
 
 // --- Ping Constants ---
 pub const PING_PACKET_COUNT: u16 = 10;
