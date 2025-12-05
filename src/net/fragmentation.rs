@@ -412,42 +412,49 @@ mod tests {
     }
 
     #[test]
-    fn test_reassembly() {
+    fn test_fragment_assemble() {
+        let mut fragmenter = IpFragmenter::new(60);
         let mut reassembler = IpReassembler::new();
 
-        // Create two fragments
-        // Fragment 1: offset 0, 40 bytes of data
-        let mut frag1 = vec![
-            0x45, 0x00, 0x00, 0x48, // IP header start (version, IHL, ToS, length = 20 + 40 = 72)
-            0x12, 0x34, 0x20, 0x00, // Identification=0x1234, flags/offset (more_fragments=1, offset=0)
-            0x40, 0x00, 0x00, 0x00, // TTL, protocol, checksum
-            0xc0, 0xa8, 0x01, 0x01, // Source IP 192.168.1.1
-            0xc0, 0xa8, 0x01, 0x02, // Dest IP 192.168.1.2
+        // Create a valid IP header
+        let mut packet = vec![
+            0x45, // Version 4, IHL 5 (20 bytes)
+            0x00, // TOS
+            0x00, 0x00, // Total length (will be set)
+            0x00, 0x00, // Identification
+            0x00, 0x00, // Flags + Fragment offset
+            0x40, // TTL
+            0x11, // Protocol (UDP)
+            0x00, 0x00, // Header checksum
+            192, 168, 1, 1, // Source IP
+            192, 168, 1, 2, // Destination IP
         ];
-        frag1.extend(vec![0xAAu8; 40]); // Data: 40 bytes
 
-        // Fragment 2: offset 1 (in 8-byte chunks, so at byte 8), remaining 10 bytes of data
-        let mut frag2 = vec![
-            0x45, 0x00, 0x00, 0x1E, // IP header start (length = 20 + 10 = 48)
-            0x12, 0x34, 0x00, 0x01, // Identification=0x1234, flags/offset (more_fragments=0, offset=1)
-            0x40, 0x00, 0x00, 0x00, // TTL, protocol, checksum
-            0xc0, 0xa8, 0x01, 0x01, // Source IP
-            0xc0, 0xa8, 0x01, 0x02, // Dest IP
-        ];
-        frag2.extend(vec![0xBBu8; 10]); // Data: 10 bytes
+        // Add payload data
+        let payload: Vec<u8> = (0..100u8).collect();
+        packet.extend(&payload);
 
-        // Process first fragment (no complete packet yet)
-        let result1 = reassembler.process_fragment(&frag1).unwrap();
-        assert_eq!(result1, None);
+        // Set total length
+        let total_len = packet.len() as u16;
+        packet[2..4].copy_from_slice(&total_len.to_be_bytes());
 
-        // Process second fragment (should complete)
-        let result2 = reassembler.process_fragment(&frag2).unwrap();
-        assert!(result2.is_some());
+        // Fragment the packet
+        let fragments = fragmenter.fragment_packet(&packet).unwrap();
+        assert!(fragments.len() > 1, "Packet should be fragmented into multiple parts");
 
-        let reassembled = result2.unwrap();
-        // Should contain all data: 40 + 10 = 50 bytes of data + 20 bytes header = 70 bytes
-        assert_eq!(reassembled.len(), 70);
-        assert_eq!(&reassembled[20..60], vec![0xAAu8; 40].as_slice());
-        assert_eq!(&reassembled[60..70], vec![0xBBu8; 10].as_slice());
+        // Reassemble fragments
+        let mut result: Option<Vec<u8>> = None;
+        for fragment in &fragments {
+            result = reassembler.process_fragment(fragment).unwrap();
+        }
+
+        // Should have reassembled packet
+        assert!(result.is_some(), "Packet should be reassembled");
+
+        let reassembled = result.unwrap();
+
+        // Check that the reassembled payload matches original
+        let reassembled_payload = &reassembled[20..];
+        assert_eq!(reassembled_payload, &payload, "Reassembled payload should match original");
     }
 }
