@@ -5,6 +5,7 @@ pub struct ArpTable {
     table: HashMap<Ipv4Addr, u8>,
 }
 
+// FIXME: deprecate this in favor of Router's ARP table
 impl ArpTable {
     pub fn new() -> Self {
         let mut table = HashMap::new();

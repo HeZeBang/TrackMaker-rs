@@ -25,6 +25,7 @@ use ui::progress::{ProgressManager, templates};
 use utils::consts::*;
 use utils::logging::init_logging;
 
+use crate::net::router::InterfaceType;
 use crate::phy::FrameType;
 
 #[derive(Parser)]
@@ -146,6 +147,18 @@ enum Commands {
         #[arg(long)]
         gateway_mac: Option<String>,
 
+        /// Default Gateway MAC (format: aa:bb:cc:dd:ee:ff)
+        #[arg(long)]
+        gateway_interface: String,
+
+        /// Ethernet IP address
+        #[arg(long)]
+        eth_ip: String,
+
+        /// Ethernet MAC address
+        #[arg(long)]
+        eth_mac: String,
+
         /// Line coding scheme (4b5b or manchester)
         #[arg(long, default_value = "4b5b")]
         encoding: String,
@@ -229,6 +242,9 @@ fn main() {
                     node3_mac,
                     gateway_ip,
                     gateway_mac,
+                    gateway_interface,
+                    eth_ip,
+                    eth_mac,
                     encoding,
                 } => {
                     // Router Mode
@@ -240,8 +256,11 @@ fn main() {
                         wifi_interface,
                         node3_ip,
                         node3_mac,
+                        eth_ip,
+                        Some(eth_mac),
                         gateway_ip,
                         gateway_mac,
+                        gateway_interface,
                         line_coding,
                     );
                     return;
@@ -901,8 +920,11 @@ fn run_router(
     wifi_interface: String,
     node3_ip_str: String,
     node3_mac_str: Option<String>,
+    eth_ip: String,
+    eth_mac_str: Option<String>,
     gateway_ip_str: String,
     gateway_mac_str: Option<String>,
+    gateway_interface: String,
     line_coding: LineCodingKind,
 ) {
     use crate::net::router::{Router, RouterConfig};
@@ -924,7 +946,10 @@ fn run_router(
         .expect("Invalid NODE3 IP");
     let gateway_ip: Ipv4Addr = gateway_ip_str
         .parse()
-        .expect("Invalid Gateway IP");
+        .expect("Invalid Default Gateway IP");
+    let eth_ip: Ipv4Addr = eth_ip
+        .parse()
+        .expect("Invalid Ethernet IP");
 
     // Parse NODE3 MAC if provided
     let node3_mac: Option<[u8; 6]> = node3_mac_str.map(|s| {
@@ -954,17 +979,32 @@ fn run_router(
         mac
     });
 
+    // Parse Ethernet MAC
+    let eth_mac: Option<[u8; 6]> = eth_mac_str.map(|s| {
+        let parts: Vec<u8> = s
+            .split(':')
+            .map(|p| u8::from_str_radix(p, 16).expect("Invalid MAC format"))
+            .collect();
+        if parts.len() != 6 {
+            panic!("MAC address must have 6 octets");
+        }
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&parts);
+        mac
+    });
+
     info!("Starting Router Mode...");
     info!("Acoustic interface: {} (MAC {})", acoustic_ip, acoustic_mac);
     info!("WiFi interface: {} on {}", wifi_ip, wifi_interface);
     info!("NODE3: {}", node3_ip);
+
     if let Some(mac) = gateway_mac {
         info!(
-            "Gateway: {} (MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
-            gateway_ip, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            "Gateway: {} on {} (MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
+            gateway_ip, gateway_interface, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
     } else {
-        info!("Gateway: {} (MAC not provided)", gateway_ip);
+        info!("Gateway: {} on {}(MAC not provided)", gateway_ip, gateway_interface);
     }
 
     // Determine acoustic and WiFi network from IPs
@@ -1028,13 +1068,16 @@ fn run_router(
         wifi_netmask: netmask,
         gateway_ip,
         gateway_mac,
+        gateway_interface,
+        eth_ip,
+        eth_mac: eth_mac.unwrap_or([0u8;6]),
     };
 
     let mut router = Router::new(config);
 
     // Add NODE3 ARP entry if MAC provided
     if let Some(mac) = node3_mac {
-        router.add_wifi_arp_entry(node3_ip, mac);
+        router.add_arp_entry(node3_ip, mac, InterfaceType::WiFi);
         info!(
             "Added static ARP entry for Node3, WiFi: {} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             node3_ip, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
@@ -1045,7 +1088,7 @@ fn run_router(
     }
 
     if let Some(mac) = gateway_mac {
-        router.add_arp_entry(gateway_ip, mac);
+        router.add_arp_entry(gateway_ip, mac, InterfaceType::Ethernet);
         info!(
             "Added static ARP entry for Gateway: {} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             gateway_ip, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]

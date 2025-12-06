@@ -18,10 +18,20 @@ pub fn get_device_by_name(name: &str) -> Result<Device, Box<dyn Error>> {
     Err(format!("Device {} not found", name).into())
 }
 
+pub fn get_default_device() -> Result<Device, Box<dyn Error>> {
+    let device_opt = Device::lookup()?;
+    let device = match device_opt {
+        Some(d) => d,
+        None => return Err("No default device found".into()),
+    };
+    info!("Using default device: {:?}", device);
+    Ok(device)
+}
+
 // Open a capture on a device
 pub fn open_capture(device: Device) -> Result<Capture<Active>, Box<dyn Error>> {
     let mut cap = Capture::from_device(device)?
-        .promisc(true) // Promiscuous mode: capture all packets on the network
+        .promisc(false) // Promiscuous mode: capture all packets on the network
         .snaplen(65535) // Maximum packet size to capture
         .immediate_mode(true)
         .timeout(10) // 10ms timeout
