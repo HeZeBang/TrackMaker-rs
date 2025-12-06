@@ -265,7 +265,6 @@ impl AcousticInterface {
                 CSMAState::WaitingForAck => {
                     let start = Instant::now();
                     let timeout = Duration::from_millis(ACK_TIMEOUT_MS);
-                    let mut processed_len = 0;
 
                     loop {
                         if start.elapsed() > timeout {
@@ -280,19 +279,17 @@ impl AcousticInterface {
                         }
 
                         std::thread::sleep(Duration::from_millis(10));
-                        let samples = self
-                            .shared
-                            .record_buffer
-                            .lock()
-                            .unwrap()
-                            .clone();
+                        let samples = {
+                            let mut buf = self.shared.record_buffer.lock().unwrap();
+                            let s = buf.clone();
+                            buf.clear();
+                            s
+                        };
 
-                        if samples.len() > processed_len {
-                            let new_samples = &samples[processed_len..];
+                        if !samples.is_empty() {
                             let decoded = self
                                 .decoder
-                                .process_samples(new_samples);
-                            processed_len = samples.len();
+                                .process_samples(&samples);
 
                             for f in decoded {
                                 if f.frame_type == FrameType::Ack
@@ -320,7 +317,6 @@ impl AcousticInterface {
             .lock()
             .unwrap() = AppState::Recording;
         let start = Instant::now();
-        let mut processed_len = 0;
 
         loop {
             if let Some(t) = timeout {
@@ -334,25 +330,23 @@ impl AcousticInterface {
             // Check for user interrupt or logic to stop?
             // For now just loop
 
-            let samples = self
-                .shared
-                .record_buffer
-                .lock()
-                .unwrap()
-                .clone();
-            if samples.len() > processed_len {
-                let new_samples = &samples[processed_len..];
+            let samples = {
+                let mut buf = self.shared.record_buffer.lock().unwrap();
+                let s = buf.clone();
+                buf.clear();
+                s
+            };
+
+            if !samples.is_empty() {
                 let decoded = self
                     .decoder
-                    .process_samples(new_samples);
-                processed_len = samples.len();
+                    .process_samples(&samples);
 
                 for f in decoded {
                     if f.frame_type == FrameType::Data || f.frame_type == FrameType::Ack && !f.data.is_empty() {
                         // Try to reassemble fragments
                         match self.reassembler.process_fragment(&f.data)? {
                             Some(reassembled_packet) => {
-                                self.shared.record_buffer.lock().unwrap().clear();
                                 return Ok(reassembled_packet);
                             }
                             None => {

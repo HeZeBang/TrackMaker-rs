@@ -123,9 +123,13 @@ enum Commands {
         #[arg(long, default_value = "1")]
         acoustic_mac: u8,
 
-        /// Local IP on WiFi side (connected to NODE3)
+        /// Local IP on WiFi Hotspot (connected to NODE3)
         #[arg(long, default_value = "192.168.2.1")]
         wifi_ip: String,
+
+        /// Local MAC on WiFi Hotspot
+        #[arg(long)]
+        wifi_mac: Option<String>,
 
         /// WiFi interface name (e.g., wlan0, wlp2s0)
         #[arg(long, default_value = "wlan0")]
@@ -157,7 +161,7 @@ enum Commands {
 
         /// Ethernet MAC address
         #[arg(long)]
-        eth_mac: String,
+        eth_mac: Option<String>,
 
         /// Line coding scheme (4b5b or manchester)
         #[arg(long, default_value = "4b5b")]
@@ -238,6 +242,7 @@ fn main() {
                     acoustic_mac,
                     wifi_ip,
                     wifi_interface,
+                    wifi_mac,
                     node3_ip,
                     node3_mac,
                     gateway_ip,
@@ -254,10 +259,11 @@ fn main() {
                         acoustic_mac,
                         wifi_ip,
                         wifi_interface,
+                        wifi_mac,
                         node3_ip,
                         node3_mac,
                         eth_ip,
-                        Some(eth_mac),
+                        eth_mac,
                         gateway_ip,
                         gateway_mac,
                         gateway_interface,
@@ -918,6 +924,7 @@ fn run_router(
     acoustic_mac: u8,
     wifi_ip_str: String,
     wifi_interface: String,
+    wifi_mac_str: Option<String>,
     node3_ip_str: String,
     node3_mac_str: Option<String>,
     eth_ip: String,
@@ -993,6 +1000,20 @@ fn run_router(
         mac
     });
 
+    // Parse WiFi MAC
+    let wifi_mac: Option<[u8; 6]> = wifi_mac_str.map(|s| {
+        let parts: Vec<u8> = s
+            .split(':')
+            .map(|p| u8::from_str_radix(p, 16).expect("Invalid MAC format"))
+            .collect();
+        if parts.len() != 6 {
+            panic!("MAC address must have 6 octets");
+        }
+        let mut mac = [0u8; 6];
+        mac.copy_from_slice(&parts);
+        mac
+    });
+
     info!("Starting Router Mode...");
     info!("Acoustic interface: {} (MAC {})", acoustic_ip, acoustic_mac);
     info!("WiFi interface: {} on {}", wifi_ip, wifi_interface);
@@ -1052,15 +1073,15 @@ fn run_router(
         .unwrap();
     connect_system_ports(active_client.as_client(), &in_name, &out_name);
 
-    // Get WiFi MAC address (we'll use a dummy one for now, could be detected)
-    let wifi_mac = [0x00, 0x00, 0x00, 0x00, 0x00, acoustic_mac];
-
     // Create router config
     let config = RouterConfig {
         acoustic_ip,
         acoustic_mac,
         wifi_ip,
-        wifi_mac,
+        wifi_mac: wifi_mac.unwrap_or_else(|| {
+            warn!("No MAC for WiFI Provided!");
+            [0u8; 6]
+        }),
         wifi_interface,
         acoustic_network,
         acoustic_netmask: netmask,
@@ -1070,7 +1091,10 @@ fn run_router(
         gateway_mac,
         gateway_interface,
         eth_ip,
-        eth_mac: eth_mac.unwrap_or([0u8;6]),
+        eth_mac: eth_mac.unwrap_or_else(|| {
+            warn!("No MAC for Ethernet Provided!");
+            [0u8; 6]
+        }),
     };
 
     let mut router = Router::new(config);

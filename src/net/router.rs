@@ -207,7 +207,7 @@ pub struct RouterConfig {
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
-            acoustic_ip: "192.168.1.2".parse().unwrap(),
+            acoustic_ip: "192.168.1.1".parse().unwrap(),
             acoustic_mac: 2,
             wifi_ip: "192.168.2.1".parse().unwrap(),
             wifi_mac: [0x00, 0x00, 0x00, 0x00, 0x00, 0x02],
@@ -524,19 +524,11 @@ impl Router {
             self.config.wifi_ip, self.config.wifi_interface
         );
 
-        // Open WiFi capture
+        // Open WiFi device
         let wifi_device = crate::net::pcap_utils::get_device_by_name(
             &self.config.wifi_interface,
         )
         .map_err(|e| format!("Failed to get WiFi device: {}", e))?;
-
-        let mut wifi_capture = crate::net::pcap_utils::open_capture(wifi_device)
-            .map_err(|e| format!("Failed to open WiFi capture: {}", e))?;
-
-        // Set filter to only capture IP packets
-        wifi_capture
-            .filter("icmp", true)
-            .map_err(|e| format!("Failed to set filter: {}", e))?;
 
         // Create acoustic interface
         let mut acoustic_interface = AcousticInterface::new(
@@ -575,6 +567,15 @@ impl Router {
         let router_wifi = self.clone();
         let running = self.running.clone();
         let wifi_to_router = to_router_tx.clone();
+
+        let mut wifi_capture = crate::net::pcap_utils::open_capture(wifi_device.clone())
+            .map_err(|e| format!("Failed to open WiFi capture: {}", e))?;
+
+        // Set filter to only capture IP packets
+        wifi_capture
+            .filter("icmp", true)
+            .map_err(|e| format!("Failed to set filter: {}", e))?;
+
         let wifi_rx_handle = thread::spawn(move || {
             while running.lock().unwrap().load(Ordering::SeqCst) {
                 // 1. Read from WiFi (with timeout)
@@ -605,12 +606,19 @@ impl Router {
                         warn!("WiFi capture error: {}", e);
                     }
                 }
+            }
+        });
 
+        let running = self.running.clone();
+        let mut wifi_capture = crate::net::pcap_utils::open_capture(wifi_device)
+            .map_err(|e| format!("Failed to open WiFi capture: {}", e))?;
+        let wifi_tx_handle = thread::spawn(move || {
+            while running.lock().unwrap().load(Ordering::SeqCst) {
                 // 2. Send to WiFi
                 while let Ok(frame) = to_wifi_rx.try_recv() {
-                    info!("Gateway sent");
+                    info!("WiFi sent");
                     if let Err(e) = wifi_capture.sendpacket(frame) {
-                        warn!("Failed to send packet to Ethernet: {}", e);
+                        warn!("Failed to send packet to WiFi: {}", e);
                     }
                 }
             }
@@ -739,6 +747,9 @@ impl Router {
 
         // Wait for threads to finish
         if let Err(e) = wifi_rx_handle.join() {
+            warn!("WiFi RX thread panicked: {:?}", e);
+        }
+        if let Err(e) = wifi_tx_handle.join() {
             warn!("WiFi RX thread panicked: {:?}", e);
         }
         if let Some(handle) = gateway_tx_handle {

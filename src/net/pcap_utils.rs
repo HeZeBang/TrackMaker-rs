@@ -31,7 +31,7 @@ pub fn get_default_device() -> Result<Device, Box<dyn Error>> {
 // Open a capture on a device
 pub fn open_capture(device: Device) -> Result<Capture<Active>, Box<dyn Error>> {
     let mut cap = Capture::from_device(device)?
-        .promisc(false) // Promiscuous mode: capture all packets on the network
+        .promisc(true) // Promiscuous mode: capture all packets on the network
         .snaplen(65535) // Maximum packet size to capture
         .immediate_mode(true)
         .timeout(10) // 10ms timeout
