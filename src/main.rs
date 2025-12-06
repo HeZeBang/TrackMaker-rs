@@ -163,6 +163,18 @@ enum Commands {
         #[arg(long)]
         eth_mac: Option<String>,
 
+        /// TUN interface name
+        #[arg(long, default_value = "tun0")]
+        tun_name: String,
+
+        /// TUN interface IP
+        #[arg(long, default_value = "10.0.0.1")]
+        tun_ip: String,
+
+        /// TUN interface Netmask
+        #[arg(long, default_value = "255.255.255.0")]
+        tun_netmask: String,
+
         /// Line coding scheme (4b5b or manchester)
         #[arg(long, default_value = "4b5b")]
         encoding: String,
@@ -250,6 +262,9 @@ fn main() {
                     gateway_interface,
                     eth_ip,
                     eth_mac,
+                    tun_name,
+                    tun_ip,
+                    tun_netmask,
                     encoding,
                 } => {
                     // Router Mode
@@ -267,6 +282,9 @@ fn main() {
                         gateway_ip,
                         gateway_mac,
                         gateway_interface,
+                        tun_name,
+                        tun_ip,
+                        tun_netmask,
                         line_coding,
                     );
                     return;
@@ -932,6 +950,9 @@ fn run_router(
     gateway_ip_str: String,
     gateway_mac_str: Option<String>,
     gateway_interface: String,
+    tun_name: String,
+    tun_ip_str: String,
+    tun_netmask_str: String,
     line_coding: LineCodingKind,
 ) {
     use crate::net::router::{Router, RouterConfig};
@@ -957,6 +978,12 @@ fn run_router(
     let eth_ip: Ipv4Addr = eth_ip
         .parse()
         .expect("Invalid Ethernet IP");
+    let tun_ip: Ipv4Addr = tun_ip_str
+        .parse()
+        .expect("Invalid TUN IP");
+    let tun_netmask: Ipv4Addr = tun_netmask_str
+        .parse()
+        .expect("Invalid TUN Netmask");
 
     // Parse NODE3 MAC if provided
     let node3_mac: Option<[u8; 6]> = node3_mac_str.map(|s| {
@@ -1095,6 +1122,9 @@ fn run_router(
             warn!("No MAC for Ethernet Provided!");
             [0u8; 6]
         }),
+        tun_name,
+        tun_ip,
+        tun_netmask,
     };
 
     let mut router = Router::new(config);

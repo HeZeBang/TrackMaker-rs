@@ -3,7 +3,10 @@
 //! This module implements a simple static router that forwards IP packets
 //! between an acoustic interface (to NODE1) and a WiFi interface (to NODE3).
 
-use etherparse::{Ipv4HeaderSlice, PacketBuilder};
+use etherparse::{
+    ArpHardwareId, ArpOperation, ArpPacket, EtherType, Icmpv4Header, Icmpv4Type, IpNumber,
+    Ipv4Header, Ipv4HeaderSlice, PacketBuilder,
+};
 use pcap::{Active, Capture, Device, Linktype};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
@@ -29,6 +32,8 @@ pub enum InterfaceType {
     WiFi,
     /// Other
     Ethernet,
+    /// Virtual TUN interface
+    Tun,
 }
 
 /// A directly connected network
@@ -202,6 +207,12 @@ pub struct RouterConfig {
     pub gateway_mac: Option<[u8; 6]>,
     /// Ethernet Gateway Interface
     pub gateway_interface: String,
+    /// TUN interface name
+    pub tun_name: String,
+    /// TUN interface IP
+    pub tun_ip: Ipv4Addr,
+    /// TUN interface Netmask
+    pub tun_netmask: Ipv4Addr,
 }
 
 impl Default for RouterConfig {
@@ -227,6 +238,9 @@ impl Default for RouterConfig {
             gateway_interface: "eth0".to_string(),
             eth_ip: "10.20.0.1".parse().unwrap(),
             eth_mac: [0x9c, 0x29, 0x76, 0x0c, 0x49, 0x00],
+            tun_name: "tun0".to_string(),
+            tun_ip: "10.0.0.1".parse().unwrap(),
+            tun_netmask: "255.255.255.0".parse().unwrap(),
         }
     }
 }
@@ -288,6 +302,19 @@ impl Router {
             config.wifi_network,
             config.wifi_netmask,
             InterfaceType::WiFi,
+        );
+
+        // Calculate TUN network
+        let tun_net_octets = [
+            config.tun_ip.octets()[0] & config.tun_netmask.octets()[0],
+            config.tun_ip.octets()[1] & config.tun_netmask.octets()[1],
+            config.tun_ip.octets()[2] & config.tun_netmask.octets()[2],
+            config.tun_ip.octets()[3] & config.tun_netmask.octets()[3],
+        ];
+        routing_table.add_direct_network(
+            Ipv4Addr::from(tun_net_octets),
+            config.tun_netmask,
+            InterfaceType::Tun,
         );
 
         Self {
@@ -412,6 +439,59 @@ impl Router {
         );
     }
 
+    /// Process packet using etherparse (decrement TTL, rebuild checksums)
+    fn process_packet_with_etherparse(packet_data: &[u8]) -> Result<Vec<u8>, String> {
+        let (mut ip_header, payload) = Ipv4Header::from_slice(packet_data)
+            .map_err(|e| format!("Invalid IPv4 header: {}", e))?;
+
+        if ip_header.time_to_live <= 1 {
+            return Err("TTL expired".to_string());
+        }
+        ip_header.time_to_live -= 1;
+
+        if ip_header.protocol == IpNumber::ICMP {
+            // Try to parse as ICMP
+            if let Ok((icmp_header, icmp_payload)) = Icmpv4Header::from_slice(payload) {
+                // If it is Echo Reply or Request, we can use PacketBuilder to be safe and "create an icmp"
+                if let Icmpv4Type::EchoReply(echo) = icmp_header.icmp_type {
+                    let builder = PacketBuilder::ipv4(
+                        ip_header.source,
+                        ip_header.destination,
+                        ip_header.time_to_live,
+                    )
+                    .icmpv4_echo_reply(echo.id, echo.seq);
+
+                    let mut result = Vec::with_capacity(builder.size(icmp_payload.len()));
+                    builder
+                        .write(&mut result, icmp_payload)
+                        .map_err(|e| format!("Failed to build ICMP packet: {}", e))?;
+                    return Ok(result);
+                } else if let Icmpv4Type::EchoRequest(echo) = icmp_header.icmp_type {
+                    let builder = PacketBuilder::ipv4(
+                        ip_header.source,
+                        ip_header.destination,
+                        ip_header.time_to_live,
+                    )
+                    .icmpv4_echo_request(echo.id, echo.seq);
+
+                    let mut result = Vec::with_capacity(builder.size(icmp_payload.len()));
+                    builder
+                        .write(&mut result, icmp_payload)
+                        .map_err(|e| format!("Failed to build ICMP packet: {}", e))?;
+                    return Ok(result);
+                }
+            }
+        }
+
+        // Fallback for non-ICMP or other ICMP types: just rewrite IP header
+        let mut result = Vec::with_capacity(packet_data.len());
+        ip_header
+            .write(&mut result)
+            .map_err(|e| format!("Failed to write IP header: {}", e))?;
+        result.extend_from_slice(payload);
+        Ok(result)
+    }
+
     /// Prepare a packet for Acoustic interface
     /// Returns (ip_packet, dest_mac)
     fn prepare_acoustic_packet(
@@ -433,6 +513,43 @@ impl Router {
         );
 
         Ok((ip_packet, dest_mac[5]))
+    }
+
+    fn prepare_arp_request(
+        &self,
+        source_mac: [u8; 6],
+        source_ip: Ipv4Addr,
+        target_ip: Ipv4Addr,
+    ) -> Vec<u8> {
+        // 2. 构造 ARP 请求帧
+        let target_mac = [0xff; 6];  // broadcast
+
+        let sender_ip = Ipv4Addr::new(10,42,0,1);  // 改成你的 IP
+        let target_ip = Ipv4Addr::new(10,42,0,2);     // 想查询的 IP
+
+        // 使用 PacketBuilder 构造 Ethernet + ARP 帧
+        let builder = PacketBuilder::
+        ethernet2(source_mac,
+                target_mac)
+        .arp(ArpPacket::new(
+            ArpHardwareId::ETHERNET,
+            EtherType::IPV4,
+            ArpOperation::REQUEST,
+            &source_mac, // sender_hw_addr
+            &sender_ip.octets(),     // sender_protocol_addr
+            &[0u8; 6], // target_hw_addr
+            &target_ip.octets()        // target_protocol_addr
+        ).unwrap());
+
+        // get some memory to store the result
+        let mut result = Vec::<u8>::with_capacity(builder.size());
+
+        // serialize
+        builder.write(&mut result).unwrap();
+
+        debug!("Built ARP request, len = {}", result.len());
+
+        result
     }
 
     /// Handle inbound NAT and forward to acoustic interface
@@ -551,6 +668,22 @@ impl Router {
             None
         };
 
+        // Create TUN interface
+        let mut tun_config = tun::Configuration::default();
+        tun_config
+            .address(self.config.tun_ip)
+            .netmask(self.config.tun_netmask)
+            .destination(self.config.tun_ip)
+            .tun_name(&self.config.tun_name)
+            .up();
+
+        #[cfg(target_os = "linux")]
+        tun_config.platform_config(|config| {
+            config.packet_information(false);
+        });
+
+        let tun_device = tun::create(&tun_config).map_err(|e| format!("Failed to create TUN device: {}", e))?;
+
         info!("Router is running. Press Ctrl+C to stop.");
 
         // Channels for inter-thread communication
@@ -558,8 +691,47 @@ impl Router {
             crossbeam_channel::unbounded::<(Vec<u8>, u8)>();
         let (to_wifi_tx, to_wifi_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
         let (to_eth_tx, to_eth_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (to_tun_tx, to_tun_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
         let (to_router_tx, to_router_rx) =
             crossbeam_channel::unbounded::<(Vec<u8>, InterfaceType)>();
+
+        // Spawn TUN Threads
+        let tun_to_router = to_router_tx.clone();
+        let running = self.running.clone();
+        
+        // Split TUN device
+        let (mut tun_reader, mut tun_writer) = tun_device.split();
+
+        let tun_rx_handle = thread::spawn(move || {
+            let mut buf = [0u8; 1504];
+            while running.lock().unwrap().load(Ordering::SeqCst) {
+                match std::io::Read::read(&mut tun_reader, &mut buf) {
+                    Ok(n) => {
+                        if n > 0 {
+                            let packet = buf[..n].to_vec();
+                            tun_to_router.send((packet, InterfaceType::Tun)).unwrap();
+                        }
+                    }
+                    Err(e) => {
+                        // warn!("TUN read error: {}", e);
+                        // thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        });
+
+        let running = self.running.clone();
+        let tun_tx_handle = thread::spawn(move || {
+             while running.lock().unwrap().load(Ordering::SeqCst) {
+                while let Ok(packet) = to_tun_rx.try_recv() {
+                    info!("Writing packet to TUN device (len={})", packet.len());
+                    if let Err(e) = std::io::Write::write_all(&mut tun_writer, &packet) {
+                        warn!("Failed to write to TUN: {}", e);
+                    }
+                }
+                thread::sleep(Duration::from_millis(1));
+             }
+        });
 
         // WiFi Hotspot RX
         
@@ -731,6 +903,7 @@ impl Router {
                             &to_acoustic_tx,
                             &to_wifi_tx,
                             &to_eth_tx,
+                            &to_tun_tx,
                             ip_packet,
                             src_interface,
                         );
@@ -762,6 +935,12 @@ impl Router {
                 warn!("Ethernet RX thread panicked: {:?}", e);
             }
         }
+        if let Err(e) = tun_rx_handle.join() {
+            warn!("TUN RX thread panicked: {:?}", e);
+        }
+        if let Err(e) = tun_tx_handle.join() {
+            warn!("TUN TX thread panicked: {:?}", e);
+        }
         if let Err(e) = acoustic_handle.join() {
             warn!("Acoustic thread panicked: {:?}", e);
         }
@@ -778,6 +957,7 @@ impl Router {
         to_acoustic: &crossbeam_channel::Sender<(Vec<u8>, u8)>,
         to_wifi: &crossbeam_channel::Sender<Vec<u8>>,
         to_eth: &crossbeam_channel::Sender<Vec<u8>>,
+        to_tun: &crossbeam_channel::Sender<Vec<u8>>,
         ip_packet: Vec<u8>,
         src_interface: InterfaceType,
     ) {
@@ -818,13 +998,15 @@ impl Router {
                         };
                         continue 'router_loop;
                     } else {
-                        // Decrement TTL
-                        let mut packet = raw_data;
-                        if let Err(e) = Self::decrement_ttl(&mut packet) {
-                            warn!("TTL expired: {}", e);
-                            state = PacketState::Dropped { reason: format!("TTL expired: {}", e) };
-                            continue 'router_loop;
-                        }
+                        // Decrement TTL and rebuild packet
+                        let packet = match Self::process_packet_with_etherparse(&raw_data) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                warn!("Failed to process packet: {}", e);
+                                state = PacketState::Dropped { reason: e };
+                                continue 'router_loop;
+                            }
+                        };
 
                         state = PacketState::Routing {
                             src_ip,
@@ -937,12 +1119,17 @@ impl Router {
                                 mac
                             },
                             InterfaceType::Ethernet => self.config.eth_mac,
+                            InterfaceType::Tun => [0u8; 6],
                         },
-                        dst_mac: self.arp_table.get_mac(&new_dst_ip, new_iface).unwrap_or_else(|| {
-                            // TODO: arp request
-                            error!("No ARP entry for {}, using default MAC", new_dst_ip);
+                        dst_mac: if new_iface == InterfaceType::Tun {
                             [0u8; 6]
-                        }),
+                        } else {
+                            self.arp_table.get_mac(&new_dst_ip, new_iface).unwrap_or_else(|| {
+                                // TODO: arp request
+                                error!("No ARP entry for {}, using default MAC", new_dst_ip);
+                                [0u8; 6]
+                            })
+                        },
                     };
                     continue 'router_loop;
                 }
@@ -966,6 +1153,12 @@ impl Router {
                         InterfaceType::Ethernet => {
                             if let Err(e) = to_eth.send(self.build_ethernet_frame(src_mac, dst_mac, payload.as_slice())) {
                                 warn!("Failed to send packet to Ethernet thread: {}", e);
+                            }
+                        }
+                        InterfaceType::Tun => {
+                            info!("Routing packet to TUN (len={})", payload.len());
+                            if let Err(e) = to_tun.send(payload) {
+                                warn!("Failed to send packet to TUN thread: {}", e);
                             }
                         }
                     }
