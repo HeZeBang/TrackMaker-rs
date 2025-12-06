@@ -887,7 +887,7 @@ fn run_ip_host(local_ip_str: String) {
         info!("Sending Echo Reply to {} ({})", src_ip, dest_mac);
 
         if let Err(e) =
-            interface.send_packet(&reply_bytes, dest_mac, FrameType::Data)
+            interface.send_packet(&reply_bytes, dest_mac, FrameType::Ack)
         {
             error!("Failed to send reply: {}", e);
         }

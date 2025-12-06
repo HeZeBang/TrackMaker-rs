@@ -55,13 +55,7 @@ impl AcousticInterface {
         frame_type: FrameType,
     ) -> Result<(), String> {
         // Fragment the packet if it's too large
-        let packets_to_send = if let FrameType::Data = frame_type {
-            // Only fragment IP data packets
-            self.fragmenter.fragment_packet(data)?
-        } else {
-            // For ACK frames, send as-is
-            vec![data.to_vec()]
-        };
+        let packets_to_send = self.fragmenter.fragment_packet(data)?;
 
         // Send each fragment
         for packet_data in packets_to_send {
