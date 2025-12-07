@@ -159,6 +159,10 @@ enum Commands {
         #[arg(long)]
         eth_ip: String,
 
+        /// Ethernet Netmask
+        #[arg(long, default_value = "255.255.255.0")]
+        eth_netmask: String,
+
         /// Ethernet MAC address
         #[arg(long)]
         eth_mac: Option<String>,
@@ -261,6 +265,7 @@ fn main() {
                     gateway_mac,
                     gateway_interface,
                     eth_ip,
+                    eth_netmask,
                     eth_mac,
                     tun_name,
                     tun_ip,
@@ -278,6 +283,7 @@ fn main() {
                         node3_ip,
                         node3_mac,
                         eth_ip,
+                        eth_netmask,
                         eth_mac,
                         gateway_ip,
                         gateway_mac,
@@ -946,6 +952,7 @@ fn run_router(
     node3_ip_str: String,
     node3_mac_str: Option<String>,
     eth_ip: String,
+    eth_netmask_str: String,
     eth_mac_str: Option<String>,
     gateway_ip_str: String,
     gateway_mac_str: Option<String>,
@@ -978,6 +985,9 @@ fn run_router(
     let eth_ip: Ipv4Addr = eth_ip
         .parse()
         .expect("Invalid Ethernet IP");
+    let eth_netmask: Ipv4Addr = eth_netmask_str
+        .parse()
+        .expect("Invalid Ethernet Netmask");
     let tun_ip: Ipv4Addr = tun_ip_str
         .parse()
         .expect("Invalid TUN IP");
@@ -1118,6 +1128,7 @@ fn run_router(
         gateway_mac,
         gateway_interface,
         eth_ip,
+        eth_netmask,
         eth_mac: eth_mac.unwrap_or_else(|| {
             warn!("No MAC for Ethernet Provided!");
             [0u8; 6]

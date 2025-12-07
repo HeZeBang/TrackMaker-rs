@@ -199,6 +199,8 @@ pub struct RouterConfig {
     pub wifi_netmask: Ipv4Addr,
     /// Ethernet IP
     pub eth_ip: Ipv4Addr,
+    /// Ethernet Netmask
+    pub eth_netmask: Ipv4Addr,
     /// Ethernet Mac
     pub eth_mac: [u8; 6],
     /// Ethernet Gateway IP (e.g., 192.168.2.254)
@@ -241,6 +243,7 @@ impl Default for RouterConfig {
             gateway_mac: None,
             gateway_interface: "eth0".to_string(),
             eth_ip: "10.20.0.1".parse().unwrap(),
+            eth_netmask: "255.255.255.0".parse().unwrap(),
             eth_mac: [0x9c, 0x29, 0x76, 0x0c, 0x49, 0x00],
             tun_name: "tun0".to_string(),
             tun_ip: "10.0.0.1".parse().unwrap(),
@@ -308,6 +311,19 @@ impl Router {
             config.wifi_network,
             config.wifi_netmask,
             InterfaceType::WiFi,
+        );
+
+        // Add Ethernet network
+        let eth_net_octets = [
+            config.eth_ip.octets()[0] & config.eth_netmask.octets()[0],
+            config.eth_ip.octets()[1] & config.eth_netmask.octets()[1],
+            config.eth_ip.octets()[2] & config.eth_netmask.octets()[2],
+            config.eth_ip.octets()[3] & config.eth_netmask.octets()[3],
+        ];
+        routing_table.add_direct_network(
+            Ipv4Addr::from(eth_net_octets),
+            config.eth_netmask,
+            InterfaceType::Ethernet,
         );
 
         // Calculate TUN network
@@ -626,6 +642,7 @@ impl Router {
             "WiFi interface: {} on {}",
             self.config.wifi_ip, self.config.wifi_interface
         );
+        info!("Traversal Targets: NODE3={}, NODE1={}", self.config.node3_ip, self.config.node1_ip);
 
         // Open WiFi device
         let wifi_device = crate::net::pcap_utils::get_device_by_name(
@@ -1023,6 +1040,7 @@ impl Router {
                                              
                                              // Register DNAT session
                                              self.nat_table.register_dnat_session(icmp_packet.identifier);
+                                             info!("Traversal: Registered DNAT session for ID {}", icmp_packet.identifier);
 
                                              // Modify Destination IP
                                              let mut packet = raw_data.clone();
@@ -1121,6 +1139,7 @@ impl Router {
 
                     // Post-Routing (SNAT)
                     if new_iface == InterfaceType::Ethernet && protocol == etherparse::IpNumber::ICMP {
+                        debug!("Post-Routing: Ethernet ICMP packet");
                         // ICMP
                         // Parse ICMP
                         // We need to check if it is EchoRequest or EchoReply
@@ -1184,8 +1203,9 @@ impl Router {
                                     continue 'router_loop;
                                 }
                         } else if icmp_type == IcmpType::EchoReply {
+                             debug!("Checking SNAT for Echo Reply ID {}", icmp_id);
                              if self.nat_table.is_dnat_session(icmp_id) {
-                                 debug!("Traversal: Masquerading Echo Reply ID {} from {}", icmp_id, src_ip_from_header);
+                                 info!("Traversal: Masquerading Echo Reply ID {} from {}", icmp_id, src_ip_from_header);
                                  
                                  // Change Source IP to Router's External IP (eth_ip)
                                  let new_src_ip = self.config.eth_ip;
