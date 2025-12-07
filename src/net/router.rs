@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc::Sender};
 use std::thread;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::audio::recorder::AppShared;
 use crate::mac::acoustic_interface::AcousticInterface;
@@ -353,7 +353,7 @@ impl Router {
     }
 
     /// Parse Ethernet frame and extract IP packet
-    fn parse_ethernet_frame(frame: &[u8]) -> Option<(Vec<u8>, [u8; 6], [u8; 6])> {
+    fn parse_ethernet_frame(frame: &[u8]) -> Option<(Vec<u8>, [u8; 6], [u8; 6], u16)> {
         // TODO: use etherparse
         let eth = etherparse::Ethernet2HeaderSlice::from_slice(frame).ok()?;
         if frame.len() < 14 {
@@ -361,12 +361,12 @@ impl Router {
         }
 
         let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-        if ethertype != 0x0800 {
-            // Not IPv4
+        if ethertype != 0x0800 && ethertype != 0x0806 {
+            // Not IPv4 or ARP
             return None;
         }
 
-        Some((frame[14..].to_vec(), eth.source(), eth.destination()))
+        Some((frame[14..].to_vec(), eth.source(), eth.destination(), ethertype))
     }
 
     /// Decrement TTL and recalculate checksum
@@ -524,9 +524,6 @@ impl Router {
         // 2. 构造 ARP 请求帧
         let target_mac = [0xff; 6];  // broadcast
 
-        let sender_ip = Ipv4Addr::new(10,42,0,1);  // 改成你的 IP
-        let target_ip = Ipv4Addr::new(10,42,0,2);     // 想查询的 IP
-
         // 使用 PacketBuilder 构造 Ethernet + ARP 帧
         let builder = PacketBuilder::
         ethernet2(source_mac,
@@ -536,7 +533,7 @@ impl Router {
             EtherType::IPV4,
             ArpOperation::REQUEST,
             &source_mac, // sender_hw_addr
-            &sender_ip.octets(),     // sender_protocol_addr
+            &source_ip.octets(),     // sender_protocol_addr
             &[0u8; 6], // target_hw_addr
             &target_ip.octets()        // target_protocol_addr
         ).unwrap());
@@ -613,7 +610,7 @@ impl Router {
         }
 
         // If not handled by NAT, ignore (since it was addressed to us but not NATed)
-        debug!("Packet for router itself, ignoring (let host stack handle)");
+        trace!("Packet for router itself, ignoring (let host stack handle)");
     }
 
     /// Check if packet is for us (router itself)
@@ -713,8 +710,8 @@ impl Router {
                         }
                     }
                     Err(e) => {
-                        // warn!("TUN read error: {}", e);
-                        // thread::sleep(Duration::from_millis(100));
+                        warn!("TUN read error: {}", e);
+                        thread::sleep(Duration::from_millis(100));
                     }
                 }
             }
@@ -745,7 +742,7 @@ impl Router {
 
         // Set filter to only capture IP packets
         wifi_capture
-            .filter("icmp", true)
+            .filter("icmp or arp", true)
             .map_err(|e| format!("Failed to set filter: {}", e))?;
 
         let wifi_rx_handle = thread::spawn(move || {
@@ -753,11 +750,11 @@ impl Router {
                 // 1. Read from WiFi (with timeout)
                 match wifi_capture.next_packet() {
                     Ok(packet) => {
-                        if let Some((ip_packet, src_mac, dst_mac)) =
+                        if let Some((ip_packet, src_mac, dst_mac, _ethertype)) =
                             Self::parse_ethernet_frame(packet.data)
                         {
-                            if dst_mac == router_wifi.config.wifi_mac {
-                                info!(
+                            if dst_mac == router_wifi.config.wifi_mac || dst_mac == [0xff; 6] {
+                                debug!(
                                     "WiFi RX Packet for us from {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                                     src_mac[0],
                                     src_mac[1],
@@ -856,17 +853,17 @@ impl Router {
                 let eth_to_router = to_router_tx.clone();
                 let mut gateway_recv = crate::net::pcap_utils::open_capture(main_device)
                     .map_err(|e| format!("Failed to open Ethernet capture: {}", e))?;
-                gateway_recv.filter("icmp", true).unwrap();
+                gateway_recv.filter("icmp or arp", true).unwrap();
                 let running = self.running.clone();
                 gateway_rx_handle = Some(thread::spawn(move || {
                     while running.lock().unwrap().load(Ordering::SeqCst) {
                         match gateway_recv.next_packet() {
                             Ok(packet) => {
-                                if let Some((ip_packet, src_mac, dst_mac)) =
+                                if let Some((ip_packet, src_mac, dst_mac, _ethertype)) =
                                     Self::parse_ethernet_frame(packet.data)
                                 {
-                                    if dst_mac == network_router.config.eth_mac {
-                                        info!(
+                                    if dst_mac == network_router.config.eth_mac || dst_mac == [0xff; 6] {
+                                        trace!(
                                             "Ethernet RX Packet for us from {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                                             src_mac[0],
                                             src_mac[1],
@@ -892,7 +889,7 @@ impl Router {
         }
 
         // Main Router Loop
-        let router_main = self.clone();
+        let mut router_main = self.clone();
         let running = self.running.clone();
         let main_handle = thread::spawn(move || {
             while running.lock().unwrap().load(Ordering::SeqCst) {
@@ -953,7 +950,7 @@ impl Router {
     }
 
     fn handle_packet(
-        &self,
+        &mut self,
         to_acoustic: &crossbeam_channel::Sender<(Vec<u8>, u8)>,
         to_wifi: &crossbeam_channel::Sender<Vec<u8>>,
         to_eth: &crossbeam_channel::Sender<Vec<u8>>,
@@ -965,6 +962,29 @@ impl Router {
         'router_loop: loop {
             match state {
                 PacketState::Ingress { iface, raw_data } => {
+                    // Check if it's ARP (starts with 0x0001 for Ethernet HW type)
+                    if raw_data.len() >= 28 && raw_data[0] == 0x00 && raw_data[1] == 0x01 {
+                         // Manual ARP parsing
+                         let hw_type = u16::from_be_bytes([raw_data[0], raw_data[1]]);
+                         let proto_type = u16::from_be_bytes([raw_data[2], raw_data[3]]);
+                         let hw_len = raw_data[4];
+                         let proto_len = raw_data[5];
+                         let opcode = u16::from_be_bytes([raw_data[6], raw_data[7]]);
+
+                         if hw_type == 1 && proto_type == 0x0800 && hw_len == 6 && proto_len == 4 {
+                             if opcode == 2 { // Reply
+                                 let mut sender_mac = [0u8; 6];
+                                 sender_mac.copy_from_slice(&raw_data[8..14]);
+                                 let sender_ip = Ipv4Addr::new(raw_data[14], raw_data[15], raw_data[16], raw_data[17]);
+                                 
+                                 info!("ARP Reply: {} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", 
+                                     sender_ip, sender_mac[0], sender_mac[1], sender_mac[2], sender_mac[3], sender_mac[4], sender_mac[5]);
+                                 self.arp_table.update(sender_ip, sender_mac, iface);
+                             }
+                         }
+                         return;
+                    }
+
                     let (src_ip, dest_ip, protocol) = {
                         let ip_header = match Ipv4HeaderSlice::from_slice(&raw_data) {
                             Ok(h) => h,
@@ -991,7 +1011,7 @@ impl Router {
 
                     // Check if packet is for us (our IP / NAT response)
                     if self.is_for_us(&dest_ip) {
-                        debug!("Packet is for router");
+                        trace!("Packet is for router");
                         state = PacketState::LocalProcess {
                             src_ip,
                             packet: raw_data,
@@ -1108,6 +1128,48 @@ impl Router {
                         }
                     }
 
+                    let dst_mac_opt = if new_iface == InterfaceType::Tun {
+                        Some([0u8; 6])
+                    } else {
+                        self.arp_table.get_mac(&new_dst_ip, new_iface)
+                    };
+
+                    let dst_mac = match dst_mac_opt {
+                        Some(mac) => mac,
+                        None => {
+                             // Send ARP Request
+                             let src_mac = match new_iface {
+                                InterfaceType::WiFi => self.config.wifi_mac,
+                                InterfaceType::Ethernet => self.config.eth_mac,
+                                _ => [0u8; 6],
+                             };
+                             let src_ip = match new_iface {
+                                InterfaceType::WiFi => self.config.wifi_ip,
+                                InterfaceType::Ethernet => self.config.eth_ip,
+                                _ => Ipv4Addr::new(0,0,0,0),
+                             };
+
+                             if src_mac != [0u8; 6] {
+                                 let arp_req = self.prepare_arp_request(src_mac, src_ip, new_dst_ip);
+                                 match new_iface {
+                                     InterfaceType::WiFi => {
+                                         to_wifi.send(arp_req).unwrap();
+                                     }
+                                     InterfaceType::Ethernet => {
+                                         to_eth.send(arp_req).unwrap();
+                                     }
+                                     _ => {}
+                                 }
+                                 info!("Sent ARP Request for {}", new_dst_ip);
+                             } else {
+                                 error!("Cannot send ARP request: unknown source MAC/IP for interface {:?}", new_iface);
+                             }
+                             
+                             state = PacketState::Dropped { reason: format!("ARP Request sent for {}", new_dst_ip) };
+                             continue 'router_loop;
+                        }
+                    };
+
                     state = PacketState::Send {
                         out_interface: new_iface,
                         payload: packet,
@@ -1121,15 +1183,7 @@ impl Router {
                             InterfaceType::Ethernet => self.config.eth_mac,
                             InterfaceType::Tun => [0u8; 6],
                         },
-                        dst_mac: if new_iface == InterfaceType::Tun {
-                            [0u8; 6]
-                        } else {
-                            self.arp_table.get_mac(&new_dst_ip, new_iface).unwrap_or_else(|| {
-                                // TODO: arp request
-                                error!("No ARP entry for {}, using default MAC", new_dst_ip);
-                                [0u8; 6]
-                            })
-                        },
+                        dst_mac,
                     };
                     continue 'router_loop;
                 }
@@ -1139,6 +1193,7 @@ impl Router {
                     src_mac,
                     dst_mac,
                 } => {
+                    debug!("Sending to {:?}, len={}", out_interface, payload.len());
                     match out_interface {
                         InterfaceType::Acoustic => {
                             if let Err(e) = to_acoustic.send((payload, dst_mac[5])) {
