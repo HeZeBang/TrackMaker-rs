@@ -8,12 +8,15 @@ pub struct NatTable {
     /// Map from ICMP Identifier to Source IP
     /// We use the identifier to map replies back to the original sender
     icmp_map: Arc<Mutex<HashMap<u16, Ipv4Addr>>>,
+    /// Set of ICMP Identifiers for DNAT sessions (Traversal)
+    dnat_ids: Arc<Mutex<std::collections::HashSet<u16>>>,
 }
 
 impl NatTable {
     pub fn new() -> Self {
         Self {
             icmp_map: Arc::new(Mutex::new(HashMap::new())),
+            dnat_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -28,5 +31,17 @@ impl NatTable {
     pub fn translate_echo_reply(&self, identifier: u16) -> Option<Ipv4Addr> {
         let map = self.icmp_map.lock().unwrap();
         map.get(&identifier).copied()
+    }
+
+    /// Register a DNAT session (Traversal)
+    pub fn register_dnat_session(&self, identifier: u16) {
+        let mut set = self.dnat_ids.lock().unwrap();
+        set.insert(identifier);
+    }
+
+    /// Check if an identifier belongs to a DNAT session
+    pub fn is_dnat_session(&self, identifier: u16) -> bool {
+        let set = self.dnat_ids.lock().unwrap();
+        set.contains(&identifier)
     }
 }

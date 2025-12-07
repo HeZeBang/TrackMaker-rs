@@ -1125,6 +1125,8 @@ fn run_router(
         tun_name,
         tun_ip,
         tun_netmask,
+        node3_ip,
+        node1_ip: "192.168.1.2".parse().unwrap(),
     };
 
     let mut router = Router::new(config);

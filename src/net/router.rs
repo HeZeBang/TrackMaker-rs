@@ -213,6 +213,10 @@ pub struct RouterConfig {
     pub tun_ip: Ipv4Addr,
     /// TUN interface Netmask
     pub tun_netmask: Ipv4Addr,
+    /// NODE3 IP (for Traversal)
+    pub node3_ip: Ipv4Addr,
+    /// NODE1 IP (for Traversal)
+    pub node1_ip: Ipv4Addr,
 }
 
 impl Default for RouterConfig {
@@ -241,6 +245,8 @@ impl Default for RouterConfig {
             tun_name: "tun0".to_string(),
             tun_ip: "10.0.0.1".parse().unwrap(),
             tun_netmask: "255.255.255.0".parse().unwrap(),
+            node3_ip: "192.168.2.2".parse().unwrap(),
+            node1_ip: "192.168.1.2".parse().unwrap(),
         }
     }
 }
@@ -994,6 +1000,62 @@ impl Router {
 
                     // Check if packet is for us (our IP / NAT response)
                     if self.is_for_us(&dest_ip) {
+                        // Check for Traversal (DNAT)
+                        if protocol == etherparse::IpNumber::ICMP {
+                             // Parse ICMP
+                             let ihl = (raw_data[0] & 0x0F) as usize * 4;
+                             if let Ok(icmp_packet) = IcmpPacket::from_bytes(&raw_data[ihl..]) {
+                                 if icmp_packet.icmp_type == IcmpType::EchoRequest {
+                                     // Check payload
+                                     if icmp_packet.payload.len() > 16 {
+                                         let first_byte = icmp_packet.payload[16]; // Data first byte
+                                         info!("First byte: {:02x}", first_byte);
+                                         let target_ip = if first_byte == 0xaa {
+                                             Some(self.config.node3_ip)
+                                         } else if first_byte == 0xbb {
+                                             Some(self.config.node1_ip)
+                                         } else {
+                                             None
+                                         };
+
+                                         if let Some(new_dst) = target_ip {
+                                             info!("Traversal: Forwarding Echo Request (payload {:02x}) to {}", first_byte, new_dst);
+                                             
+                                             // Register DNAT session
+                                             self.nat_table.register_dnat_session(icmp_packet.identifier);
+
+                                             // Modify Destination IP
+                                             let mut packet = raw_data.clone();
+                                             let new_dst_octets = new_dst.octets();
+                                             packet[16] = new_dst_octets[0];
+                                             packet[17] = new_dst_octets[1];
+                                             packet[18] = new_dst_octets[2];
+                                             packet[19] = new_dst_octets[3];
+
+                                             // Recalculate IP Checksum
+                                             Self::recalculate_ip_checksum(&mut packet);
+
+                                             // Decrement TTL (since we are forwarding)
+                                             match Self::decrement_ttl(&mut packet) {
+                                                 Ok(_) => {
+                                                     state = PacketState::Routing {
+                                                         src_ip,
+                                                         dst_ip: new_dst,
+                                                         packet,
+                                                     };
+                                                     continue 'router_loop;
+                                                 }
+                                                 Err(e) => {
+                                                     state = PacketState::Dropped { reason: e.to_string() };
+                                                     continue 'router_loop;
+                                                 }
+                                             }
+                                         }
+                                     }
+                                 }
+                             }
+                        }
+
                         trace!("Packet is for router");
                         state = PacketState::LocalProcess {
                             src_ip,
@@ -1029,10 +1091,10 @@ impl Router {
                     }
                     return;
                 }
-                PacketState::Routing { src_ip: _, dst_ip, packet } => {
+                PacketState::Routing { src_ip: _, dst_ip, mut packet } => {
                     // Re-parse IP header for Routing state logic
-                    let ip_header = match Ipv4HeaderSlice::from_slice(&packet) {
-                        Ok(h) => h,
+                    let (protocol, ihl, src_ip_from_header) = match Ipv4HeaderSlice::from_slice(&packet) {
+                        Ok(h) => (h.protocol(), h.slice().len(), Ipv4Addr::from(h.source())),
                         Err(_) => {
                              state = PacketState::Dropped { reason: "Invalid IP header in Routing state".to_string() };
                              continue 'router_loop;
@@ -1058,19 +1120,23 @@ impl Router {
                     };
 
                     // Post-Routing (SNAT)
-                    if new_iface == InterfaceType::Ethernet && ip_header.protocol() == etherparse::IpNumber::ICMP {
+                    if new_iface == InterfaceType::Ethernet && protocol == etherparse::IpNumber::ICMP {
                         // ICMP
                         // Parse ICMP
-                        let ihl = ip_header.slice().len();
-                        if let Ok(icmp_packet) = IcmpPacket::from_bytes(&packet[ihl..]) {
-                            if icmp_packet.icmp_type == IcmpType::EchoRequest {
+                        // We need to check if it is EchoRequest or EchoReply
+                        let (icmp_type, icmp_id, icmp_seq) = if let Ok(icmp_packet) = IcmpPacket::from_bytes(&packet[ihl..]) {
+                             (icmp_packet.icmp_type, icmp_packet.identifier, icmp_packet.sequence_number)
+                        } else {
+                             (IcmpType::Unknown(0), 0, 0)
+                        };
+
+                        if icmp_type == IcmpType::EchoRequest {
                                 // Register in NAT table
-                                let src_ip = Ipv4Addr::from(ip_header.source());
                                 self.nat_table
-                                    .register_echo_request(icmp_packet.identifier, src_ip);
+                                    .register_echo_request(icmp_id, src_ip_from_header);
                                 debug!(
                                     "NAT: Registered Echo Request ID {} from {}",
-                                    icmp_packet.identifier, src_ip
+                                    icmp_id, src_ip_from_header
                                 );
 
                                 let new_src_ip = self.config.eth_ip;
@@ -1087,17 +1153,20 @@ impl Router {
                                         gateway_mac[5]
                                     );
 
+                                    // Extract payload
+                                    let payload = &packet[ihl + 8 ..];
+
                                     let builder =
                                         PacketBuilder::ipv4(new_src_ip.octets(), dst_ip.octets(), 60)
                                             .icmpv4_echo_request(
-                                                icmp_packet.identifier,
-                                                icmp_packet.sequence_number,
+                                                icmp_id,
+                                                icmp_seq,
                                             );
                                     let new_payload = {
                                         let mut frame = Vec::<u8>::with_capacity(
-                                            builder.size(icmp_packet.payload.len()),
+                                            builder.size(payload.len()),
                                         );
-                                        builder.write(&mut frame, &icmp_packet.payload).unwrap();
+                                        builder.write(&mut frame, payload).unwrap();
                                         frame
                                     };
 
@@ -1114,7 +1183,22 @@ impl Router {
                                     };
                                     continue 'router_loop;
                                 }
-                            }
+                        } else if icmp_type == IcmpType::EchoReply {
+                             if self.nat_table.is_dnat_session(icmp_id) {
+                                 debug!("Traversal: Masquerading Echo Reply ID {} from {}", icmp_id, src_ip_from_header);
+                                 
+                                 // Change Source IP to Router's External IP (eth_ip)
+                                 let new_src_ip = self.config.eth_ip;
+                                 let octets = new_src_ip.octets();
+                                 
+                                 // Mutate packet
+                                 packet[12] = octets[0];
+                                 packet[13] = octets[1];
+                                 packet[14] = octets[2];
+                                 packet[15] = octets[3];
+                                 
+                                 Self::recalculate_ip_checksum(&mut packet);
+                             }
                         }
                     }
 

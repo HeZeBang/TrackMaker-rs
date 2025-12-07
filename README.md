@@ -45,3 +45,9 @@ jackd
 ```bash
 jackd -dalsa -r48000 -p128 -Xraw -D -Chw:Device -Phw:Device
 ```
+
+## Disable ECHO
+
+```bash
+sysctl -w net.ipv4.icmp_echo_ignore_all=1
+```
