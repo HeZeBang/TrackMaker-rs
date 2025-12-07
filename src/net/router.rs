@@ -571,13 +571,13 @@ impl Router {
         result
     }
 
-    /// Handle inbound NAT and return packet for routing if translated
+    /// Handle inbound NAT. If translated, modifies packet in-place and returns original destination IP.
     fn handle_inbound_nat(
         &self,
-        mut ip_packet: Vec<u8>,
-    ) -> Option<(Vec<u8>, Ipv4Addr)> {
+        ip_packet: &mut Vec<u8>,
+    ) -> Option<Ipv4Addr> {
         // Check if it's ICMP
-        let ip_header = match Ipv4HeaderSlice::from_slice(&ip_packet) {
+        let ip_header = match Ipv4HeaderSlice::from_slice(ip_packet) {
             Ok(h) => h,
             Err(_) => return None,
         };
@@ -605,9 +605,9 @@ impl Router {
                         ip_packet[19] = original_ip_octets[3];
 
                         // Recalculate IP Checksum
-                        Self::recalculate_ip_checksum(&mut ip_packet);
+                        Self::recalculate_ip_checksum(ip_packet);
 
-                        return Some((ip_packet, original_ip));
+                        return Some(original_ip);
                     }
                 }
             }
@@ -968,6 +968,9 @@ impl Router {
         'router_loop: loop {
             match state {
                 PacketState::Ingress { iface, raw_data } => {
+                    if iface == InterfaceType::Acoustic  {
+                        to_tun.send(raw_data.clone()).unwrap();
+                    }
                     // Check if it's ARP (starts with 0x0001 for Ethernet HW type)
                     if raw_data.len() >= 28 && raw_data[0] == 0x00 && raw_data[1] == 0x01 {
                          // Manual ARP parsing
@@ -1098,15 +1101,34 @@ impl Router {
                         };
                     }
                 }
-                PacketState::LocalProcess { src_ip, packet } => {
-                    if let Some((new_packet, new_dest_ip)) = self.handle_inbound_nat(packet) {
+                PacketState::LocalProcess { src_ip, mut packet } => {
+                    if let Some(new_dest_ip) = self.handle_inbound_nat(&mut packet) {
                         state = PacketState::Routing {
                             src_ip,
                             dst_ip: new_dest_ip,
-                            packet: new_packet,
+                            packet,
                         };
                         continue 'router_loop;
                     }
+
+                    // If not NAT, check if it is for Acoustic IP (which means it should go to TUN)
+                    let is_acoustic_dest = if let Ok(h) = Ipv4HeaderSlice::from_slice(&packet) {
+                        h.destination_addr() == self.config.acoustic_ip
+                    } else {
+                        false
+                    };
+
+                    if is_acoustic_dest {
+                        // Forward to TUN
+                        state = PacketState::Send {
+                            out_interface: InterfaceType::Tun,
+                            payload: packet,
+                            src_mac: [0u8; 6],
+                            dst_mac: [0u8; 6],
+                        };
+                        continue 'router_loop;
+                    }
+
                     return;
                 }
                 PacketState::Routing { src_ip: _, dst_ip, mut packet } => {
@@ -1290,8 +1312,11 @@ impl Router {
                     debug!("Sending to {:?}, len={}", out_interface, payload.len());
                     match out_interface {
                         InterfaceType::Acoustic => {
-                            if let Err(e) = to_acoustic.send((payload, dst_mac[5])) {
+                            if let Err(e) = to_acoustic.send((payload.clone(), dst_mac[5])) {
                                 warn!("Failed to send packet to Acoustic thread: {}", e);
+                            }
+                            if let Err(e) = to_tun.send(payload) {
+                                warn!("Failed to send packet to TUN thread: {}", e);
                             }
                         }
                         InterfaceType::WiFi => {
