@@ -549,16 +549,15 @@ impl Router {
         result
     }
 
-    /// Handle inbound NAT and forward to acoustic interface
+    /// Handle inbound NAT and return packet for routing if translated
     fn handle_inbound_nat(
         &self,
-        to_acoustic: &crossbeam_channel::Sender<(Vec<u8>, u8)>,
         mut ip_packet: Vec<u8>,
-    ) {
+    ) -> Option<(Vec<u8>, Ipv4Addr)> {
         // Check if it's ICMP
         let ip_header = match Ipv4HeaderSlice::from_slice(&ip_packet) {
             Ok(h) => h,
-            Err(_) => return,
+            Err(_) => return None,
         };
 
         if ip_header.protocol() == etherparse::IpNumber::ICMP {
@@ -586,24 +585,7 @@ impl Router {
                         // Recalculate IP Checksum
                         Self::recalculate_ip_checksum(&mut ip_packet);
 
-                        // Forward to Acoustic Interface
-                        match self
-                            .prepare_acoustic_packet(ip_packet, original_ip)
-                        {
-                            Ok(msg) => {
-                                if let Err(e) = to_acoustic.send(msg) {
-                                    warn!(
-                                        "Failed to send NAT reply to Acoustic thread: {}",
-                                        e
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to prepare NAT reply: {}", e);
-                                self.stop();
-                            }
-                        }
-                        return;
+                        return Some((ip_packet, original_ip));
                     }
                 }
             }
@@ -611,6 +593,7 @@ impl Router {
 
         // If not handled by NAT, ignore (since it was addressed to us but not NATed)
         trace!("Packet for router itself, ignoring (let host stack handle)");
+        None
     }
 
     /// Check if packet is for us (router itself)
@@ -1035,8 +1018,15 @@ impl Router {
                         };
                     }
                 }
-                PacketState::LocalProcess { src_ip: _, packet } => {
-                    self.handle_inbound_nat(to_acoustic, packet);
+                PacketState::LocalProcess { src_ip, packet } => {
+                    if let Some((new_packet, new_dest_ip)) = self.handle_inbound_nat(packet) {
+                        state = PacketState::Routing {
+                            src_ip,
+                            dst_ip: new_dest_ip,
+                            packet: new_packet,
+                        };
+                        continue 'router_loop;
+                    }
                     return;
                 }
                 PacketState::Routing { src_ip: _, dst_ip, packet } => {
