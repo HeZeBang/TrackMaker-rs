@@ -65,7 +65,7 @@ export GTW_IP=$(ip route show default dev $ETH_IF | awk '{print $3}')
 export GTW_MAC=$(ip neigh show $GTW_IP dev $ETH_IF | awk '{print $3}')
 echo "Device: Eth/Gtw - $ETH_IF, Hotspot - $WLAN_IF\nHotspot:\t$WLAN_IP\t($WLAN_MAC)\nEthernet:\t$ETH_IP\t($ETH_MAC)\nGateway:\t$GTW_IP\t($GTW_MAC)"
 
-PIPEWIRE_QUANTUM=128/48000 pw-jack ./target/debug/trackmaker-rs router --wifi-interface $WLAN_IF --wifi-ip $WLAN_IP --wifi-mac $WLAN_MAC --node3-ip 10.42.0.2 --gateway-ip $GTW_IP --gateway-mac $GTW_MAC --gateway-interface $ETH_IF --eth-ip $ETH_IP --eth-mac $GTW_MAC --tun-ip 10.0.0.1 --tun-name tun0
+PIPEWIRE_QUANTUM=128/48000 pw-jack ./target/debug/trackmaker-rs router --wifi-interface $WLAN_IF --wifi-ip $WLAN_IP --wifi-mac $WLAN_MAC --node3-ip 10.42.0.2 --gateway-ip $GTW_IP --gateway-mac $GTW_MAC --gateway-interface $ETH_IF --eth-ip $ETH_IP --eth-mac $ETH_MAC --tun-ip 10.0.0.1 --tun-name tun0
 ```
 
 ---

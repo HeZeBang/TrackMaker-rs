@@ -846,7 +846,7 @@ impl Router {
                 gateway_tx_handle = Some(thread::spawn(move || {
                     while running.lock().unwrap().load(Ordering::SeqCst) {
                         while let Ok(frame) = to_eth_rx.try_recv() {
-                            info!("Gateway sent");
+                            // info!("Gateway sent");
                             if let Err(e) = gateway_send.sendpacket(frame) {
                                 warn!("Failed to send packet to Ethernet: {}", e);
                             }
@@ -868,6 +868,10 @@ impl Router {
                                 if let Some((ip_packet, src_mac, dst_mac, _ethertype)) =
                                     Self::parse_ethernet_frame(packet.data)
                                 {
+                                    if src_mac == network_router.config.eth_mac {
+                                        // Ignore packets sent by ourselves
+                                        continue;
+                                    }
                                     if dst_mac == network_router.config.eth_mac || dst_mac == [0xff; 6] {
                                         trace!(
                                             "Ethernet RX Packet for us from {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
