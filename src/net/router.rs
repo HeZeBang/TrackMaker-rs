@@ -1339,7 +1339,7 @@ impl Router {
                     return;
                 }
                 PacketState::Dropped { reason } => {
-                    warn!("Packet dropped: {}", reason);
+                    debug!("Packet dropped: {}", reason);
                     return;
                 }
             }

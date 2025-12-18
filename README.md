@@ -51,3 +51,30 @@ jackd -dalsa -r48000 -p128 -Xraw -D -Chw:Device -Phw:Device
 ```bash
 sysctl -w net.ipv4.icmp_echo_ignore_all=1
 ```
+
+## Project 3
+
+```bash
+export WLAN_IF="wlan0"
+export ETH_IF="wlp0s20f3"
+export WLAN_IP=$(ip -4 addr show dev $WLAN_IF | awk '/inet /{print $2}' | cut -d/ -f1)
+export WLAN_MAC=$(ip link show dev $WLAN_IF | awk '/link\/ether/{print $2}')
+export ETH_IP=$(ip -4 addr show dev $ETH_IF | awk '/inet /{print $2}' | cut -d/ -f1)
+export ETH_MAC=$(ip link show dev $ETH_IF | awk '/link\/ether/{print $2}')
+export GTW_IP=$(ip route show default dev $ETH_IF | awk '{print $3}')
+export GTW_MAC=$(ip neigh show $GTW_IP dev $ETH_IF | awk '{print $3}')
+echo "Device: Eth/Gtw - $ETH_IF, Hotspot - $WLAN_IF\nHotspot:\t$WLAN_IP\t($WLAN_MAC)\nEthernet:\t$ETH_IP\t($ETH_MAC)\nGateway:\t$GTW_IP\t($GTW_MAC)"
+
+PIPEWIRE_QUANTUM=128/48000 pw-jack ./target/debug/trackmaker-rs router --wifi-interface $WLAN_IF --wifi-ip $WLAN_IP --wifi-mac $WLAN_MAC --node3-ip 10.42.0.2 --gateway-ip $GTW_IP --gateway-mac $GTW_MAC --gateway-interface $ETH_IF --eth-ip $ETH_IP --eth-mac $GTW_MAC --tun-ip 10.0.0.1 --tun-name tun0
+```
+
+---
+
+```bash
+PIPEWIRE_QUANTUM=128/48000 pw-jack ./target/debug/trackmaker-rs router --wifi-interface wlan0 --wifi-ip 10.42.0.1 --wifi-mac 6c:1f:f7:7b:d2:02 --node3-ip 10.42.0.2 --gateway-ip 10.20.100.1 --gateway-mac 00:00:5e:00:01:01 --gateway-interface wlp0s20f3 --eth-ip 10.20.239.6 --eth-mac 9c:29:76:0c:49:00 --tun-ip 10.0.0.1 --tun-name tun0
+```
+
+- `wifi-interface`: Device Name for WLAN Hotspot (Not for ethernet)
+- `wifi-ip`, `wifi-mac`
+- `node3-ip`: IP Address for Node3
+- `node3-mac`(Optional): Mac for Node3
