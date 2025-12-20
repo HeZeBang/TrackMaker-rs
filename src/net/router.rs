@@ -35,6 +35,14 @@ pub enum InterfaceType {
     Tun,
 }
 
+/// Packet waiting for ARP resolution
+#[derive(Debug, Clone)]
+struct PendingPacket {
+    interface: InterfaceType,
+    packet: Vec<u8>,
+    src_mac: [u8; 6],
+}
+
 /// A directly connected network
 #[derive(Debug, Clone)]
 pub struct DirectNetwork {
@@ -285,6 +293,8 @@ pub struct Router {
     routing_table: Arc<RwLock<RoutingTable>>,
     arp_table: Arc<RwLock<ArpTable>>,
     nat_table: Arc<RwLock<NatTable>>,
+    // Buffer for packets awaiting ARP resolution
+    pending_packets: Arc<RwLock<HashMap<Ipv4Addr, Vec<PendingPacket>>>>,
     running: Arc<Mutex<AtomicBool>>,
 }
 
@@ -361,6 +371,7 @@ impl Router {
             routing_table: Arc::new(RwLock::new(routing_table)),
             arp_table: Arc::new(RwLock::new(ArpTable::new())),
             nat_table: Arc::new(RwLock::new(NatTable::new())),
+            pending_packets: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(Mutex::new(AtomicBool::new(false))),
         }
     }
@@ -1130,6 +1141,70 @@ impl Router {
                                 if let Ok(mut table) = self.arp_table.write() {
                                     table.update(sender_ip, sender_mac, iface);
                                 }
+
+                                // Check for pending packets (packets that were waiting for this ARP reply)
+                                let buffered = if let Ok(mut pending) =
+                                    self.pending_packets.write()
+                                {
+                                    pending.remove(&sender_ip)
+                                } else {
+                                    None
+                                };
+
+                                if let Some(packets) = buffered {
+                                    info!(
+                                        "ARP Resolved for {}. Sending {} buffered packets.",
+                                        sender_ip,
+                                        packets.len()
+                                    );
+                                    for pkt in packets {
+                                        match pkt.interface {
+                                            InterfaceType::WiFi => {
+                                                let frame = self
+                                                    .build_ethernet_frame(
+                                                        pkt.src_mac,
+                                                        sender_mac,
+                                                        &pkt.packet,
+                                                    );
+                                                if let Err(e) =
+                                                    to_wifi.send(frame)
+                                                {
+                                                    warn!(
+                                                        "Failed to send buffered WiFi packet: {}",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                            InterfaceType::Ethernet => {
+                                                let frame = self
+                                                    .build_ethernet_frame(
+                                                        pkt.src_mac,
+                                                        sender_mac,
+                                                        &pkt.packet,
+                                                    );
+                                                if let Err(e) =
+                                                    to_eth.send(frame)
+                                                {
+                                                    warn!(
+                                                        "Failed to send buffered Ethernet packet: {}",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                            InterfaceType::Acoustic => {
+                                                if let Err(e) = to_acoustic.send(
+                                                    (pkt.packet, sender_mac[5]),
+                                                ) {
+                                                    warn!(
+                                                        "Failed to send buffered Acoustic packet: {}",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
                             }
                         }
                         return;
@@ -1478,32 +1553,81 @@ impl Router {
                     let dst_mac = match dst_mac_opt {
                         Some(mac) => mac,
                         None => {
-                            // Send ARP Request
-                            let src_mac = match new_iface {
-                                InterfaceType::WiFi => self.config.wifi_mac,
-                                InterfaceType::Ethernet => self.config.eth_mac,
-                                _ => [0u8; 6],
-                            };
-                            let src_ip = match new_iface {
-                                InterfaceType::WiFi => self.config.wifi_ip,
-                                InterfaceType::Ethernet => self.config.eth_ip,
-                                _ => Ipv4Addr::new(0, 0, 0, 0),
+                            // Determine Source MAC/IP for ARP request
+                            let (src_mac, src_ip) = match new_iface {
+                                InterfaceType::WiFi => {
+                                    (self.config.wifi_mac, self.config.wifi_ip)
+                                }
+                                InterfaceType::Ethernet => {
+                                    (self.config.eth_mac, self.config.eth_ip)
+                                }
+                                InterfaceType::Acoustic => {
+                                    let mut mac = [0u8; 6];
+                                    mac[5] = self.config.acoustic_mac;
+                                    (mac, self.config.acoustic_ip)
+                                }
+                                _ => ([0u8; 6], Ipv4Addr::new(0, 0, 0, 0)),
                             };
 
                             if src_mac != [0u8; 6] {
-                                let arp_req = self.prepare_arp_request(
-                                    src_mac, src_ip, new_dst_ip,
-                                );
-                                match new_iface {
-                                    InterfaceType::WiFi => {
-                                        to_wifi.send(arp_req).unwrap();
+                                // 1. Buffer packet waiting for ARP
+                                // We need to clone the packet because we are moving it into the buffer
+                                // and `packet` variable is needed if we were to continue (but here we return).
+                                // Actually, we can just move `packet` into the PendingPacket.
+                                let pending_pkt = PendingPacket {
+                                    interface: new_iface,
+                                    packet: packet, // Move packet
+                                    src_mac: src_mac,
+                                };
+
+                                let should_send_arp = if let Ok(mut pending) =
+                                    self.pending_packets.write()
+                                {
+                                    let queue = pending
+                                        .entry(new_dst_ip)
+                                        .or_default();
+                                    queue.push(pending_pkt);
+                                    queue.len() == 1 // Only send ARP if this is the first packet in queue to avoid ARP storm
+                                } else {
+                                    false
+                                };
+
+                                // 2. Send ARP Request if needed
+                                if should_send_arp {
+                                    let arp_req = self.prepare_arp_request(
+                                        src_mac, src_ip, new_dst_ip,
+                                    );
+                                    match new_iface {
+                                        InterfaceType::WiFi => {
+                                            if let Err(e) = to_wifi.send(arp_req)
+                                            {
+                                                warn!(
+                                                    "Failed to send ARP request to WiFi: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                        InterfaceType::Ethernet => {
+                                            if let Err(e) = to_eth.send(arp_req)
+                                            {
+                                                warn!(
+                                                    "Failed to send ARP request to Ethernet: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                        _ => {}
                                     }
-                                    InterfaceType::Ethernet => {
-                                        to_eth.send(arp_req).unwrap();
-                                    }
-                                    _ => {}
+                                    info!(
+                                        "Sent ARP Request for {} and buffered packet",
+                                        new_dst_ip
+                                    );
+                                } else {
+                                    debug!(
+                                        "Buffered packet for {} (ARP already pending)",
+                                        new_dst_ip
+                                    );
                                 }
-                                info!("Sent ARP Request for {}", new_dst_ip);
                             } else {
                                 error!(
                                     "Cannot send ARP request: unknown source MAC/IP for interface {:?}",
@@ -1511,13 +1635,8 @@ impl Router {
                                 );
                             }
 
-                            state = PacketState::Dropped {
-                                reason: format!(
-                                    "ARP Request sent for {}",
-                                    new_dst_ip
-                                ),
-                            };
-                            continue 'router_loop;
+                            // Stop processing this packet, it is either buffered or dropped due to error
+                            return;
                         }
                     };
 
