@@ -177,6 +177,25 @@ enum Commands {
         #[arg(long, default_value = "4b5b")]
         encoding: String,
     },
+
+    /// Run as a TUN Adapter (expose acoustic interface as a network interface)
+    Tun {
+        /// Local IP address
+        #[arg(long, default_value = "192.168.1.1")]
+        ip: String,
+
+        /// Netmask
+        #[arg(long, default_value = "255.255.255.0")]
+        netmask: String,
+
+        /// TUN interface name
+        #[arg(long, default_value = "tun0")]
+        tun_name: String,
+
+        /// Line coding scheme (4b5b or manchester)
+        #[arg(long, default_value = "4b5b")]
+        encoding: String,
+    },
 }
 
 fn parse_line_coding(encoding: &str) -> LineCodingKind {
@@ -287,6 +306,16 @@ fn main() {
                         tun_netmask,
                         line_coding,
                     );
+                    return;
+                }
+                Commands::Tun {
+                    ip,
+                    netmask,
+                    tun_name,
+                    encoding,
+                } => {
+                    let line_coding = parse_line_coding(&encoding);
+                    net::tun::run_tun(ip, netmask, tun_name, line_coding);
                     return;
                 }
             }
