@@ -1,5 +1,5 @@
-pub mod csma;
 pub mod acoustic_interface;
+pub mod csma;
 pub mod types;
 
 pub enum CSMAState {

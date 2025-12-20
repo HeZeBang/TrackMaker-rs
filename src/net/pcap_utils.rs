@@ -1,6 +1,6 @@
 use pcap::{Active, Capture, Device};
-use tracing::info;
 use std::error::Error;
+use tracing::info;
 
 pub fn list_devices() -> Result<Vec<Device>, Box<dyn Error>> {
     let devices = Device::list()?;
@@ -58,7 +58,7 @@ pub fn next_packet<'a>(
         Ok(packet) => {
             info!("Packet received: {:?}", packet);
             Ok(packet)
-        },
+        }
         Err(e) => Err(Box::new(e)),
     }
 }

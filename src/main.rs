@@ -527,7 +527,12 @@ fn run_receiver(
     }
 }
 
-fn run_ping(target: String, local_ip_str: String, gateway: Option<String>, payload_size: usize) {
+fn run_ping(
+    target: String,
+    local_ip_str: String,
+    gateway: Option<String>,
+    payload_size: usize,
+) {
     use crate::mac::acoustic_interface::AcousticInterface;
     use crate::net::arp::ArpTable;
     use etherparse::{
@@ -769,11 +774,11 @@ fn run_ping(target: String, local_ip_str: String, gateway: Option<String>, paylo
 
 fn run_ip_host(local_ip_str: String) {
     use crate::mac::acoustic_interface::AcousticInterface;
+    use crate::net::arp::ArpTable;
     use etherparse::{
         Icmpv4Header, Icmpv4Type, IpNumber, Ipv4Header as EtherIpv4Header,
     };
     use std::net::Ipv4Addr;
-    use crate::net::arp::ArpTable;
 
     let local_ip: Ipv4Addr = local_ip_str
         .parse()
@@ -874,10 +879,7 @@ fn run_ip_host(local_ip_str: String) {
             _ => continue,
         };
 
-        info!(
-            "Received ICMP Echo Request from {:?}",
-            ip_slice.source()
-        );
+        info!("Received ICMP Echo Request from {:?}", ip_slice.source());
 
         // Build Echo Reply using etherparse
         let payload = icmp_slice.payload().to_vec();
@@ -1059,10 +1061,20 @@ fn run_router(
     if let Some(mac) = gateway_mac {
         info!(
             "Gateway: {} on {} (MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
-            gateway_ip, gateway_interface, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            gateway_ip,
+            gateway_interface,
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
         );
     } else {
-        info!("Gateway: {} on {}(MAC not provided)", gateway_ip, gateway_interface);
+        info!(
+            "Gateway: {} on {}(MAC not provided)",
+            gateway_ip, gateway_interface
+        );
     }
 
     // Determine acoustic and WiFi network from IPs
@@ -1075,7 +1087,9 @@ fn run_router(
         let octets = wifi_ip.octets();
         Ipv4Addr::new(octets[0], octets[1], octets[2], 0)
     };
-    let netmask: Ipv4Addr = "255.255.255.0".parse().unwrap();
+    let netmask: Ipv4Addr = "255.255.255.0"
+        .parse()
+        .unwrap();
 
     // Setup JACK
     let (client, _status) = jack::Client::new(
@@ -1150,8 +1164,12 @@ fn run_router(
             node3_ip, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
     } else {
-        warn!("No NODE3 MAC provided. Router will need to learn it or packets to NODE3 will fail.");
-        warn!("Use --node3-mac aa:bb:cc:dd:ee:ff to specify NODE3's MAC address");
+        warn!(
+            "No NODE3 MAC provided. Router will need to learn it or packets to NODE3 will fail."
+        );
+        warn!(
+            "Use --node3-mac aa:bb:cc:dd:ee:ff to specify NODE3's MAC address"
+        );
     }
 
     if let Some(mac) = gateway_mac {

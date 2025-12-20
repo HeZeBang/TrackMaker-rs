@@ -7,10 +7,10 @@ use std::sync::{
 };
 
 use crate::{
-    audio::{recorder},
+    audio::recorder,
     mac,
     phy::{Frame, FrameType, LineCodingKind, PhyDecoder, PhyEncoder},
-    ui::progress::{ProgressManager},
+    ui::progress::ProgressManager,
     utils::consts::*,
 };
 use tracing::{debug, error, info, trace, warn};
@@ -56,7 +56,7 @@ impl CsmaNode {
             remote_addr: remote_mac,
         }
     }
-    
+
     pub fn run_sender_loop(
         &mut self,
         tx_timeout: u64,

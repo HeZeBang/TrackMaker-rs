@@ -74,7 +74,9 @@ impl IpFragmenter {
     /// Get the next identification number
     pub fn next_identification(&mut self) -> u16 {
         let id = self.next_identification;
-        self.next_identification = self.next_identification.wrapping_add(1);
+        self.next_identification = self
+            .next_identification
+            .wrapping_add(1);
         id
     }
 
@@ -92,11 +94,19 @@ impl IpFragmenter {
     ) -> Result<Vec<Vec<u8>>, String> {
         if packet.len() <= self.mtu {
             // No fragmentation needed
-            debug!("Packet size {} <= MTU {}, no fragmentation", packet.len(), self.mtu);
+            debug!(
+                "Packet size {} <= MTU {}, no fragmentation",
+                packet.len(),
+                self.mtu
+            );
             return Ok(vec![packet.to_vec()]);
         }
 
-        debug!("Fragmenting packet of size {} (MTU={})", packet.len(), self.mtu);
+        debug!(
+            "Fragmenting packet of size {} (MTU={})",
+            packet.len(),
+            self.mtu
+        );
 
         // Parse IP header (first 20 bytes minimum)
         if packet.len() < 20 {
@@ -131,7 +141,8 @@ impl IpFragmenter {
         let mut offset = 0;
 
         while offset < data.len() {
-            let chunk_size = std::cmp::min(max_data_per_fragment, data.len() - offset);
+            let chunk_size =
+                std::cmp::min(max_data_per_fragment, data.len() - offset);
             let chunk = &data[offset..offset + chunk_size];
 
             // More fragments flag is set if there's more data after this fragment
@@ -156,7 +167,8 @@ impl IpFragmenter {
 
             // Update total length
             let fragment_total_length = ihl + chunk_size;
-            fragment[2..4].copy_from_slice(&(fragment_total_length as u16).to_be_bytes());
+            fragment[2..4]
+                .copy_from_slice(&(fragment_total_length as u16).to_be_bytes());
 
             // Update identification
             fragment[4..6].copy_from_slice(&identification.to_be_bytes());
@@ -224,7 +236,9 @@ impl IpReassembler {
         packet: &[u8],
     ) -> Result<Option<Vec<u8>>, String> {
         if packet.len() < 20 {
-            return Err("Invalid IP packet fragment: too small for header".to_string());
+            return Err(
+                "Invalid IP packet fragment: too small for header".to_string()
+            );
         }
 
         // Parse IP header
@@ -251,20 +265,31 @@ impl IpReassembler {
         }
 
         // Store header from first fragment (or any fragment)
-        if !self.headers.contains_key(&key) {
-            self.headers.insert(key, packet[..ihl].to_vec());
+        if !self
+            .headers
+            .contains_key(&key)
+        {
+            self.headers
+                .insert(key, packet[..ihl].to_vec());
         }
 
         // Initialize fragment storage if needed
-        if !self.fragments.contains_key(&key) {
-            self.fragments.insert(key, Vec::new());
+        if !self
+            .fragments
+            .contains_key(&key)
+        {
+            self.fragments
+                .insert(key, Vec::new());
         }
 
         // Store fragment with its offset
         let payload = packet[ihl..].to_vec();
-        let fragment_list = self.fragments.get_mut(&key).unwrap();
+        let fragment_list = self
+            .fragments
+            .get_mut(&key)
+            .unwrap();
         fragment_list.push((frag_info.fragment_offset, payload.clone()));
-        
+
         debug!(
             "Fragment received: id={}, offset={}, more={}, payload_len={}, total_fragments={}",
             identification,
@@ -276,14 +301,20 @@ impl IpReassembler {
 
         // Mark if this is the last fragment
         if !frag_info.more_fragments {
-            self.last_fragment_seen.insert(key, true);
+            self.last_fragment_seen
+                .insert(key, true);
             debug!("Last fragment marked for id={}", identification);
         }
 
         // Check if we can reassemble
-        if self.last_fragment_seen.get(&key).copied().unwrap_or(false) {
+        if self
+            .last_fragment_seen
+            .get(&key)
+            .copied()
+            .unwrap_or(false)
+        {
             let fragment_list = &self.fragments[&key];
-            
+
             // Sort fragments by offset
             let mut sorted_fragments = fragment_list.clone();
             sorted_fragments.sort_by_key(|(offset, _)| *offset);
@@ -291,13 +322,16 @@ impl IpReassembler {
             debug!(
                 "Checking reassembly: id={}, fragments={:?}",
                 identification,
-                sorted_fragments.iter().map(|(o, _)| o).collect::<Vec<_>>()
+                sorted_fragments
+                    .iter()
+                    .map(|(o, _)| o)
+                    .collect::<Vec<_>>()
             );
 
             // Check if we have all fragments (no gaps in offsets)
             let mut expected_offset = 0u16;
             let mut complete = true;
-            
+
             for (offset, payload) in &sorted_fragments {
                 if *offset != expected_offset {
                     complete = false;
@@ -310,10 +344,13 @@ impl IpReassembler {
                 // Next expected offset is current offset + number of 8-byte units in this payload
                 let payload_units = ((payload.len() + 7) / 8) as u16;
                 expected_offset = offset + payload_units;
-                
+
                 debug!(
                     "Fragment ok: offset={}, payload_len={}, units={}, next_expected={}",
-                    offset, payload.len(), payload_units, expected_offset
+                    offset,
+                    payload.len(),
+                    payload_units,
+                    expected_offset
                 );
             }
 
@@ -334,7 +371,8 @@ impl IpReassembler {
                 // Update IP header total_length
                 let total_length = reassembled.len() as u16;
                 if reassembled.len() >= 4 {
-                    reassembled[2..4].copy_from_slice(&total_length.to_be_bytes());
+                    reassembled[2..4]
+                        .copy_from_slice(&total_length.to_be_bytes());
                 }
 
                 // Clear fragmentation flags in reassembled packet
@@ -344,12 +382,15 @@ impl IpReassembler {
 
                 // Clean up stored fragments
                 self.fragments.remove(&key);
-                self.last_fragment_seen.remove(&key);
+                self.last_fragment_seen
+                    .remove(&key);
                 self.headers.remove(&key);
 
                 debug!(
                     "Reassembled {} fragments (identification: {}, total_size: {})",
-                    sorted_fragments.len(), identification, reassembled.len()
+                    sorted_fragments.len(),
+                    identification,
+                    reassembled.len()
                 );
 
                 return Ok(Some(reassembled));
@@ -386,7 +427,9 @@ mod tests {
 
         // Create a small packet (less than MTU)
         let packet = vec![0u8; 100];
-        let fragments = fragmenter.fragment_packet(&packet).unwrap();
+        let fragments = fragmenter
+            .fragment_packet(&packet)
+            .unwrap();
 
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0], packet);
@@ -400,7 +443,9 @@ mod tests {
         let mut packet = vec![0x45u8; 20]; // IP version 4, IHL 5 (20 bytes header)
         packet.extend(vec![0x00u8; 300]); // 300 bytes of data
 
-        let fragments = fragmenter.fragment_packet(&packet).unwrap();
+        let fragments = fragmenter
+            .fragment_packet(&packet)
+            .unwrap();
 
         // Should be fragmented into multiple fragments
         assert!(fragments.len() > 1);
@@ -439,13 +484,20 @@ mod tests {
         packet[2..4].copy_from_slice(&total_len.to_be_bytes());
 
         // Fragment the packet
-        let fragments = fragmenter.fragment_packet(&packet).unwrap();
-        assert!(fragments.len() > 1, "Packet should be fragmented into multiple parts");
+        let fragments = fragmenter
+            .fragment_packet(&packet)
+            .unwrap();
+        assert!(
+            fragments.len() > 1,
+            "Packet should be fragmented into multiple parts"
+        );
 
         // Reassemble fragments
         let mut result: Option<Vec<u8>> = None;
         for fragment in &fragments {
-            result = reassembler.process_fragment(fragment).unwrap();
+            result = reassembler
+                .process_fragment(fragment)
+                .unwrap();
         }
 
         // Should have reassembled packet
@@ -455,6 +507,9 @@ mod tests {
 
         // Check that the reassembled payload matches original
         let reassembled_payload = &reassembled[20..];
-        assert_eq!(reassembled_payload, &payload, "Reassembled payload should match original");
+        assert_eq!(
+            reassembled_payload, &payload,
+            "Reassembled payload should match original"
+        );
     }
 }

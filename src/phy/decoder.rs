@@ -224,7 +224,8 @@ impl PhyDecoder {
             if i + 1 < window_count {
                 let leaving = search_area[i];
                 let entering = search_area[i + preamble_len];
-                window_energy = window_energy - leaving * leaving + entering * entering;
+                window_energy =
+                    window_energy - leaving * leaving + entering * entering;
                 // Prevent negative energy due to floating point errors
                 if window_energy < 0.0 {
                     window_energy = 0.0;
@@ -353,12 +354,6 @@ impl PhyDecoder {
             }
         }
     }
-
-
-
-
-
-
 
     fn compute_dot_product(&self, window: &[f32]) -> f32 {
         #[cfg(target_arch = "x86_64")]

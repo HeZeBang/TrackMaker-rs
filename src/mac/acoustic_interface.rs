@@ -55,7 +55,9 @@ impl AcousticInterface {
         frame_type: FrameType,
     ) -> Result<(), String> {
         // Fragment the packet if it's too large
-        let packets_to_send = self.fragmenter.fragment_packet(data)?;
+        let packets_to_send = self
+            .fragmenter
+            .fragment_packet(data)?;
 
         // Send each fragment
         for packet_data in packets_to_send {
@@ -280,7 +282,11 @@ impl AcousticInterface {
 
                         std::thread::sleep(Duration::from_millis(10));
                         let samples = {
-                            let mut buf = self.shared.record_buffer.lock().unwrap();
+                            let mut buf = self
+                                .shared
+                                .record_buffer
+                                .lock()
+                                .unwrap();
                             let s = buf.clone();
                             buf.clear();
                             s
@@ -331,7 +337,11 @@ impl AcousticInterface {
             // For now just loop
 
             let samples = {
-                let mut buf = self.shared.record_buffer.lock().unwrap();
+                let mut buf = self
+                    .shared
+                    .record_buffer
+                    .lock()
+                    .unwrap();
                 let s = buf.clone();
                 buf.clear();
                 s
@@ -343,15 +353,22 @@ impl AcousticInterface {
                     .process_samples(&samples);
 
                 for f in decoded {
-                    if f.frame_type == FrameType::Data || f.frame_type == FrameType::Ack && !f.data.is_empty() {
+                    if f.frame_type == FrameType::Data
+                        || f.frame_type == FrameType::Ack && !f.data.is_empty()
+                    {
                         // Try to reassemble fragments
-                        match self.reassembler.process_fragment(&f.data)? {
+                        match self
+                            .reassembler
+                            .process_fragment(&f.data)?
+                        {
                             Some(reassembled_packet) => {
                                 return Ok(reassembled_packet);
                             }
                             None => {
                                 // Fragment received but packet not complete yet
-                                debug!("Fragment received, waiting for more fragments...");
+                                debug!(
+                                    "Fragment received, waiting for more fragments..."
+                                );
                             }
                         }
                     }
