@@ -10,9 +10,8 @@ use etherparse::{
 use pcap::{Active, Capture, Device, Linktype};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc::Sender};
+use std::sync::{Arc, Mutex, RwLock}; // Added RwLock for better read concurrency
 use std::thread;
 use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
@@ -281,9 +280,11 @@ impl Default for RouterConfig {
 #[derive(Clone)]
 pub struct Router {
     config: RouterConfig,
-    routing_table: RoutingTable,
-    arp_table: ArpTable,
-    nat_table: NatTable,
+    // Use Arc<RwLock> to share state across threads.
+    // Cloning `Router` will now point to the same tables, enabling correct concurrent updates.
+    routing_table: Arc<RwLock<RoutingTable>>,
+    arp_table: Arc<RwLock<ArpTable>>,
+    nat_table: Arc<RwLock<NatTable>>,
     running: Arc<Mutex<AtomicBool>>,
 }
 
@@ -357,22 +358,23 @@ impl Router {
 
         Self {
             config,
-            routing_table,
-            arp_table: ArpTable::new(),
-            nat_table: NatTable::new(),
+            routing_table: Arc::new(RwLock::new(routing_table)),
+            arp_table: Arc::new(RwLock::new(ArpTable::new())),
+            nat_table: Arc::new(RwLock::new(NatTable::new())),
             running: Arc::new(Mutex::new(AtomicBool::new(false))),
         }
     }
 
     /// Add a static ARP entry for Other(Gateway)
     pub fn add_arp_entry(
-        &mut self,
+        &self,
         ip: Ipv4Addr,
         mac: [u8; 6],
         interface: InterfaceType,
     ) {
-        self.arp_table
-            .add_entry(ip, mac, interface);
+        if let Ok(mut table) = self.arp_table.write() {
+            table.add_entry(ip, mac, interface);
+        }
     }
 
     /// Build an Ethernet frame for WiFi transmission
@@ -554,30 +556,6 @@ impl Router {
         Ok(result)
     }
 
-    /// Prepare a packet for Acoustic interface
-    /// Returns (ip_packet, dest_mac)
-    fn prepare_acoustic_packet(
-        &self,
-        mut ip_packet: Vec<u8>,
-        dest_ip: Ipv4Addr,
-    ) -> Result<(Vec<u8>, u8), String> {
-        // Decrement TTL
-        Self::decrement_ttl(&mut ip_packet).map_err(|e| e.to_string())?;
-
-        // Get destination MAC from acoustic ARP table
-        let dest_mac = self
-            .arp_table
-            .get_mac(&dest_ip, InterfaceType::Acoustic)
-            .ok_or_else(|| format!("No ARP entry for {}", dest_ip))?;
-
-        info!(
-            "Forwarding packet to acoustic interface: {} -> MAC {}",
-            dest_ip, dest_mac[5]
-        );
-
-        Ok((ip_packet, dest_mac[5]))
-    }
-
     fn prepare_arp_request(
         &self,
         source_mac: [u8; 6],
@@ -627,11 +605,15 @@ impl Router {
             let ihl = ip_header.slice().len();
             if let Ok(icmp_packet) = IcmpPacket::from_bytes(&ip_packet[ihl..]) {
                 if icmp_packet.icmp_type == IcmpType::EchoReply {
-                    // Lookup in NAT table
-                    if let Some(original_ip) = self
-                        .nat_table
-                        .translate_echo_reply(icmp_packet.identifier)
-                    {
+                    // Lookup in NAT table (Thread-safe read)
+                    let original_ip_opt =
+                        if let Ok(table) = self.nat_table.read() {
+                            table.translate_echo_reply(icmp_packet.identifier)
+                        } else {
+                            None
+                        };
+
+                    if let Some(original_ip) = original_ip_opt {
                         debug!(
                             "NAT: Translating Echo Reply ID {} to {}",
                             icmp_packet.identifier, original_ip
@@ -755,6 +737,7 @@ impl Router {
         // Split TUN device
         let (mut tun_reader, mut tun_writer) = tun_device.split();
 
+        // TUN RX (Read from TUN -> Send to Router)
         let tun_rx_handle = thread::spawn(move || {
             let mut buf = [0u8; 1504];
             while running
@@ -762,6 +745,7 @@ impl Router {
                 .unwrap()
                 .load(Ordering::SeqCst)
             {
+                // Blocking read is fine here as long as tun_reader supports it properly
                 match std::io::Read::read(&mut tun_reader, &mut buf) {
                     Ok(n) => {
                         if n > 0 {
@@ -772,36 +756,43 @@ impl Router {
                         }
                     }
                     Err(e) => {
-                        warn!("TUN read error: {}", e);
-                        thread::sleep(Duration::from_millis(100));
+                        // If it's a temp error or timeout, we might continue
+                        // For a real error, we might log and break
+                        match e.kind() {
+                            std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut => {
+                                // Short sleep to avoid tight loop on non-blocking error
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                            _ => {
+                                warn!("TUN read error: {}", e);
+                                thread::sleep(Duration::from_millis(100));
+                            }
+                        }
                     }
                 }
             }
         });
 
-        let running = self.running.clone();
+        // TUN TX (Read from Channel -> Write to TUN)
+        // Optimized: Use blocking iterator instead of busy waiting loop
         let tun_tx_handle = thread::spawn(move || {
-            while running
-                .lock()
-                .unwrap()
-                .load(Ordering::SeqCst)
-            {
-                while let Ok(packet) = to_tun_rx.try_recv() {
-                    info!("Writing packet to TUN device (len={})", packet.len());
-                    if let Err(e) =
-                        std::io::Write::write_all(&mut tun_writer, &packet)
-                    {
-                        warn!("Failed to write to TUN: {}", e);
-                    }
+            // This loop automatically terminates when to_tun_tx is dropped
+            for packet in to_tun_rx {
+                info!("Writing packet to TUN device (len={})", packet.len());
+                if let Err(e) =
+                    std::io::Write::write_all(&mut tun_writer, &packet)
+                {
+                    warn!("Failed to write to TUN: {}", e);
                 }
-                thread::sleep(Duration::from_millis(1));
             }
+            debug!("TUN TX thread stopping");
         });
 
         // WiFi Hotspot RX
 
         // Spawn WiFi Thread
-        let router_wifi = self.clone();
+        let router_wifi = self.clone(); // Clone is now cheap and safe (shares Arc<RwLock>)
         let running = self.running.clone();
         let wifi_to_router = to_router_tx.clone();
 
@@ -821,6 +812,7 @@ impl Router {
                 .load(Ordering::SeqCst)
             {
                 // 1. Read from WiFi (with timeout)
+                // pcap `next_packet` is blocking or has timeout set in open_capture
                 match wifi_capture.next_packet() {
                     Ok(packet) => {
                         if let Some((ip_packet, src_mac, dst_mac, _ethertype)) =
@@ -848,33 +840,29 @@ impl Router {
                         }
                     }
                     Err(pcap::Error::TimeoutExpired) => {
-                        // Timeout, check for outgoing packets
-                        info!("WIFI Capture Timeout");
+                        // Timeout allows checking `running` flag
                     }
                     Err(e) => {
                         warn!("WiFi capture error: {}", e);
+                        thread::sleep(Duration::from_millis(100)); // Prevent tight loop on error
                     }
                 }
             }
         });
 
-        let running = self.running.clone();
+        // WiFi TX Thread
+        // Optimized: Use blocking iterator
         let mut wifi_capture = crate::net::pcap_utils::open_capture(wifi_device)
             .map_err(|e| format!("Failed to open WiFi capture: {}", e))?;
         let wifi_tx_handle = thread::spawn(move || {
-            while running
-                .lock()
-                .unwrap()
-                .load(Ordering::SeqCst)
-            {
-                // 2. Send to WiFi
-                while let Ok(frame) = to_wifi_rx.try_recv() {
-                    info!("WiFi sent");
-                    if let Err(e) = wifi_capture.sendpacket(frame) {
-                        warn!("Failed to send packet to WiFi: {}", e);
-                    }
+            // Loop until channel is closed
+            for frame in to_wifi_rx {
+                info!("WiFi sent");
+                if let Err(e) = wifi_capture.sendpacket(frame) {
+                    warn!("Failed to send packet to WiFi: {}", e);
                 }
             }
+            debug!("WiFi TX thread stopping");
         });
 
         // Spawn Acoustic Thread
@@ -887,6 +875,7 @@ impl Router {
                 .load(Ordering::SeqCst)
             {
                 // 1. Read from Acoustic (non-blocking/timeout)
+                // Assuming receive_packet has internal timeout logic
                 match acoustic_interface
                     .receive_packet(Some(Duration::from_millis(10)))
                 {
@@ -894,15 +883,15 @@ impl Router {
                         acoustic_to_router
                             .send((ip_packet.clone(), InterfaceType::Acoustic))
                             .unwrap();
-                        // router_acoustic
-                        //     .handle_acoustic_packet(&to_wifi_tx, ip_packet);
                     }
                     Err(_) => {
-                        // Timeout or error
+                        // Timeout or error, just continue
                     }
                 }
 
                 // 2. Send to Acoustic
+                // Use try_recv here because we are in a loop handling both RX and TX in one thread.
+                // This is a specific design for acoustic interface which might be half-duplex or single-threaded.
                 while let Ok((ip_packet, dest_mac)) = to_acoustic_rx.try_recv() {
                     if let Err(e) = acoustic_interface.send_packet(
                         &ip_packet,
@@ -921,32 +910,25 @@ impl Router {
         if let Some(main_device) = eth_device {
             if main_device.name != self.config.wifi_interface {
                 // Gateway TX
+                // Optimized: Use blocking iterator
                 let mut gateway_send =
                     crate::net::pcap_utils::open_capture(main_device.clone())
                         .map_err(|e| {
                             format!("Failed to open Ethernet capture: {}", e)
                         })?;
-                let running = self.running.clone();
+
                 gateway_tx_handle = Some(thread::spawn(move || {
-                    while running
-                        .lock()
-                        .unwrap()
-                        .load(Ordering::SeqCst)
-                    {
-                        while let Ok(frame) = to_eth_rx.try_recv() {
-                            // info!("Gateway sent");
-                            if let Err(e) = gateway_send.sendpacket(frame) {
-                                warn!(
-                                    "Failed to send packet to Ethernet: {}",
-                                    e
-                                );
-                            }
+                    for frame in to_eth_rx {
+                        // info!("Gateway sent");
+                        if let Err(e) = gateway_send.sendpacket(frame) {
+                            warn!("Failed to send packet to Ethernet: {}", e);
                         }
                     }
+                    debug!("Ethernet TX thread stopping");
                 }));
 
                 // Gateway RX
-                let network_router = self.clone();
+                let network_router = self.clone(); // Clone Safe Router
                 let eth_to_router = to_router_tx.clone();
                 let mut gateway_recv =
                     crate::net::pcap_utils::open_capture(main_device).map_err(
@@ -1001,6 +983,7 @@ impl Router {
                             }
                             Err(e) => {
                                 warn!("Ethernet capture error: {}", e);
+                                thread::sleep(Duration::from_millis(100));
                             }
                         }
                     }
@@ -1018,7 +1001,9 @@ impl Router {
                 .load(Ordering::SeqCst)
             {
                 // Receive packets from interfaces
-                match to_router_rx.recv_timeout(Duration::from_millis(100)) {
+                // Uses recv_timeout so we can periodically check `running` flag
+                // Alternatively, we could just block on recv() if we dropping the sender was the only stop mechanism.
+                match to_router_rx.recv_timeout(Duration::from_secs(1)) {
                     Ok((ip_packet, src_interface)) => {
                         router_main.handle_packet(
                             &to_acoustic_tx,
@@ -1030,16 +1015,21 @@ impl Router {
                         );
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        // Timeout, continue
+                        // Timeout, continue loop to check running flag
                     }
                     Err(e) => {
                         warn!("Router main loop error: {}", e);
+                        break; // Channel disconnected
                     }
                 }
             }
+            debug!("Main router loop stopping");
         });
 
         // Wait for threads to finish
+        // Note: RX threads typically need an external signal or loop check to stop.
+        // TX threads will stop when the main_handle drops the senders (which happens when main_handle finishes).
+
         if let Err(e) = wifi_rx_handle.join() {
             warn!("WiFi RX thread panicked: {:?}", e);
         }
@@ -1135,8 +1125,11 @@ impl Router {
                                     sender_mac[4],
                                     sender_mac[5]
                                 );
-                                self.arp_table
-                                    .update(sender_ip, sender_mac, iface);
+
+                                // Update ARP Table Thread-Safely
+                                if let Ok(mut table) = self.arp_table.write() {
+                                    table.update(sender_ip, sender_mac, iface);
+                                }
                             }
                         }
                         return;
@@ -1198,11 +1191,14 @@ impl Router {
                                                 first_byte, new_dst
                                             );
 
-                                            // Register DNAT session
-                                            self.nat_table
-                                                .register_dnat_session(
+                                            // Register DNAT session (Thread-safe write)
+                                            if let Ok(mut table) =
+                                                self.nat_table.write()
+                                            {
+                                                table.register_dnat_session(
                                                     icmp_packet.identifier,
                                                 );
+                                            }
                                             info!(
                                                 "Traversal: Registered DNAT session for ID {}",
                                                 icmp_packet.identifier
@@ -1333,24 +1329,27 @@ impl Router {
 
                     // TODO: search DNAT table/rule (Pre-Routing)
 
-                    // Lookup routing table
-                    let (new_dst_ip, new_iface) = match self
-                        .routing_table
-                        .lookup(&dst_ip)
+                    // Lookup routing table (Thread-safe read)
+                    let (new_dst_ip, new_iface) = if let Ok(table) =
+                        self.routing_table.read()
                     {
-                        Some((next_hop, iface)) => {
-                            if let Some(new_dst) = next_hop {
-                                // redirect to some gateway
-                                (new_dst, iface)
-                            } else {
-                                (dst_ip, iface)
+                        match table.lookup(&dst_ip) {
+                            Some((next_hop, iface)) => {
+                                if let Some(new_dst) = next_hop {
+                                    // redirect to some gateway
+                                    (new_dst, iface)
+                                } else {
+                                    (dst_ip, iface)
+                                }
+                            }
+                            None => {
+                                // Maybe for 0.0.0.0/0?
+                                // Check for default gateway
+                                (self.config.gateway_ip, InterfaceType::Ethernet) // TODO: change to other interface
                             }
                         }
-                        None => {
-                            // Maybe for 0.0.0.0/0?
-                            // Check for default gateway
-                            (self.config.gateway_ip, InterfaceType::Ethernet) // TODO: change to other interface
-                        }
+                    } else {
+                        (self.config.gateway_ip, InterfaceType::Ethernet)
                     };
 
                     // Post-Routing (SNAT)
@@ -1375,12 +1374,13 @@ impl Router {
                             };
 
                         if icmp_type == IcmpType::EchoRequest {
-                            // Register in NAT table
-                            self.nat_table
-                                .register_echo_request(
+                            // Register in NAT table (Thread-safe write)
+                            if let Ok(mut table) = self.nat_table.write() {
+                                table.register_echo_request(
                                     icmp_id,
                                     src_ip_from_header,
                                 );
+                            }
                             debug!(
                                 "NAT: Registered Echo Request ID {} from {}",
                                 icmp_id, src_ip_from_header
@@ -1437,10 +1437,15 @@ impl Router {
                                 "Checking SNAT for Echo Reply ID {}",
                                 icmp_id
                             );
-                            if self
-                                .nat_table
-                                .is_dnat_session(icmp_id)
-                            {
+                            // Thread-safe read
+                            let is_dnat =
+                                if let Ok(table) = self.nat_table.read() {
+                                    table.is_dnat_session(icmp_id)
+                                } else {
+                                    false
+                                };
+
+                            if is_dnat {
                                 info!(
                                     "Traversal: Masquerading Echo Reply ID {} from {}",
                                     icmp_id, src_ip_from_header
@@ -1461,11 +1466,13 @@ impl Router {
                         }
                     }
 
+                    // Thread-safe read for ARP
                     let dst_mac_opt = if new_iface == InterfaceType::Tun {
                         Some([0u8; 6])
+                    } else if let Ok(table) = self.arp_table.read() {
+                        table.get_mac(&new_dst_ip, new_iface)
                     } else {
-                        self.arp_table
-                            .get_mac(&new_dst_ip, new_iface)
+                        None
                     };
 
                     let dst_mac = match dst_mac_opt {
