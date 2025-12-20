@@ -1,58 +1,33 @@
 # TrackMaker-rs
 A high-performance audio-based information transmission tool, written in Rust
 
-## Note on MacOS
+## Usage
 
-To fully utilize JACK on macOS, you may need to install additional components such as `jack` via Homebrew:
+### Ping
 
-```bash
-brew install jack
-```
-
-Normally, the JACK server will start in 44100Hz with a buffer size of 512 samples. To change this settings, start the JACK server by:
+This is an acoustic ping client.
 
 ```bash
-jackd -d coreaudio -r 48000 -p 256
+cargo r -- ping 1.1.1.1 --gateway 192.168.1.1 --local-ip 192.168.1.3
 ```
 
-If you're launching this program on MacOS with homebrew, link the dynamic libraries by:
+- `gateway`: Default gateway address for NAT or fallback
+- `local-ip`: Local IP Address for Acoustic Link
+
+### IP-Host
+
+This is an acoustic host for responding to acoustic ping requests.
 
 ```bash
-export DYLD_LIBRARY_PATH="$HOME/homebrew/lib:$DYLD_LIBRARY_PATH"
+cargo r -- ip-host --local-ip 192.168.1.2
 ```
 
-Additionally, we found the provided device will get much more noise when output volume is over 30%, se we recommend playback `0.29` or `-17dB` and record `0.64` or `16dB` to get the bset result.
+- `local-ip`: Local IP Address for Acoustic Link
 
-## Note for Linux Pipewire
+### Router
 
-Pipewire contins its default jack implementation, to dajust settings, use:
-
-```bash
-pw-metadata -n settings 0 clock.force-rate 48000
-pw-metadata -n settings 0 clock.force-quantum 128
-```
-
-Sometimes Pipeware will oversample if you choose the volume that is too large, so my best trail is to set OUTPUT to about `31%` / `-30.63dB` and record to `153%` / `11.0dB`.
-
-For best performance with pipewire jack server, use the following command:
-
-```bash
-PIPEWIRE_QUANTUM=256/48000 pw-jack ./target/release/trackmaker-rs
-```
-
-jackd
-
-```bash
-jackd -dalsa -r48000 -p128 -Xraw -D -Chw:Device -Phw:Device
-```
-
-## Disable ECHO
-
-```bash
-sysctl -w net.ipv4.icmp_echo_ignore_all=1
-```
-
-## Project 3
+For router, you need to compile and use `setcap` to bypass limitation of network operations.
+You cannot use `sudo` to run it directly because `jack` will not find its server which is running in user mode.
 
 ```bash
 export WLAN_IF="wlan0"
@@ -78,3 +53,56 @@ PIPEWIRE_QUANTUM=128/48000 pw-jack ./target/debug/trackmaker-rs router --wifi-in
 - `wifi-ip`, `wifi-mac`
 - `node3-ip`: IP Address for Node3
 - `node3-mac`(Optional): Mac for Node3
+
+## Notes
+
+# ## Note on MacOS
+
+To fully utilize JACK on macOS, you may need to install additional components such as `jack` via Homebrew:
+
+```bash
+brew install jack
+```
+
+Normally, the JACK server will start in 44100Hz with a buffer size of 512 samples. To change this settings, start the JACK server by:
+
+```bash
+jackd -d coreaudio -r 48000 -p 256
+```
+
+If you're launching this program on MacOS with homebrew, link the dynamic libraries by:
+
+```bash
+export DYLD_LIBRARY_PATH="$HOME/homebrew/lib:$DYLD_LIBRARY_PATH"
+```
+
+Additionally, we found the provided device will get much more noise when output volume is over 30%, se we recommend playback `0.29` or `-17dB` and record `0.64` or `16dB` to get the bset result.
+
+### Note for Linux with Pipewire
+
+Pipewire contins its default jack implementation, to dajust settings, use:
+
+```bash
+pw-metadata -n settings 0 clock.force-rate 48000
+pw-metadata -n settings 0 clock.force-quantum 128
+```
+
+Sometimes Pipeware will oversample if you choose the volume that is too large, so my best trail is to set OUTPUT to about `31%` / `-30.63dB` and record to `153%` / `11.0dB`.
+
+For best performance with pipewire jack server, use the following command:
+
+```bash
+PIPEWIRE_QUANTUM=256/48000 pw-jack ./target/release/trackmaker-rs
+```
+
+jackd
+
+```bash
+jackd -dalsa -r48000 -p128 -Xraw -D -Chw:Device -Phw:Device
+```
+
+### How to Disable local ECHO
+
+```bash
+sysctl -w net.ipv4.icmp_echo_ignore_all=1
+```
