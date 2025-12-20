@@ -192,6 +192,10 @@ enum Commands {
         #[arg(long, default_value = "tun0")]
         tun_name: String,
 
+        /// Default Gateway IP (optional)
+        #[arg(long)]
+        gateway: Option<String>,
+
         /// Line coding scheme (4b5b or manchester)
         #[arg(long, default_value = "4b5b")]
         encoding: String,
@@ -219,54 +223,76 @@ fn main() {
     let cli = Cli::parse();
 
     // Determine mode and parameters
-    let (selection, line_coding, tx_addr, rx_addr, timeout) =
-        if cli.interactive || cli.command.is_none() {
-            // Interactive mode (original dialoguer behavior)
-            interactive_mode()
-        } else {
-            // Command-line mode
-            match cli.command.unwrap() {
-                Commands::Tx {
-                    local,
-                    remote,
-                    encoding,
-                    duration,
-                } => {
-                    let line_coding = parse_line_coding(&encoding);
-                    info!("Using line coding: {}", line_coding.name());
-                    (0, line_coding, local, remote, duration)
-                }
-                Commands::Rx {
-                    local,
-                    remote,
-                    encoding,
-                    duration,
-                } => {
-                    let line_coding = parse_line_coding(&encoding);
-                    info!("Using line coding: {}", line_coding.name());
-                    (1, line_coding, local, remote, duration)
-                }
-                Commands::Test { encoding } => {
-                    let line_coding = parse_line_coding(&encoding);
-                    test_transmission(line_coding);
-                    return;
-                }
-                Commands::Ping {
-                    target,
-                    local_ip,
-                    gateway,
-                    payload_size,
-                } => {
-                    // Ping Mode
-                    run_ping(target, local_ip, gateway, payload_size);
-                    return;
-                }
-                Commands::IpHost { local_ip } => {
-                    // IP Host Mode
-                    run_ip_host(local_ip);
-                    return;
-                }
-                Commands::Router {
+    let (selection, line_coding, tx_addr, rx_addr, timeout) = if cli.interactive
+        || cli.command.is_none()
+    {
+        // Interactive mode (original dialoguer behavior)
+        interactive_mode()
+    } else {
+        // Command-line mode
+        match cli.command.unwrap() {
+            Commands::Tx {
+                local,
+                remote,
+                encoding,
+                duration,
+            } => {
+                let line_coding = parse_line_coding(&encoding);
+                info!("Using line coding: {}", line_coding.name());
+                (0, line_coding, local, remote, duration)
+            }
+            Commands::Rx {
+                local,
+                remote,
+                encoding,
+                duration,
+            } => {
+                let line_coding = parse_line_coding(&encoding);
+                info!("Using line coding: {}", line_coding.name());
+                (1, line_coding, local, remote, duration)
+            }
+            Commands::Test { encoding } => {
+                let line_coding = parse_line_coding(&encoding);
+                test_transmission(line_coding);
+                return;
+            }
+            Commands::Ping {
+                target,
+                local_ip,
+                gateway,
+                payload_size,
+            } => {
+                // Ping Mode
+                run_ping(target, local_ip, gateway, payload_size);
+                return;
+            }
+            Commands::IpHost { local_ip } => {
+                // IP Host Mode
+                run_ip_host(local_ip);
+                return;
+            }
+            Commands::Router {
+                acoustic_ip,
+                acoustic_mac,
+                wifi_ip,
+                wifi_interface,
+                wifi_mac,
+                node3_ip,
+                node3_mac,
+                gateway_ip,
+                gateway_mac,
+                gateway_interface,
+                eth_ip,
+                eth_netmask,
+                eth_mac,
+                tun_name,
+                tun_ip,
+                tun_netmask,
+                encoding,
+            } => {
+                // Router Mode
+                let line_coding = parse_line_coding(&encoding);
+                run_router(
                     acoustic_ip,
                     acoustic_mac,
                     wifi_ip,
@@ -274,52 +300,32 @@ fn main() {
                     wifi_mac,
                     node3_ip,
                     node3_mac,
-                    gateway_ip,
-                    gateway_mac,
-                    gateway_interface,
                     eth_ip,
                     eth_netmask,
                     eth_mac,
+                    gateway_ip,
+                    gateway_mac,
+                    gateway_interface,
                     tun_name,
                     tun_ip,
                     tun_netmask,
-                    encoding,
-                } => {
-                    // Router Mode
-                    let line_coding = parse_line_coding(&encoding);
-                    run_router(
-                        acoustic_ip,
-                        acoustic_mac,
-                        wifi_ip,
-                        wifi_interface,
-                        wifi_mac,
-                        node3_ip,
-                        node3_mac,
-                        eth_ip,
-                        eth_netmask,
-                        eth_mac,
-                        gateway_ip,
-                        gateway_mac,
-                        gateway_interface,
-                        tun_name,
-                        tun_ip,
-                        tun_netmask,
-                        line_coding,
-                    );
-                    return;
-                }
-                Commands::Tun {
-                    ip,
-                    netmask,
-                    tun_name,
-                    encoding,
-                } => {
-                    let line_coding = parse_line_coding(&encoding);
-                    net::tun::run_tun(ip, netmask, tun_name, line_coding);
-                    return;
-                }
+                    line_coding,
+                );
+                return;
             }
-        };
+            Commands::Tun {
+                ip,
+                netmask,
+                tun_name,
+                gateway,
+                encoding,
+            } => {
+                let line_coding = parse_line_coding(&encoding);
+                net::tun::run_tun(ip, netmask, tun_name, gateway, line_coding);
+                return;
+            }
+        }
+    };
 
     let (client, status) = jack::Client::new(
         format!(

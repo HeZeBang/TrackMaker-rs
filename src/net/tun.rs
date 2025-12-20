@@ -20,6 +20,7 @@ pub fn run_tun(
     ip_str: String,
     netmask_str: String,
     tun_name: String,
+    gateway_str: Option<String>,
     line_coding: LineCodingKind,
 ) {
     // Parse IPs
@@ -29,10 +30,17 @@ pub fn run_tun(
     let netmask: Ipv4Addr = netmask_str
         .parse()
         .expect("Invalid netmask");
+    let gateway: Option<Ipv4Addr> = gateway_str.map(|s| {
+        s.parse()
+            .expect("Invalid gateway IP")
+    });
 
     info!("Starting TUN Adapter...");
     info!("  IP: {}", ip);
     info!("  Netmask: {}", netmask);
+    if let Some(gw) = gateway {
+        info!("  Gateway: {}", gw);
+    }
     info!("  Device: {}", tun_name);
     info!("  MTU: {}", MAX_FRAME_DATA_SIZE);
 
@@ -110,6 +118,10 @@ pub fn run_tun(
 
     // 1. TUN Reader Thread (TUN -> Acoustic Channel)
     let r_reader = running.clone();
+    let local_ip = ip;
+    let local_netmask = netmask;
+    let local_gateway = gateway;
+
     thread::spawn(move || {
         let mut buf = [0u8; 1500];
         while r_reader.load(Ordering::SeqCst) {
@@ -134,7 +146,33 @@ pub fn run_tun(
                                 continue;
                             }
 
-                            let target_mac = dest_ip.octets()[3];
+                            // Routing logic:
+                            // 1. If dest_ip is in local subnet, target_mac = dest_ip.last_octet
+                            // 2. If dest_ip is NOT in local subnet and gateway exists, target_mac = gateway.last_octet
+                            // 3. Otherwise, use dest_ip.last_octet (fallback)
+
+                            let is_local = {
+                                let ip_octets = dest_ip.octets();
+                                let net_octets = local_ip.octets();
+                                let mask_octets = local_netmask.octets();
+                                (0..4).all(|i| {
+                                    (ip_octets[i] & mask_octets[i])
+                                        == (net_octets[i] & mask_octets[i])
+                                })
+                            };
+
+                            let target_mac = if is_local {
+                                dest_ip.octets()[3]
+                            } else if let Some(gw) = local_gateway {
+                                debug!(
+                                    "Routing packet for {} via gateway {}",
+                                    dest_ip, gw
+                                );
+                                gw.octets()[3]
+                            } else {
+                                dest_ip.octets()[3]
+                            };
+
                             debug!(
                                 "TUN -> Channel: {} bytes to {} (MAC {})",
                                 len, dest_ip, target_mac
