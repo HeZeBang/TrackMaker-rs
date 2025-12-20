@@ -5,6 +5,7 @@ pub mod ip;
 pub mod nat;
 pub mod pcap_utils;
 pub mod router;
+pub mod tool;
 
 pub enum Protocol {
     Icmp = 1,
