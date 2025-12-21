@@ -225,14 +225,19 @@ pub fn run_tun(
         match interface.receive_packet(Some(Duration::from_millis(10))) {
             Ok(mut packet) => {
                 // FIXME: Patch: Ensure IPv4 checksum is correct
-                if let Ok((mut header, payload)) = etherparse::Ipv4Header::from_slice(&packet) {
-                     header.header_checksum = header.calc_header_checksum();
-                     
-                     let mut new_packet = Vec::with_capacity(packet.len());
-                     if header.write(&mut new_packet).is_ok() {
-                         new_packet.extend_from_slice(payload);
-                         packet = new_packet;
-                     }
+                if let Ok((mut header, payload)) =
+                    etherparse::Ipv4Header::from_slice(&packet)
+                {
+                    header.header_checksum = header.calc_header_checksum();
+
+                    let mut new_packet = Vec::with_capacity(packet.len());
+                    if header
+                        .write(&mut new_packet)
+                        .is_ok()
+                    {
+                        new_packet.extend_from_slice(payload);
+                        packet = new_packet;
+                    }
                 }
 
                 debug!("Acoustic -> Channel: {} bytes", packet.len());

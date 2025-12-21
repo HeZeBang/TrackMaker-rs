@@ -5,7 +5,8 @@
 
 use etherparse::{
     ArpHardwareId, ArpOperation, ArpPacket, EtherType, Icmpv4Header, Icmpv4Type,
-    IpNumber, Ipv4Header, Ipv4HeaderSlice, PacketBuilder, TcpHeaderSlice, UdpHeaderSlice,
+    IpNumber, Ipv4Header, Ipv4HeaderSlice, PacketBuilder, TcpHeaderSlice,
+    UdpHeaderSlice,
 };
 use pcap::{Active, Capture, Device, Linktype};
 use std::collections::HashMap;
@@ -294,7 +295,7 @@ pub struct Router {
     nat_table: Arc<RwLock<NatTable>>,
     // Simple Session table for TCP/UDP NAT: Port -> Original IP
     // Assumes simple Cone NAT where external port maps to internal IP 1:1 (no port translation unless collision, but keeping simple)
-    nat_sessions: Arc<RwLock<HashMap<u16, Ipv4Addr>>>, 
+    nat_sessions: Arc<RwLock<HashMap<u16, Ipv4Addr>>>,
     // Buffer for packets awaiting ARP resolution
     pending_packets: Arc<RwLock<HashMap<Ipv4Addr, Vec<PendingPacket>>>>,
     running: Arc<Mutex<AtomicBool>>,
@@ -503,10 +504,17 @@ impl Router {
 
     /// Recalculate TCP or UDP Checksum (Pseudo-Header + L4 Header + Payload)
     /// This is required when IP addresses change (NAT).
-    fn recalculate_l4_checksum(packet: &mut [u8], src_ip: Ipv4Addr, dst_ip: Ipv4Addr, protocol: IpNumber) {
+    fn recalculate_l4_checksum(
+        packet: &mut [u8],
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        protocol: IpNumber,
+    ) {
         let ihl = (packet[0] & 0x0F) as usize * 4;
-        if packet.len() < ihl { return; }
-        
+        if packet.len() < ihl {
+            return;
+        }
+
         let l4_len = packet.len() - ihl;
         let l4_bytes = &mut packet[ihl..];
 
@@ -516,38 +524,42 @@ impl Router {
                 if l4_bytes.len() >= 18 {
                     l4_bytes[16] = 0;
                     l4_bytes[17] = 0;
-                } else { return; }
-            },
+                } else {
+                    return;
+                }
+            }
             IpNumber::UDP => {
-                 if l4_bytes.len() >= 8 {
+                if l4_bytes.len() >= 8 {
                     l4_bytes[6] = 0;
                     l4_bytes[7] = 0;
-                } else { return; }
-            },
+                } else {
+                    return;
+                }
+            }
             _ => return,
         }
 
         let mut sum: u32 = 0;
-        
+
         // 1. Pseudo Header Sum
         let src_oct = src_ip.octets();
         let dst_oct = dst_ip.octets();
-        
+
         sum += u16::from_be_bytes([src_oct[0], src_oct[1]]) as u32;
         sum += u16::from_be_bytes([src_oct[2], src_oct[3]]) as u32;
         sum += u16::from_be_bytes([dst_oct[0], dst_oct[1]]) as u32;
         sum += u16::from_be_bytes([dst_oct[2], dst_oct[3]]) as u32;
-        
+
         sum += protocol.0 as u32;
         sum += l4_len as u32;
 
         // 2. L4 Header + Payload Sum
         for i in (0..l4_bytes.len()).step_by(2) {
             if i + 1 < l4_bytes.len() {
-                 sum += u16::from_be_bytes([l4_bytes[i], l4_bytes[i+1]]) as u32;
+                sum += u16::from_be_bytes([l4_bytes[i], l4_bytes[i + 1]]) as u32;
             } else {
-                 // Padding for odd length
-                 sum += u16::from_be_bytes([l4_bytes[i], 0]) as u32;
+                // Padding for odd length
+                sum += u16::from_be_bytes([l4_bytes[i], 0]) as u32;
             }
         }
 
@@ -558,16 +570,16 @@ impl Router {
         let checksum = !(sum as u16);
 
         // 4. Write Checksum
-         match protocol {
+        match protocol {
             IpNumber::TCP => {
-                 l4_bytes[16] = (checksum >> 8) as u8;
-                 l4_bytes[17] = (checksum & 0xFF) as u8;
-            },
+                l4_bytes[16] = (checksum >> 8) as u8;
+                l4_bytes[17] = (checksum & 0xFF) as u8;
+            }
             IpNumber::UDP => {
-                 l4_bytes[6] = (checksum >> 8) as u8;
-                 l4_bytes[7] = (checksum & 0xFF) as u8;
-            },
-            _ => {},
+                l4_bytes[6] = (checksum >> 8) as u8;
+                l4_bytes[7] = (checksum & 0xFF) as u8;
+            }
+            _ => {}
         }
     }
 
@@ -682,8 +694,8 @@ impl Router {
         // If the packet is destined for the Router's Ethernet IP, it might need DNAT
         let dst_ip = ip_header.destination_addr();
         if dst_ip != self.config.eth_ip {
-             // Not for our WAN IP, so standard routing or already correct
-             return None;
+            // Not for our WAN IP, so standard routing or already correct
+            return None;
         }
 
         let protocol = ip_header.protocol();
@@ -726,13 +738,21 @@ impl Router {
             if let Ok(tcp) = TcpHeaderSlice::from_slice(&ip_packet[ihl..]) {
                 let dst_port = tcp.destination_port();
                 // Lookup session
-                let original_ip_opt = if let Ok(sessions) = self.nat_sessions.read() {
-                    sessions.get(&dst_port).copied()
-                } else { None };
+                let original_ip_opt =
+                    if let Ok(sessions) = self.nat_sessions.read() {
+                        sessions
+                            .get(&dst_port)
+                            .copied()
+                    } else {
+                        None
+                    };
 
                 if let Some(original_ip) = original_ip_opt {
-                    debug!("NAT: Translating TCP Port {} to {}", dst_port, original_ip);
-                    
+                    debug!(
+                        "NAT: Translating TCP Port {} to {}",
+                        dst_port, original_ip
+                    );
+
                     // Modify Destination IP in IP Header
                     let original_ip_octets = original_ip.octets();
                     ip_packet[16] = original_ip_octets[0];
@@ -745,23 +765,36 @@ impl Router {
 
                     // Recalculate TCP Checksum (Critical!)
                     // Note: We use the *NEW* destination IP (original_ip) for checksum calculation
-                    Self::recalculate_l4_checksum(ip_packet, src_ip, original_ip, protocol);
+                    Self::recalculate_l4_checksum(
+                        ip_packet,
+                        src_ip,
+                        original_ip,
+                        protocol,
+                    );
 
                     return Some(original_ip);
                 }
             }
         } else if protocol == etherparse::IpNumber::UDP {
             if let Ok(udp) = UdpHeaderSlice::from_slice(&ip_packet[ihl..]) {
-                 let dst_port = udp.destination_port();
-                 // Lookup session
-                let original_ip_opt = if let Ok(sessions) = self.nat_sessions.read() {
-                    sessions.get(&dst_port).copied()
-                } else { None };
+                let dst_port = udp.destination_port();
+                // Lookup session
+                let original_ip_opt =
+                    if let Ok(sessions) = self.nat_sessions.read() {
+                        sessions
+                            .get(&dst_port)
+                            .copied()
+                    } else {
+                        None
+                    };
 
                 if let Some(original_ip) = original_ip_opt {
-                    debug!("NAT: Translating UDP Port {} to {}", dst_port, original_ip);
-                    
-                     // Modify Destination IP in IP Header
+                    debug!(
+                        "NAT: Translating UDP Port {} to {}",
+                        dst_port, original_ip
+                    );
+
+                    // Modify Destination IP in IP Header
                     let original_ip_octets = original_ip.octets();
                     ip_packet[16] = original_ip_octets[0];
                     ip_packet[17] = original_ip_octets[1];
@@ -772,7 +805,12 @@ impl Router {
                     Self::recalculate_ip_checksum(ip_packet);
 
                     // Recalculate UDP Checksum
-                    Self::recalculate_l4_checksum(ip_packet, src_ip, original_ip, protocol);
+                    Self::recalculate_l4_checksum(
+                        ip_packet,
+                        src_ip,
+                        original_ip,
+                        protocol,
+                    );
 
                     return Some(original_ip);
                 }
@@ -1208,7 +1246,7 @@ impl Router {
         Ok(())
     }
 
-/// IP Fragmentation logic
+    /// IP Fragmentation logic
     /// Split a large IPv4 packet into smaller fragments based on MTU
     fn fragment_and_send(
         &self,
@@ -1228,7 +1266,8 @@ impl Router {
         }
 
         // 2. Parse the IP header to get context
-        let (header, payload_offset) = match Ipv4HeaderSlice::from_slice(&packet) {
+        let (header, payload_offset) = match Ipv4HeaderSlice::from_slice(&packet)
+        {
             Ok(h) => (h.to_header(), h.slice().len()),
             Err(e) => {
                 warn!("Cannot fragment non-IPv4 packet: {}", e);
@@ -1236,13 +1275,13 @@ impl Router {
             }
         };
 
-        // Don't fragment if DF (Don't Fragment) bit is set? 
+        // Don't fragment if DF (Don't Fragment) bit is set?
         // For acoustic links, we usually ignore DF because we MUST fragment.
-        
+
         let full_payload = &packet[payload_offset..];
         let header_len = payload_offset; // usually 20 bytes
-        
-        // Calculate max payload size per fragment. 
+
+        // Calculate max payload size per fragment.
         // MUST be a multiple of 8 (IP spec requirement), except for the last fragment.
         // Formula: floor((MTU - HeaderLen) / 8) * 8
         let max_frag_payload = ((mtu - header_len) / 8) * 8;
@@ -1255,10 +1294,13 @@ impl Router {
         let total_len = full_payload.len();
         let mut offset = 0;
 
-        info!("Fragmenting {} bytes into chunks of {} bytes (MTU {})", total_len, max_frag_payload, mtu);
+        info!(
+            "Fragmenting {} bytes into chunks of {} bytes (MTU {})",
+            total_len, max_frag_payload, mtu
+        );
 
         // 3. Loop to create fragments
-// 3. Loop to create fragments
+        // 3. Loop to create fragments
         while offset < total_len {
             // Determine size of this chunk
             let remaining = total_len - offset;
@@ -1267,7 +1309,7 @@ impl Router {
 
             // Prepare new Header based on original
             let mut frag_header = header.clone();
-            
+
             // --- FIX START ---
             // 关键修改 1: 清除 DF 标志位
             // 如果不清除，MF=1 + DF=1 组合会被内核视为非法包丢弃
@@ -1277,27 +1319,29 @@ impl Router {
             // Set Flags: Keep MF (More Fragments) if original had it, OR if this isn't the last chunk
             let original_mf = header.more_fragments;
             frag_header.more_fragments = original_mf || !is_last_fragment;
-            
+
             // Set Offset: Original Offset + Current Offset / 8
             // 修复说明: 先取出 u16 值进行计算，再转换回 IpFragOffset
             let current_offset_val = header.fragment_offset.value();
             let added_offset = (offset as u16 / 8);
-            
-            frag_header.fragment_offset = etherparse::IpFragOffset::try_new(current_offset_val + added_offset)
-                .unwrap_or_else(|_| {
-                    // 如果 offset 溢出 (超过 13 bit)，这是一个极端的异常情况
-                    warn!("Fragment offset overflow!"); 
-                    etherparse::IpFragOffset::try_new(0).unwrap() 
-                });
-            
+
+            frag_header.fragment_offset = etherparse::IpFragOffset::try_new(
+                current_offset_val + added_offset,
+            )
+            .unwrap_or_else(|_| {
+                // 如果 offset 溢出 (超过 13 bit)，这是一个极端的异常情况
+                warn!("Fragment offset overflow!");
+                etherparse::IpFragOffset::try_new(0).unwrap()
+            });
+
             // Set Total Length
             frag_header.total_len = (header_len + len) as u16;
-            
+
             let mut frag_packet = Vec::with_capacity(header_len + len);
 
             // Update checksum (etherparse write does NOT do this automatically)
             frag_header.header_checksum = frag_header.calc_header_checksum();
-            
+
             // Write header
             if let Err(e) = frag_header.write(&mut frag_packet) {
                 warn!("Failed to write frag header: {}", e);
@@ -1306,12 +1350,14 @@ impl Router {
 
             info!(
                 "frag: off={} mf={} len={} checksum=0x{:04x}",
-                frag_header.fragment_offset.value(),
+                frag_header
+                    .fragment_offset
+                    .value(),
                 frag_header.more_fragments,
                 frag_header.total_len,
                 frag_header.header_checksum
             );
-            
+
             // Copy payload chunk
             frag_packet.extend_from_slice(&full_payload[offset..offset + len]);
 
@@ -1322,10 +1368,7 @@ impl Router {
 
             // 4.0. Monitor to TUN
             if let Err(e) = to_tun.send(frag_packet.clone()) {
-                warn!(
-                    "Failed to send packet to TUN thread: {}",
-                    e
-                );
+                warn!("Failed to send packet to TUN thread: {}", e);
             }
 
             // 4.1 Send fragment
@@ -1693,30 +1736,40 @@ impl Router {
 
                     // Post-Routing (SNAT/DNAT handling)
                     // Handle packets going to local acoustic/TUN interfaces (reverse NAT)
-                    if (new_iface == InterfaceType::Acoustic || new_iface == InterfaceType::Tun)
-                        && (src_ip_from_header == self.config.gateway_ip || 
-                            (src_ip_from_header.octets()[0..3] == self.config.eth_ip.octets()[0..3]))
+                    if (new_iface == InterfaceType::Acoustic
+                        || new_iface == InterfaceType::Tun)
+                        && (src_ip_from_header == self.config.gateway_ip
+                            || (src_ip_from_header.octets()[0..3]
+                                == self.config.eth_ip.octets()[0..3]))
                     {
                         // This packet came from external (Ethernet/Gateway) and is returning to local TUN
                         // No DNAT needed here - just forward as-is since the app on TUN
                         // will recognize the response by its own port/IP
-                        debug!("Reverse NAT: Packet from external {} -> local {:?}", src_ip_from_header, new_iface);
+                        debug!(
+                            "Reverse NAT: Packet from external {} -> local {:?}",
+                            src_ip_from_header, new_iface
+                        );
                     }
-                    
-                    if new_iface == InterfaceType::Ethernet
-                    {
+
+                    if new_iface == InterfaceType::Ethernet {
                         // SNAT Logic for Ethernet interface
                         let new_src_ip = self.config.eth_ip;
                         let new_src_mac = self.config.eth_mac;
-                        let gateway_mac = self.config.gateway_mac.unwrap_or([0xff; 6]); // Fallback if no gateway MAC, usually handled by ARP later but needed for build
-                        
-                        let can_snat = self.config.gateway_mac.is_some();
+                        let gateway_mac = self
+                            .config
+                            .gateway_mac
+                            .unwrap_or([0xff; 6]); // Fallback if no gateway MAC, usually handled by ARP later but needed for build
+
+                        let can_snat = self
+                            .config
+                            .gateway_mac
+                            .is_some();
                         if !can_snat {
-                             // Wait for ARP for gateway logic handled later in loop
+                            // Wait for ARP for gateway logic handled later in loop
                         }
 
                         if protocol == etherparse::IpNumber::ICMP {
-                             // ICMP
+                            // ICMP
                             debug!("Post-Routing: Ethernet ICMP packet");
                             // Parse ICMP
                             // We need to check if it is EchoRequest or EchoReply
@@ -1746,7 +1799,9 @@ impl Router {
                                     icmp_id, src_ip_from_header
                                 );
 
-                                if let Some(gateway_mac) = self.config.gateway_mac {
+                                if let Some(gateway_mac) =
+                                    self.config.gateway_mac
+                                {
                                     info!(
                                         "NAT Forwarding packet to Gateway: {} -> MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                                         new_dst_ip,
@@ -1820,14 +1875,19 @@ impl Router {
                             }
                         } else if protocol == etherparse::IpNumber::TCP {
                             // TCP SNAT
-                            if let Ok(tcp) = TcpHeaderSlice::from_slice(&packet[ihl..]) {
+                            if let Ok(tcp) =
+                                TcpHeaderSlice::from_slice(&packet[ihl..])
+                            {
                                 let src_port = tcp.source_port();
-                                
+
                                 // Record session: External Port (same as src_port) -> Internal IP (src_ip_from_header)
-                                if let Ok(mut sessions) = self.nat_sessions.write() {
-                                    sessions.insert(src_port, src_ip_from_header);
+                                if let Ok(mut sessions) =
+                                    self.nat_sessions.write()
+                                {
+                                    sessions
+                                        .insert(src_port, src_ip_from_header);
                                 }
-                                
+
                                 // Perform Masquerade (SNAT)
                                 let new_src_ip = self.config.eth_ip;
                                 let octets = new_src_ip.octets();
@@ -1842,18 +1902,28 @@ impl Router {
                                 Self::recalculate_ip_checksum(&mut packet);
 
                                 // Recalculate TCP Checksum using new Source IP
-                                Self::recalculate_l4_checksum(&mut packet, new_src_ip, dst_ip, protocol);
+                                Self::recalculate_l4_checksum(
+                                    &mut packet,
+                                    new_src_ip,
+                                    dst_ip,
+                                    protocol,
+                                );
                             }
                         } else if protocol == etherparse::IpNumber::UDP {
                             // UDP SNAT
-                             if let Ok(udp) = UdpHeaderSlice::from_slice(&packet[ihl..]) {
+                            if let Ok(udp) =
+                                UdpHeaderSlice::from_slice(&packet[ihl..])
+                            {
                                 let src_port = udp.source_port();
-                                
+
                                 // Record session
-                                if let Ok(mut sessions) = self.nat_sessions.write() {
-                                    sessions.insert(src_port, src_ip_from_header);
+                                if let Ok(mut sessions) =
+                                    self.nat_sessions.write()
+                                {
+                                    sessions
+                                        .insert(src_port, src_ip_from_header);
                                 }
-                                
+
                                 // Perform Masquerade (SNAT)
                                 let new_src_ip = self.config.eth_ip;
                                 let octets = new_src_ip.octets();
@@ -1868,7 +1938,12 @@ impl Router {
                                 Self::recalculate_ip_checksum(&mut packet);
 
                                 // Recalculate UDP Checksum
-                                Self::recalculate_l4_checksum(&mut packet, new_src_ip, dst_ip, protocol);
+                                Self::recalculate_l4_checksum(
+                                    &mut packet,
+                                    new_src_ip,
+                                    dst_ip,
+                                    protocol,
+                                );
                             }
                         }
                     }
@@ -1989,7 +2064,7 @@ impl Router {
                     };
                     continue 'router_loop;
                 }
-PacketState::Send {
+                PacketState::Send {
                     out_interface,
                     payload,
                     src_mac,
@@ -2019,17 +2094,17 @@ PacketState::Send {
                             //         e
                             //     );
                             // }
-                            
+
                             // -- 使用修复后的分片发送逻辑 --
                             // 定义声学 MTU (需根据你的物理层载荷能力调整)
-                            const ACOUSTIC_MTU: usize = 140; 
+                            const ACOUSTIC_MTU: usize = 140;
 
                             self.fragment_and_send(
                                 to_acoustic,
                                 to_tun,
                                 payload.clone(),
                                 dst_mac[5],
-                                ACOUSTIC_MTU
+                                ACOUSTIC_MTU,
                             );
                         }
                         InterfaceType::WiFi => {
