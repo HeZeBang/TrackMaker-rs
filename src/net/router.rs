@@ -1044,7 +1044,7 @@ impl Router {
                     ) {
                         warn!("Failed to send packet to Acoustic: {}", e);
                     }
-                    thread::sleep(Duration::from_millis(150));
+                    thread::sleep(Duration::from_millis(20));
                 }
             }
         });
@@ -1213,6 +1213,7 @@ impl Router {
     fn fragment_and_send(
         &self,
         to_channel: &crossbeam_channel::Sender<(Vec<u8>, u8)>, // Channel to Acoustic
+        to_tun: &crossbeam_channel::Sender<Vec<u8>>,
         packet: Vec<u8>,
         dest_mac_byte: u8,
         mtu: usize,
@@ -1267,11 +1268,16 @@ impl Router {
             // Prepare new Header based on original
             let mut frag_header = header.clone();
             
+            // --- FIX START ---
+            // 关键修改 1: 清除 DF 标志位
+            // 如果不清除，MF=1 + DF=1 组合会被内核视为非法包丢弃
+            frag_header.dont_fragment = false;
+            // --- FIX END ---
+
             // Set Flags: Keep MF (More Fragments) if original had it, OR if this isn't the last chunk
             let original_mf = header.more_fragments;
             frag_header.more_fragments = original_mf || !is_last_fragment;
             
-            // --- 修复开始 ---
             // Set Offset: Original Offset + Current Offset / 8
             // 修复说明: 先取出 u16 值进行计算，再转换回 IpFragOffset
             let current_offset_val = header.fragment_offset.value();
@@ -1283,26 +1289,46 @@ impl Router {
                     warn!("Fragment offset overflow!"); 
                     etherparse::IpFragOffset::try_new(0).unwrap() 
                 });
-            // --- 修复结束 ---
             
             // Set Total Length
             frag_header.total_len = (header_len + len) as u16;
             
             let mut frag_packet = Vec::with_capacity(header_len + len);
+
+            // Update checksum (etherparse write does NOT do this automatically)
+            frag_header.header_checksum = frag_header.calc_header_checksum();
             
             // Write header
             if let Err(e) = frag_header.write(&mut frag_packet) {
                 warn!("Failed to write frag header: {}", e);
                 return;
             }
+
+            info!(
+                "frag: off={} mf={} len={} checksum=0x{:04x}",
+                frag_header.fragment_offset.value(),
+                frag_header.more_fragments,
+                frag_header.total_len,
+                frag_header.header_checksum
+            );
             
             // Copy payload chunk
             frag_packet.extend_from_slice(&full_payload[offset..offset + len]);
 
-            // Recalculate IP Checksum manually because we modified fields
-            Self::recalculate_ip_checksum(&mut frag_packet);
+            // --- FIX START ---
+            // 关键修改 2: 移除手动重算 Checksum
+            // Self::recalculate_ip_checksum(&mut frag_packet); // <--- 已移除，防止覆盖正确的 Checksum
+            // --- FIX END ---
 
-            // 4. Send fragment
+            // 4.0. Monitor to TUN
+            if let Err(e) = to_tun.send(frag_packet.clone()) {
+                warn!(
+                    "Failed to send packet to TUN thread: {}",
+                    e
+                );
+            }
+
+            // 4.1 Send fragment
             if let Err(e) = to_channel.send((frag_packet, dest_mac_byte)) {
                 warn!("Failed to send fragment: {}", e);
                 break;
@@ -1976,24 +2002,35 @@ PacketState::Send {
                     );
                     match out_interface {
                         InterfaceType::Acoustic => {
-                            // !!! CHANGED HERE !!!
-                            // Define your Acoustic MTU here (e.g., 80 bytes)
-                            // Ideally, load this from config
-                            const ACOUSTIC_MTU: usize = 80; // 留一些余量给物理层开销，如果是 MTU 80 就填 80
+                            // -- 原来的直接发送逻辑 (已注释) --
+                            // if let Err(e) =
+                            //     to_acoustic.send((payload.clone(), dst_mac[5]))
+                            // {
+                            //     warn!(
+                            //         "Failed to send packet to Acoustic thread: {}",
+                            //         e
+                            //     );
+                            // }
+
+                            // 监控用途：同时转发给 TUN 供抓包查看
+                            // if let Err(e) = to_tun.send(payload.clone()) {
+                            //     warn!(
+                            //         "Failed to send packet to TUN thread: {}",
+                            //         e
+                            //     );
+                            // }
+                            
+                            // -- 使用修复后的分片发送逻辑 --
+                            // 定义声学 MTU (需根据你的物理层载荷能力调整)
+                            const ACOUSTIC_MTU: usize = 140; 
 
                             self.fragment_and_send(
                                 to_acoustic,
+                                to_tun,
                                 payload.clone(),
                                 dst_mac[5],
                                 ACOUSTIC_MTU
                             );
-                            
-                            // Send to TUN as well (Monitoring) - Optional, sending full packet for local monitoring
-                            // Or you might want to send the fragments to TUN too? 
-                            // Usually we only mirror the logical packet to TUN if doing sniffing.
-                            if let Err(e) = to_tun.send(payload) { // Sending original full packet to TUN for logging
-                                warn!("Failed to send packet to TUN thread: {}", e);
-                            }
                         }
                         InterfaceType::WiFi => {
                             if let Err(e) =
