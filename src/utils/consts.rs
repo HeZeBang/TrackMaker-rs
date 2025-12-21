@@ -49,9 +49,9 @@ pub const PHY_HEADER_BYTES: usize = 7; // Length (2) + CRC (1) + Frame Type (1) 
 
 // --- CSMA/CA Constants ---
 /// Energy level threshold to consider the channel busy.
-pub const ENERGY_THRESHOLD: f32 = 0.05;
+pub const ENERGY_THRESHOLD: f32 = 0.5;
 /// Energy detection minimum samples
-pub const ENERGY_DETECTION_SAMPLES: usize = 0;
+pub const ENERGY_DETECTION_SAMPLES: usize = 20;
 /// Distributed Inter-frame Space (DIFS) in milliseconds.
 /// The duration to sense the channel to see if it's idle.
 pub const DIFS_DURATION_MS: u64 = 20;

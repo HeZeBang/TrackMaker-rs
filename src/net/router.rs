@@ -205,6 +205,28 @@ impl ArpTable {
     }
 }
 
+/// Simple DNS Table for local resolution
+#[derive(Clone)]
+pub struct DnsTable {
+    entries: HashMap<String, Ipv4Addr>,
+}
+
+impl DnsTable {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    pub fn add_entry(&mut self, domain: &str, ip: Ipv4Addr) {
+        self.entries.insert(domain.to_lowercase(), ip);
+    }
+
+    pub fn lookup(&self, domain: &str) -> Option<Ipv4Addr> {
+        self.entries.get(&domain.to_lowercase()).copied()
+    }
+}
+
 /// Router configuration
 #[derive(Clone)]
 pub struct RouterConfig {
@@ -296,6 +318,8 @@ pub struct Router {
     // Simple Session table for TCP/UDP NAT: Port -> Original IP
     // Assumes simple Cone NAT where external port maps to internal IP 1:1 (no port translation unless collision, but keeping simple)
     nat_sessions: Arc<RwLock<HashMap<u16, Ipv4Addr>>>,
+    // Local DNS Table
+    dns_table: Arc<RwLock<DnsTable>>,
     // Buffer for packets awaiting ARP resolution
     pending_packets: Arc<RwLock<HashMap<Ipv4Addr, Vec<PendingPacket>>>>,
     running: Arc<Mutex<AtomicBool>>,
@@ -369,12 +393,24 @@ impl Router {
             InterfaceType::Tun,
         );
 
+        // Initialize DNS Table with hardcoded entries
+        let mut dns_table = DnsTable::new();
+        // Hardcoded Static Entries
+        dns_table.add_entry("router.lan", config.wifi_ip);
+        dns_table.add_entry("node1.lan", config.node1_ip);
+        dns_table.add_entry("node3.lan", config.node3_ip);
+        // Add a funny external one for testing
+        dns_table.add_entry("example.com", "104.18.27.120".parse().unwrap());
+        dns_table.add_entry("google.com", "8.8.8.8".parse().unwrap());
+        dns_table.add_entry("test.dns", "1.2.3.4".parse().unwrap());
+
         Self {
             config,
             routing_table: Arc::new(RwLock::new(routing_table)),
             arp_table: Arc::new(RwLock::new(ArpTable::new())),
             nat_table: Arc::new(RwLock::new(NatTable::new())),
             nat_sessions: Arc::new(RwLock::new(HashMap::new())),
+            dns_table: Arc::new(RwLock::new(dns_table)),
             pending_packets: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(Mutex::new(AtomicBool::new(false))),
         }
@@ -829,6 +865,119 @@ impl Router {
             || *dest_ip == self.config.eth_ip
     }
 
+    // --- Simple DNS Helper Functions ---
+    fn parse_dns_name(payload: &[u8], offset: &mut usize) -> Option<String> {
+        let mut labels = Vec::new();
+        loop {
+            if *offset >= payload.len() {
+                return None;
+            }
+            let len = payload[*offset] as usize;
+            if len == 0 {
+                *offset += 1;
+                break;
+            }
+            // Check for pointer (compression), though basic requests usually don't have it
+            if (len & 0xC0) == 0xC0 {
+                // Pointer logic omitted for simplicity in request parsing
+                return None;
+            }
+            *offset += 1;
+            if *offset + len > payload.len() {
+                return None;
+            }
+            let label = std::str::from_utf8(&payload[*offset..*offset + len]).ok()?;
+            labels.push(label.to_string());
+            *offset += len;
+        }
+        Some(labels.join("."))
+    }
+
+    fn build_dns_response(&self, payload: &[u8]) -> Option<Vec<u8>> {
+        if payload.len() < 12 { return None; }
+        
+        // Transaction ID
+        let id_bytes = [payload[0], payload[1]];
+        let flags = u16::from_be_bytes([payload[2], payload[3]]);
+        // Check if it is a query (QR bit = 0) and Opcode = 0 (Standard Query)
+        if (flags & 0x8000) != 0 { return None; } 
+
+        let qdcount = u16::from_be_bytes([payload[4], payload[5]]);
+        if qdcount != 1 { return None; } // Only handle single question
+
+        let mut offset = 12;
+        let domain_name = Self::parse_dns_name(payload, &mut offset)?;
+
+        // Skip QTYPE and QCLASS
+        if offset + 4 > payload.len() { return None; }
+        let qtype = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+        let qclass = u16::from_be_bytes([payload[offset + 2], payload[offset + 3]]);
+        offset += 4;
+
+        info!("DNS Query for: {} (Type: {}, Class: {})", domain_name, qtype, qclass);
+
+        // Only handle A records (Type 1) and IN class (1)
+        if qtype != 1 || qclass != 1 {
+             // Return No Error but no answer? Or unimplemented?
+             // Let's just ignore for now or implement "Refused" later
+             // For now, construct response with 0 answers
+             let mut response = Vec::new();
+             response.extend_from_slice(&id_bytes);
+             response.extend_from_slice(&0x8180u16.to_be_bytes()); // Standard response, No error
+             response.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+             response.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+             response.extend_from_slice(&0u16.to_be_bytes());
+             response.extend_from_slice(&0u16.to_be_bytes());
+             // Copy question
+             response.extend_from_slice(&payload[12..offset]);
+             return Some(response);
+        }
+
+        // Lookup
+        let ip_opt = if let Ok(table) = self.dns_table.read() {
+            table.lookup(&domain_name)
+        } else {
+            None
+        };
+
+        let mut response = Vec::new();
+        response.extend_from_slice(&id_bytes);
+
+        if let Some(ip) = ip_opt {
+            info!("DNS Resolved: {} -> {}", domain_name, ip);
+            response.extend_from_slice(&0x8180u16.to_be_bytes()); // Standard response, No error
+            response.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+            response.extend_from_slice(&1u16.to_be_bytes()); // ANCOUNT (1 answer)
+        } else {
+            info!("DNS Not Found: {}", domain_name);
+            response.extend_from_slice(&0x8183u16.to_be_bytes()); // Name Error (RCODE=3)
+            response.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+            response.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+        }
+        
+        response.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+        response.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+
+        // Copy Question Section
+        response.extend_from_slice(&payload[12..offset]);
+
+        // Add Answer Section if resolved
+        if let Some(ip) = ip_opt {
+             // Name ptr (0xC00C points to start of name in header)
+             response.extend_from_slice(&0xC00Cu16.to_be_bytes()); 
+             response.extend_from_slice(&1u16.to_be_bytes()); // TYPE A
+             response.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+             response.extend_from_slice(&300u32.to_be_bytes()); // TTL 300s
+             response.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH 4
+             response.extend_from_slice(&ip.octets()); // RDATA
+        }
+
+        // FIXME: temp sleep to prevent AAAA record
+        thread::sleep(Duration::from_millis(500));
+
+        Some(response)
+    }
+
     /// Run the router
     pub fn run(
         &mut self,
@@ -938,7 +1087,7 @@ impl Router {
                         }
                     }
                     Err(e) => {
-                        // If it's a temp error or timeout, we might continue
+                        // If it is a temp error or timeout, we might continue
                         // For a real error, we might log and break
                         match e.kind() {
                             std::io::ErrorKind::WouldBlock
@@ -1075,6 +1224,7 @@ impl Router {
                 // Use try_recv here because we are in a loop handling both RX and TX in one thread.
                 // This is a specific design for acoustic interface which might be half-duplex or single-threaded.
                 while let Ok((ip_packet, dest_mac)) = to_acoustic_rx.try_recv() {
+                    // thread::sleep(Duration::from_millis(20));
                     if let Err(e) = acoustic_interface.send_packet(
                         &ip_packet,
                         dest_mac,
@@ -1082,7 +1232,6 @@ impl Router {
                     ) {
                         warn!("Failed to send packet to Acoustic: {}", e);
                     }
-                    thread::sleep(Duration::from_millis(20));
                 }
             }
         });
@@ -1665,6 +1814,46 @@ impl Router {
                         };
                         continue 'router_loop;
                     }
+
+                    // --- DNS SERVICE START ---
+                    // Check if UDP port 53
+                    if let Ok(h) = Ipv4HeaderSlice::from_slice(&packet) {
+                        if h.protocol() == etherparse::IpNumber::UDP {
+                             let ihl = h.slice().len();
+                             let udp_slice = &packet[ihl..];
+                             if let Ok(udp) = UdpHeaderSlice::from_slice(udp_slice) {
+                                 if udp.destination_port() == 53 {
+                                    // It is a DNS Query!
+                                    let dns_payload = &udp_slice[8..];
+                                    if let Some(response_payload) = self.build_dns_response(dns_payload) {
+                                        // Build UDP Response
+                                        // Swap Ports
+                                        let src_port = 53;
+                                        let dst_port = udp.source_port();
+                                        
+                                        // Build UDP Packet
+                                        let builder = PacketBuilder::ipv4(
+                                            h.destination(), // Src IP (router)
+                                            h.source(),      // Dst IP (requester)
+                                            64,              // TTL
+                                        ).udp(src_port, dst_port);
+
+                                        let mut result = Vec::with_capacity(builder.size(response_payload.len()));
+                                        if let Ok(_) = builder.write(&mut result, &response_payload) {
+                                            // Send back
+                                            state = PacketState::Routing {
+                                                src_ip: Ipv4Addr::from(h.destination()),
+                                                dst_ip: Ipv4Addr::from(h.source()),
+                                                packet: result,
+                                            };
+                                            continue 'router_loop;
+                                        }
+                                    }
+                                 }
+                             }
+                        }
+                    }
+                    // --- DNS SERVICE END ---
 
                     // If not NAT, check if it is for Acoustic IP (which means it should go to TUN)
                     let is_acoustic_dest =

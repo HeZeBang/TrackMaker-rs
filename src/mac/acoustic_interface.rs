@@ -82,7 +82,7 @@ impl AcousticInterface {
         };
         let frames = vec![frame.clone()];
 
-        let mut state = CSMAState::Transmitting;
+        let mut state = CSMAState::Sensing;
         let mut stage = 0;
 
         // Start recording for sensing
