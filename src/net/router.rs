@@ -402,6 +402,7 @@ impl Router {
         // Add a funny external one for testing
         dns_table.add_entry("example.com", "104.18.27.120".parse().unwrap());
         dns_table.add_entry("google.com", "8.8.8.8".parse().unwrap());
+        dns_table.add_entry("help.3g.163.com", "111.124.202.255".parse().unwrap());
         dns_table.add_entry("test.dns", "1.2.3.4".parse().unwrap());
 
         Self {
