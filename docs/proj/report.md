@@ -1,7 +1,7 @@
-# CS120 Networking over Sound — Final Project Report (TrackMaker-rs)
+# CS120 Computer Network Project Report (TrackMaker-rs)
 
 ## Abstract
-TrackMaker-rs is a Rust implementation of a layered communication stack that transmits IP packets over an acoustic (audio) channel. The system bridges real-time audio I/O (JACK / PipeWire-JACK) with a custom PHY (line coding + framing + synchronization), a reliability and medium-access layer (Stop-and-Wait ARQ with CSMA-style carrier sensing/backoff), and a lightweight network layer integration that supports ICMP “ping”, routing/NAT between interfaces, a minimal DNS responder, and a TUN virtual network interface.
+TrackMaker-rs is a Rust implementation of a layered communication stack that transmits IP packets over an acoustic channel. The system bridges real-time audio I/O (JACK / PipeWire-JACK) with a custom physical layer (line coding + framing + synchronization), a reliability and medium-access layer (Stop-and-Wait ARQ with CSMA-style carrier sensing/backoff), and a lightweight network layer integration that supports ICMP “ping”, routing/NAT between interfaces, a minimal DNS responder, and a TUN virtual network interface.
 
 The key design goal was to make an “audio modem” that can interoperate with standard OS networking tools and protocols where feasible, while remaining robust to noise and timing drift. TrackMaker-rs exposes this stack via a CLI (transmit/receive, ping/ip-host, router, tun), and uses careful real-time buffer management to operate inside JACK callbacks.
 
@@ -13,13 +13,13 @@ This project follows a course progression from building a reliable link over aud
 - **A network-layer toolchain** including an acoustic ICMP ping client/server, a multi-interface router with NAT, and a Linux TUN device integration.
 - **A basic DNS service** running inside the router, answering A-record queries from a local table.
 
-The repository structure mirrors this layering: `src/phy/` (encoding/decoding), `src/mac/` (CSMA + acoustic interface abstraction), `src/net/` (tools, router, NAT, fragmentation, tun), and `src/audio/` + `src/device/` for real-time audio transport.
+The repository structure mirrors this layering: `src/phy/` (encoding/decoding), `src/mac/` (CSMA + acoustic interface abstraction), `src/net/` (tools, router, NAT, fragmentation, tun), and `src/audio/` + `src/devicbe/` for real-time audio transport.
 
 ## 2. System Overview
 ### 2.1 High-level architecture
 The overall pipeline is:
 
-1. **Packet source**: CLI tools (`ping`, `ip-host`, router forwarder, file transfer) produce payloads (typically IPv4 packets).
+1. **Packet source**: Applications produce payloads and are encapsulated in frames.
 2. **MAC / reliability** (`src/mac/`): frames are queued, transmitted with CSMA-style sensing/backoff, and acknowledged using Stop-and-Wait ARQ.
 3. **PHY encoding** (`src/phy/`): frames are converted to a waveform: preamble + sync pattern + line-coded bits.
 4. **Audio device** (`src/audio/`, `src/device/`): samples are sent/received via JACK process callbacks using shared ring buffers.
@@ -28,7 +28,7 @@ The overall pipeline is:
 ### 2.2 Real-time audio transport
 Audio I/O is handled with a JACK client. A process callback reads input samples into a shared record buffer and writes output samples from a playback buffer. The application coordinates Recording/Playing modes through an `AppState` state machine. This structure allows the PHY to run concurrently while respecting real-time constraints (no blocking operations inside the callback).
 
-Operationally, we found buffer/quantum configuration affects reliability. The README documents recommended PipeWire settings (48 kHz, 128–256 quantum) and practical volume guidance to reduce distortion/oversampling artifacts.
+Operationally, we found buffer/quantum configuration affects reliability. After testing on different configuration groups, we recommend PipeWire settings (48 kHz, 128–256 quantum) and practical volume guidance to reduce distortion/oversampling artifacts.
 
 ## 3. Project 0: Environment, CLI, and Audio Interface
 ### 3.1 CLI entry points
