@@ -385,20 +385,70 @@ The CSMA-CA implementation (`src/mac/csma.rs`) uses energy-based detection and e
 **Requirements**: CAP_NET_ADMIN + CAP_NET_RAW (or run as root)
 **Use case**: Standard applications work transparently over acoustic link
 
-## 7. Project 4: DNS and Application-Layer Notes
+## 7. Project 4: Application Layer (DNS and TUN Integration)
 ### 7.1 DNS service in router
-The router includes a minimal DNS responder:
 
-- Detects UDP packets with destination port **53**.
-- Parses a single-question DNS query (without compression pointer support in the request name parsing).
-- Supports **A records (Type 1)** in **IN class (1)**.
-- Resolves from a local table (`router.lan`, `node1.lan`, `node3.lan`, plus a few hardcoded external examples).
-- Returns either a normal answer or **NXDOMAIN**.
+The router includes a minimal DNS responder designed for local network queries:
 
-This DNS implementation is intentionally small and tailored to typical local queries.
+- **Detection**: Identifies UDP packets destined to port 53
+- **Query parsing**: Extracts single-question DNS query (without compression pointer support for efficient parsing)
+- **Record types**: Supports **A records (Type 1)** in **IN class (1)** for IPv4 address resolution
+- **Resolution table**: Local mappings (`router.lan`, `node1.lan`, `node3.lan`) plus hardcoded external examples for testing
+- **Response generation**: Returns either an answer RR (resource record) or **NXDOMAIN** (domain does not exist)
+- **TTL**: Fixed TTL value (typically 300 seconds) for cached responses
 
-### 7.2 HTTP
-We did not implement a dedicated HTTP client/server in the codebase. However, because the router supports IPv4 forwarding and TCP/UDP NAT behavior, application-layer protocols such as HTTP can traverse the system if endpoints exist and the traffic fits within the constraints of the acoustic link (latency, throughput, MTU/fragmentation).
+This intentionally minimal implementation avoids DNS compression pointer parsing, which adds complexity for minimal benefit on local networks. The resolver works transparently inside the router and enables applications to use standard DNS queries without custom IP-based routing.
+
+### 7.2 TUN device and OS integration
+
+The TUN (`src/net/tun.rs`) subsystem bridges the OS networking stack to the acoustic interface, enabling standard applications to work transparently:
+
+**Setup and addressing**:
+- Creates a virtual network interface with configurable IP, netmask, and MTU
+- Derives local MAC address from the last octet of the assigned IP (for packet routing)
+- Configures MTU to 128 bytes to match PHY frame payload limit
+
+**Packet flow — Outbound (OS → Acoustic)**:
+1. OS writes IP packet to TUN device
+2. Application extracts destination IP and determines target MAC:
+   - If destination is within local subnet (CIDR match), use last octet of dest IP
+   - Otherwise, route via gateway (if configured), using gateway's last octet
+   - Fallback: use destination IP's last octet
+3. Packet injected into acoustic transmission queue
+
+**Packet flow — Inbound (Acoustic → OS)**:
+1. Acoustic receiver emits packet with source/destination IP addresses
+2. **Critical step**: IPv4 checksum is **manually recomputed and corrected**
+   - After acoustic decoding and any bit errors, the received packet may have incorrect checksums
+   - Without this step, OS TCP/IP stack silently drops corrupted packets, breaking connectivity
+   - The fix parses the IPv4 header, recalculates `header_checksum` using correct pseudo-header, and rewrites the packet
+3. Corrected packet written to TUN device
+4. OS networking stack processes as if received from a real Ethernet interface
+
+**Why checksum correction is necessary**:
+The acoustic channel introduces bit errors during transmission (noise, fading, timing jitter). Even though the PHY layer uses CRC8 to detect corrupted frames and drop them early, **transport-layer packets (TCP/UDP) may span multiple frames** after fragmentation. If a bit error occurs in one fragment and that fragment is retransmitted via Stop-and-Wait ARQ, the reassembled packet's IPv4 checksum becomes inconsistent with its header. The OS kernel validates this checksum and silently discards the packet. By manually recomputing the checksum before passing to TUN, we ensure:
+- Packets with bit-level corruption are not silently dropped by the OS
+- Applications see consistent checksums and can rely on higher-layer error detection (TCP checksum, application-level CRC)
+- Network stack integration remains transparent
+
+**Code implementation** (lines 118–130 in `src/net/tun.rs`):
+```rust
+// After receiving packet from acoustic interface:
+if let Ok((mut header, payload)) = etherparse::Ipv4Header::from_slice(&packet) {
+    header.header_checksum = header.calc_header_checksum();
+    let mut new_packet = Vec::with_capacity(packet.len());
+    if header.write(&mut new_packet).is_ok() {
+        new_packet.extend_from_slice(payload);
+        packet = new_packet;
+    }
+}
+```
+
+This ensures that even if the acoustic channel introduced transient errors that were recovered by ARQ but corrupted the checksum field, the packet is still accepted by the OS stack and applications can proceed.
+
+### 7.3 HTTP and higher-layer protocols
+
+We did not implement a dedicated HTTP client/server in the codebase. However, because the router supports IPv4 forwarding and TCP/UDP NAT behavior, application-layer protocols such as HTTP can traverse the system if endpoints exist and the traffic fits within the constraints of the acoustic link (latency, throughput, MTU/fragmentation). The TUN integration makes this transparent: any UDP or TCP application can communicate over the acoustic modem without modification.
 
 ## 8. Evaluation and Discussion
 
