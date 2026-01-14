@@ -76,6 +76,150 @@ For performance, the correlation uses optimized dot-product paths (including SIM
 - **CRC8** is a cheap integrity check suitable for short acoustic frames.
 - Supporting both Manchester and 4B5B+NRZI made it easier to debug and compare failure modes.
 
+### 4.5 PSK Modulation and QAM Constellation
+
+#### PSK Introduction
+
+**PSK (Phase Shift Keying)** is a digital modulation technique that represents different digital data by changing the phase of a carrier signal.
+
+- **BPSK (Binary PSK)**: Uses two phases (typically 0° and 180°) to represent binary data 0 and 1. Simple and noise-resistant but lower data rate.
+- **QPSK (Quadrature PSK)**: Uses four phases (0°, 90°, 180°, 270°) to represent two bits (00, 01, 10, 11). Higher data rate with increased noise sensitivity.
+- **M-PSK**: Uses more phases (8-PSK, 16-PSK, etc.) for higher data rates, but increasingly noise-sensitive.
+
+**PSK Advantages and Disadvantages:**
+- Advantages: Strong noise immunity (especially BPSK), high spectral efficiency compared to AM/FM, simple modulation/demodulation.
+- Disadvantages: Requires precise phase accuracy; error rate increases significantly under noise and signal attenuation.
+
+#### QAM and Constellation Mapping
+
+**QAM (Quadrature Amplitude Modulation)** combines amplitude (AM) and phase (PM) modulation, enabling higher data rates through a single carrier by using orthogonal I (In-phase) and Q (Quadrature) components. The modulated signal is formed by superimposing these two components.
+
+A **QAM constellation** is a 2D plot showing symbol positions in the I-Q plane, where each point represents a symbol. The angle represents phase and the distance from origin represents amplitude. For example:
+- Pure BPSK has two points at 0° and 180°.
+- Pure AM has points at different distances but the same angle.
+- 16-QAM typically uses a 4×4 grid of 16 points with varying phase and amplitude.
+
+#### Transmission (Sender)
+
+For the 1 kbps configuration, we use BPSK, so constellation points are $-1j$ and $1j$.
+
+**Carrier generation** for different phases:
+$$\exp\bigl(2j\pi f\,n\,T_s\bigr),\quad n = 0,1,\dots,N_{\mathrm{sym}}-1,\quad f \in F$$
+
+where $f$ is the carrier frequency and $F$ is the set of all carriers.
+
+**Pilot Prefix:**
+The preamble consists of 200 pilot symbols (represented by 1) followed by 50 silent symbols (represented by 0). These are multiplied by a pre-computed carrier to form the final audio signal.
+
+**Silence Break:**
+An additional 50 silent symbols separate the preamble from training symbols.
+
+**Training Symbols:**
+A 200-symbol sequence used for channel estimation and equalization. Uses constellation edge points $(1, j, -1, -j)$ generated pseudo-randomly for robust training.
+
+**Encoding:**
+Each frame contains at most 255 bytes consisting of:
+- **Length** (1 byte): CRC32 + PHY payload length (0–254, max is 254)
+- **CRC32** (4 bytes): Checksum of PHY payload
+- **PHY Payload** (up to 255 bytes): Actual data
+
+Two frame types:
+- **Data Frame**: Contains actual data
+- **EOF Frame**: 5 bytes total, signals end of data (Length: `0x04`, CRC32: all zeros)
+
+**Modulation:**
+Only the real part of the complex modulated signal is transmitted. The imaginary part maintains mathematical symmetry in baseband but is not physically output.
+
+#### Reception (Receiver)
+
+**Detection:**
+Short-time coherence detection identifies the carrier corresponding to 200 × 1 sps (samples per symbol) of the preamble. Returns:
+- Preamble position
+- Signal amplitude estimate (for automatic gain control)
+- Estimated frequency offset
+
+**Correction:**
+Frequency offset is corrected via interpolation, and amplitude is normalized using estimated gain to facilitate subsequent equalization.
+
+**Equalization:**
+Adaptive equalization compensates for channel distortion:
+1. Extract training signal segment following preamble detection
+2. Compute FIR filter coefficients via `equalizer.train(signal, expected, order, lookahead)`
+3. Apply filter to subsequent samples: `sampler.equalizer = lambda x: list(filt(x))`
+
+This recovers subcarrier amplitude and phase characteristics.
+
+**Demodulation:**
+Time-domain audio is framed at symbol periods:
+- Extract complex samples per carrier using `dsp.Demux`
+- Map received symbols to bit sequences using nearest-neighbor decoding
+- Merge bits from all carriers into a flat bit stream
+
+**Frame Decoding:**
+Reconstruct bytes and frames from the bit stream:
+- Pack 8 bits into 1 byte
+- Read length prefix and CRC, validate checksum
+- Extract payload on success
+- Stop on EOF frame
+
+#### Streaming Detection
+
+**Preamble Detection:**
+amodem chunks samples by symbol length and computes coherence with each carrier:
+
+```python
+def _wait(self, samples):
+    counter = 0
+    bufs = collections.deque([], maxlen=self.maxlen)
+    for offset, buf in common.iterate(samples, self.Nsym, index=True):
+        if offset > self.max_offset:
+            raise ValueError('Timeout waiting for carrier')
+        bufs.append(buf)
+        
+        coeff = dsp.coherence(buf, self.omega)
+        if abs(coeff) > self.COHERENCE_THRESHOLD:
+            counter += 1
+        else:
+            counter = 0
+        
+        if counter == self.CARRIER_THRESHOLD:
+            return offset, bufs
+```
+
+Once a carrier is detected, correlation search refines the preamble start position and estimates amplitude and frequency error:
+
+```python
+def find_start(self, buf):
+    carrier = dsp.exp_iwt(self.omega, self.Nsym)
+    carrier = np.tile(carrier, self.START_PATTERN_LENGTH)
+    zeroes = carrier * 0.0
+    signal = np.concatenate([zeroes, carrier])
+    signal = (2 ** 0.5) * signal / dsp.norm(signal)
+    
+    corr = np.abs(np.correlate(buf, signal))
+    # Find peak correlation
+    index = np.argmax(coeffs)
+    offset = index + len(zeroes)
+    return offset
+```
+
+**End-of-Frame Detection:**
+Frames use length prefix + CRC32. The sender transmits an EOF frame with empty payload at the end. The receiver detects EOF during stream decoding and terminates:
+
+```python
+def decode(self, data):
+    data = iter(data)
+    while True:
+        length, = _take_fmt(data, self.prefix_fmt)
+        frame = _take_len(data, length)
+        block = self.checksum.decode(frame)
+        if block == self.EOF:
+            log.debug('EOF frame detected')
+            return
+        
+        yield block
+```
+
 ## 5. Project 2: MAC Layer (CSMA + Reliability)
 ### 5.1 Channel sensing and backoff
 We implement CSMA-like behavior by measuring channel “busy” state (energy threshold). Before transmitting, the node waits for a clear channel and then uses randomized backoff (contention window) to reduce collisions.
