@@ -25,11 +25,11 @@ fn main() {
     tracing::info!("JACK client status: {:?}", status);
     let (sample_rate, _buffer_size) = print_jack_info(&client);
 
-    let recording_duration_samples = sample_rate * DEFAULT_RECORD_SECONDS;
+    let recording_duration_samples = sample_rate * DEFAULT_TIMEOUT;
     tracing::info!(
         "Recording duration: {} samples ({} seconds)",
         recording_duration_samples,
-        DEFAULT_RECORD_SECONDS
+        DEFAULT_TIMEOUT
     );
 
     // Shared State
@@ -177,7 +177,7 @@ fn main() {
         info!("Filling playback buffer with music from sample.flac");
 
         let mut music = Vec::new();
-        audio::decoder::decode_flac_to_f32("./assets/sample.flac")
+        audio::codec::decode_flac_to_f32("./assets/sample.flac")
             .unwrap_or_else(|_| {
                 tracing::warn!("Failed to decode sample.flac, using silence");
                 vec![0.0; recording_duration_samples as usize]
@@ -195,7 +195,7 @@ fn main() {
         .create_bar(
             "playrec",
             recording_duration_samples as u64,
-            templates::PLAYREC,
+            templates::RECORDING,
             out_port_name.as_str(),
         )
         .unwrap();

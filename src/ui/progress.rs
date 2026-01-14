@@ -51,6 +51,23 @@ impl ProgressManager {
         Ok(())
     }
 
+    pub fn increasae_length(&self, id: &str, step: u64) -> Result<(), String> {
+        let bars = self
+            .bars
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if let Some(pb) = bars.get(id) {
+            pb.set_length(
+                pb.length()
+                    .unwrap_or_default()
+                    + step,
+            );
+            Ok(())
+        } else {
+            Err(format!("Progress bar '{}' not found", id))
+        }
+    }
+
     /// 更新进度条位置
     pub fn set_position(&self, id: &str, pos: u64) -> Result<(), String> {
         let bars = self
@@ -170,13 +187,11 @@ impl Default for ProgressManager {
 
 pub mod templates {
     pub const RECORDING: &str =
-        "RECORDING:   [{bar:30.red}] {percent}% ({pos}/{len} samples) {msg}";
+        "\u{f94a} REC  [{bar:30.red}] {percent}% ({pos}/{len} samples) {msg}";
     pub const PLAYBACK: &str =
-        "PLAYBACK:    [{bar:30.green}] {percent}% ({pos}/{len} samples) {msg}";
+        "\u{f909} PLAY [{bar:30.green}] {percent}% ({pos}/{len} samples) {msg}";
     pub const SENDER: &str =
-        "SENDER:      [{bar:30.cyan}] {percent}% ({pos}/{len} frames) {msg}";
-    pub const PROCESSING: &str =
-        "PROCESSING:  [{bar:30.blue}] {percent}% ({pos}/{len}) {msg}";
-    pub const PLAYREC: &str =
-        "PLAYREC:     [{bar:30.yellow}] {percent}% ({pos}/{len} samples) {msg}";
+        "\u{f048a} SEND [{bar:30.cyan}] {percent}% ({pos}/{len} frames) {msg}";
+    pub const RECEIVER: &str =
+        "\u{f04e6} RECV [{bar:30.blue}] {percent}% ({pos}/{len} frames) {msg}";
 }
